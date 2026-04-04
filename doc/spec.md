@@ -1,9 +1,25 @@
 **Full Specification: ArborSync – Selective Subtree File Synchronization Daemon**
 
 **Version:** 1.0 (April 2026)  
-**Purpose:** Provide a complete, LLM/human-implementable blueprint for a lightweight, bidirectional, central-master file sync tool that satisfies the exact requirements: one central hierarchy, arbitrary subtree checkouts to arbitrary local paths on slaves (including full-root backup), Merkle-based indexing with custom metadata (mode bits, mtime, size), efficient rsync-style block deltas, FS watching + rescans, PSK-encrypted transport, Unix perms preserved (no UID/GID), simple conflict handling.
 
-**Provisional Project Name:** *ArborSync* (binary names: `arborsync-master`, `arborsync-slave`; crate: `arborsync`).
+**Purpose:** Provide a complete, LLM/human-implementable blueprint for a lightweight, bidirectional, central-master 
+file sync tool that satisfies these requirements:
+- one central hierarchy,
+- arbitrary subtree checkouts to arbitrary local paths on slaves,
+- Merkle-based indexing with custom metadata (mode bits, mtime, size),
+- efficient rsync-style block deltas,
+- FS watching + rescans,
+- PSK-encrypted transport,
+- Unix perms preserved (no UID/GID),
+- simple conflict handling.
+
+**Provisional Project Name:** *ArborSync* (crate: `arborsync`)
+
+Single binary: `arborsync`
+
+Usage:
+- `arborsync master /central`
+- `arborsync slave config.yaml`
 
 ### 1. Core Requirements (Non-Negotiable)
 - Master holds **one** full filesystem hierarchy (`/central`).
@@ -11,32 +27,38 @@
 - Full-replica backup = one slave mapping root `/` → `/backup/central`.
 - Bidirectional propagation (changes anywhere → everywhere interested).
 - Efficient: Merkle-tree indexing (per-subtree roots), `notify` watching + periodic rescans, `copia` block-level deltas.
-- Transport: Noise Protocol Framework with preshared symmetric key (PSK) via `snow`.
+- Transport:
+  - Encryption: 32-byte preshared symmetric key (PSK) only.
+    - Noise Protocol Framework with preshared symmetric key (PSK) via `snow`.
 - Metadata: Preserve Unix mode bits + mtime + size; ignore UID/GID.
 - Conflicts: Low-concurrency assumption → “latest mtime wins” (clocks must be NTP-synced within ~1s); optional timestamped `.conflict-YYYYMMDD-HHMMSS.ext` copy on tie.
 - Daemonized, minimal resource use, Rust-only (no external processes except optional CLI tools).
 
 ### 2. High-Level Architecture
-- **Master Daemon** (`arborsync-master`):
-  - Single process watching entire `/central`.
-  - Global index (DB) of all files + per-subtree Merkle roots.
-  - Listens on TCP/TLS-like socket (Noise handshake).
+- **Master Daemon** (`arborsync master`):
+  - Single process watching entire hierarchy.
+  - Maintains global index (DB) of all files + per-subtree Merkle roots.
+  - Listens on QUIC endpoint.
   - Accepts slave subscriptions (checkout list).
   - On change: recompute affected subtree Merkle, push deltas only to interested slaves.
-- **Slave Daemon** (`arborsync-slave`):
+- **Slave Daemon** (`arborsync slave`):
   - Runs on any host (including backup server).
   - Reads local config file with checkout mappings.
-  - Connects only to master(s); subscribes to its mappings.
+  - Connects only to master via QUIC; subscribes to mapped subtrees.
   - Local changes → push to master; master pushes → apply locally.
   - Multiple local copies of same central file are allowed (duplicate mappings).
-- **Shared Library** (`arborsync-core`): Common types, protocol, Merkle helpers, DB abstraction, delta engine.
-- **Communication:** Persistent Noise-encrypted streams (bidirectional). Framed binary messages (bincode for simplicity; Prost/Protobuf optional later).
+- **Shared Library** (`arborsync-core`): Common types, protocol, Merkle helpers, DB abstraction, delta engine, QUIC 
+  transport layer.
+- **Communication:**
+  - QUIC connections with Noise handshake via `quinn-hyphae`.
+  - Native bidirectional streams for all messages (no manual framing).
 - **Persistence:** Master uses embedded DB for index. Slaves may keep lightweight local cache (same DB backend).
 
 **Data Flow (example)**
 1. Slave A checks out `/central/src/project1` → `/opt/app1/src`.
 2. Slave B checks out `/central/` → `/backup/central` (full replica).
-3. File `/central/src/project1/foo.rs` changes on Slave A → Slave A computes delta → sends to master → master updates index → pushes delta to Slave B (and any other interested slaves).
+3. File `/central/src/project1/foo.rs` changes on Slave A → Slave A computes delta → sends to master → master 
+   updates index → pushes delta over separate QUIC streams to Slave B (and any other interested slaves).
 
 ### 3. Crate Dependencies (Cargo.toml skeleton)
 ```toml
@@ -45,9 +67,11 @@ arborsync-core = { path = "core" }  # workspace
 
 # Core
 tokio = { version = "1", features = ["full"] }
-snow = "0.9"
-copia = "0.3"                  # rsync delta-transfer (embeddable)
-notify = "8"                   # + notify-debouncer-mini = "0.5"
+quinn = "0.11"                    # QUIC transport
+quinn-hyphae = "0.1"              # Noise handshake over Quinn (full PSK support)
+copia = "0.3"                     # rsync delta-transfer (embeddable)
+notify = "8"
+notify-debouncer-mini = "0.5"
 rs_merkle = "1"
 redb = "2"                     # primary (see §5)
 bincode = "2"
@@ -57,10 +81,9 @@ time = { version = "0.3", features = ["serde"] }  # for mtime
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
-
-# Optional (for future)
-# prost, fjall, sled, etc.
 ```
+
+Note on `quinn-hyphae`: Uses the crate `quinn-hyphae` (or the maintained fork `asport-quinn-hyphae` which re-exports as `quinn_hyphae` for API compatibility). It provides full Noise pattern control + PSK injection.
 
 **Workspace structure**
 ```
@@ -127,17 +150,52 @@ Config flag: `--db-backend redb|sled` (default: redb). Master and slaves use the
   2. Sender computes delta → transmit only changed blocks.
 - Fallback: whole-file if < 4 KB or first sync.
 
-### 8. Network Protocol (over Noise PSK)
-- Handshake: `snow::NoiseBuilder::new().psk0(...)` with 32-byte PSK from config.
-- Post-handshake: length-prefixed bincode messages (enum `ProtocolMessage`).
-- Key messages (bidirectional):
-  - `Subscribe { mappings: Vec<(central_path, local_path)> }`
-  - `MerkleUpdate { subtree: String, new_root: [u8;32], proof: MerkleProof }`
-  - `DeltaRequest { file_path: String, signature: Vec<u8> }`
-  - `DeltaResponse { delta: Vec<u8> }`
-  - `FileMetadataPush { path, meta }`
-  - `ConflictNotification` (optional)
-- Heartbeat every 30 s; reconnect logic with exponential backoff.
+### 8. Network / Transport Layer (NEW – QUIC + quinn-hyphae)
+**Primary Transport:** QUIC (IETF RFC 9000) via `quinn` + **Noise handshake via `quinn-hyphae`**.  
+**Why this combination:**
+- Native stream multiplexing (each delta, Merkle update, subscription, heartbeat gets its own QUIC stream → zero head-of-line blocking).
+- 0-RTT resumption with PSK.
+- Built-in connection migration, better NAT traversal, modern congestion control.
+- Exact PSK security model you requested (no certificates).
+
+**Handshake Details:**
+- Noise pattern: `Noise_XX_25519_ChaChaPoly_BLAKE2s` (or any supported by hyphae; XX recommended for mutual auth with PSK).
+- PSK injected as 32-byte preshared key (config field `psk`).
+- ALPN: `arborsync-v1` for version negotiation.
+- Post-handshake: All protocol messages flow over QUIC bidirectional streams (no length-prefixing required; Quinn handles framing/reliability).
+
+**Configuration Additions**
+```toml
+# master.toml / slave.toml
+transport = "quic"                  # default; "tcp" optional fallback (future)
+listen_addr = "0.0.0.0:8443"        # UDP port for QUIC
+psk = "hex:32bytekeyhere..."        # enforced 32 bytes
+quic_max_concurrent_streams = 256
+quic_idle_timeout_ms = 300000
+quic_initial_mtu = 1200
+```
+
+**Master Implementation:**
+- `quinn::Endpoint::server(...)` + `quinn_hyphae::NoiseConfig` with PSK.
+- Accept connections → run hyphae Noise handshake → spawn per-connection handler.
+
+**Slave Implementation:**
+- `quinn::Endpoint::client(...)` → `connect` → hyphae handshake with PSK.
+- Open control stream for subscriptions; open new streams on-demand for deltas.
+
+**Protocol Messages (unchanged enum):**
+```rust
+#[derive(Serialize, Deserialize)]
+pub enum ProtocolMessage {
+    Subscribe { mappings: Vec<(String, String)> },  // central → local
+    MerkleUpdate { subtree: String, new_root: [u8; 32], proof: Vec<u8> },
+    DeltaRequest { file_path: String, signature: Vec<u8> },
+    DeltaResponse { delta: Vec<u8> },
+    FileMetadataPush { path: String, meta: FileMetadata },
+    // ...
+}
+```
+Messages are sent/received directly on QUIC streams using `bincode`.
 
 ### 9. Configuration
 **Master** (`/etc/arborsync/master.toml` or `--config`):
@@ -170,18 +228,21 @@ checkouts = [
 ### 11. Error Handling, Logging, Security
 - All ops in `anyhow`/`thiserror` chains.
 - Structured logging (JSON option).
+- QUIC-specific: `quinn::ConnectionError` handling, automatic reconnect with exponential backoff (Quinn handles most of it).
 - PSK must be 32 bytes (enforced); rotate via config reload.
 - No root required (run as dedicated user).
 - Rate limiting / DoS protection on master (tokio).
 
 ### 12. Implementation Roadmap (LLM-friendly chunks)
-1. Core crate: Storage trait + redb impl, FileMetadata struct, Merkle helpers.
-2. Master: watcher + index updater + listener stub.
-3. Slave: config parser + connector + local applicator.
-4. Protocol + Noise wrapper.
+1. Core crate: Storage trait + redb impl, FileMetadata struct, Merkle helpers, Transport trait (with `QuicHyphaeTransport` impl).
+2. Master: watcher + index updater + QUIC endpoint + hyphae handshake.
+3. Slave: config parser + QUIC connector + local applicator.
+4. Protocol messages over QUIC streams.
 5. Delta round-trip with copia.
 6. Full bidirectional tests (unit + integration with temp dirs).
 7. CLI flags, systemd units, packaging.
+
+Transport Modularity: Define trait Transport in core so you can swap QUIC ↔ TCP later with minimal changes.
 
 **Next Steps for Implementation**
 - Start with `cargo new arborsync --bin` + workspace.
