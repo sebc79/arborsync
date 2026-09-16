@@ -1,260 +1,543 @@
 **Full Specification: ArborSync – Selective Subtree File Synchronization Daemon**
 
-**Version:** 1.0 (April 2026)  
+**Version:** 2.0 (September 2026)
 
-**Purpose:** Provide a complete, LLM/human-implementable blueprint for a lightweight, bidirectional, central-master 
-file sync tool that satisfies these requirements:
-- one central hierarchy,
-- arbitrary subtree checkouts to arbitrary local paths on slaves,
-- Merkle-based indexing with custom metadata (mode bits, mtime, size),
-- efficient rsync-style block deltas,
-- FS watching + rescans,
-- PSK-encrypted transport,
-- Unix perms preserved (no UID/GID),
-- simple conflict handling.
+**Normative.** This file is the source of truth. Topic documents under `doc/` expand procedures; they must not add requirements that contradict this file.
 
-**Provisional Project Name:** *ArborSync* (crate: `arborsync`)
+**Purpose:** A lightweight, bidirectional, central-master file sync daemon:
 
-Single binary: `arborsync`
+- one central hierarchy on the master;
+- arbitrary subtree checkouts to arbitrary local paths on slaves;
+- path-Merkle indexing (mode, mtime, size, content hash);
+- rsync-style block deltas via `copia`;
+- filesystem watching plus periodic full metadata rescans;
+- mutually authenticated QUIC (Noise XX, per-slave static keys);
+- prefix ACLs per slave;
+- Unix permissions preserved (no UID/GID);
+- compare-and-swap on content hash; the loser is kept, never overwritten.
 
-Usage:
-- `arborsync master /central`
-- `arborsync slave config.yaml`
+**Name:** ArborSync (crate / binary: `arborsync`)
 
-### 1. Core Requirements (Non-Negotiable)
-- Master holds **one** full filesystem hierarchy (`/central`), with a global index.
-- Slaves declare a list of checkouts: each checkout maps a `central_subtree_path` (canonical prefix) to a `local_path`, with a local integer ID.
-- Full-replica backup = one slave checkout with canonical `/` → `/backup/central`.
-- Each checkout maintains its own index (metadata and Merkle roots), updated independently by local filesystem watching/scanning.
-- Bidirectional propagation: changes in any checkout update the master's global index, then propagate to overlapping checkouts on other nodes.
-- Efficient: Merkle-tree indexing (per-checkout and global subtree roots), `notify` watching + periodic rescans per checkout, `copia` block-level deltas.
-- Transport:
-  - Encryption: 32-byte preshared symmetric key (PSK) only.
-    - Noise Protocol Framework with preshared symmetric key (PSK) via `snow`.
-- Metadata: Preserve Unix mode bits + mtime + size; ignore UID/GID.
-- Conflicts: Low-concurrency assumption → "latest mtime wins" (clocks must be NTP-synced within ~1s); optional timestamped `.conflict-YYYYMMDD-HHMMSS.ext` copy on tie.
-- Daemonized, minimal resource use, Rust-only (no external processes except optional CLI tools).
+```
+arborsync master [--config /etc/arborsync/master.toml]
+arborsync slave  [--config ~/.config/arborsync/slave.toml]
+arborsync keygen [--out PATH]
+```
 
-### 2. High-Level Architecture
-- **Master Daemon** (`arborsync master`):
-  - Watches the central hierarchy (`/central`).
-  - Maintains global index (DB) of all files + per-subtree Merkle roots (no prefixing).
-  - Listens on QUIC endpoint.
-  - Accepts slave subscriptions (checkout list).
-  - On change or slave update: recompute affected subtree Merkle, push deltas to interested slaves.
-- **Slave Daemon** (`arborsync slave`):
-  - Runs on any host (including backup server).
-  - Reads local config file with checkouts (each with ID, canonical prefix, local path).
-  - Maintains per-checkout indexes (DB) with prefixed keys for metadata and Merkle roots.
-  - Connects only to master via QUIC; subscribes to checkouts.
-  - For each checkout: watches local path, updates local index, computes deltas vs master view, sends to master.
-  - Master pushes → apply to local checkouts and indexes.
-  - Local paths must not overlap (e.g., no `/a` and `/a/b`).
-- **Shared Library** (`arborsync-core`): Common types, protocol, Merkle helpers, DB abstraction, delta engine, QUIC 
-  transport layer.
-- **Communication:**
-  - QUIC connections with Noise handshake via `quinn-hyphae`.
-  - Native bidirectional streams for all messages (no manual framing).
-  - Indexing is local; no protocol changes for per-checkout indexes.
-- **Persistence:** Master uses embedded DB for index. Slaves may keep lightweight local cache (same DB backend).
+Config is TOML only.
 
-**Data Flow (example)**
-1. Slave A has checkout (ID=1, canonical `/src/project1` → local `/opt/app1/src`).
-2. Slave B has checkout (ID=1, canonical `/` → local `/backup/central`) (full replica).
-3. File `/opt/app1/src/foo.rs` changes on Slave A → Slave A updates its checkout index → computes delta vs master view → sends to master → master updates global index → pushes delta to Slave B's checkout (and any overlapping checkouts).
+---
 
-### 3. Crate Dependencies (Cargo.toml skeleton)
+### 0. Non-goals (v1)
+
+- Multi-master, master-of-masters, sharded registries, or a networked SQL backend.
+- A second embedded database (`sled`) or `--db-backend` switch.
+- Shared cluster PSK as the authenticator; Noise PSK modifier; QUIC 0-RTT (mutating RPCs must not use 0-RTT even if a crate later grows it).
+- TCP fallback, UID/GID, xattrs, ACLs, BSD flags, hardlink preservation.
+- Metrics HTTP port, config templating / include files, file-type push priority.
+- Rejecting updates by wall-clock age.
+
+---
+
+### 1. Core requirements
+
+- Master holds one filesystem hierarchy bound at `central_root` (example host path: `/central`) and one global index.
+- **Canonical paths** are absolute paths in the *logical* hierarchy, never including `central_root`. The hierarchy root is `/`. A file the OS sees as `/central/src/foo.rs` has canonical path `/src/foo.rs`. This string is the only path that appears in the index, the Merkle tree, and the wire protocol.
+- A **checkout** is `{ id, central, local }`:
+  - `id`: stable UTF-8 string, unique among that slave’s checkouts. Not a recycled integer.
+  - `central`: canonical prefix (e.g. `/src`, or `/` for a full replica).
+  - `local`: absolute host path on the slave.
+- **Local paths on one slave must not overlap** (neither `/a` and `/a/b` nor identical paths). **Central prefixes on one slave may overlap** (e.g. `/src` → `/opt/src` and `/` → `/backup/central` on the same host).
+- Each checkout has its own index (metadata, directory hashes, last-synced hashes), updated by that checkout’s watcher and rescan.
+- Bidirectional: a change in any checkout CAS-applies on the master, then fans out to every other interested checkout (including another checkout on the originating slave).
+- Transport: QUIC + Noise `XX` with persisted X25519 static keys. Master authorizes the peer key against a slave ACL and restricts that slave to configured central prefixes.
+- Metadata: Unix mode (type + perms + setuid/setgid/sticky), mtime, size. Ignore UID/GID.
+- Conflicts: CAS on content hash. Live path always converges to the CAS winner. The loser’s bytes are written under a reserved, unsynced sidecar. mtime is preserved metadata, never an arbiter.
+- Daemonized, Rust-only, no extra processes.
+
+---
+
+### 2. Architecture
+
+**Master** (`arborsync master`)
+
+- Watches `central_root`.
+- Maintains the global path-Merkle index (no checkout prefix).
+- Listens on a QUIC/UDP endpoint.
+- Authenticates slaves by static public key; enforces prefix ACL.
+- Accepts `Subscribe` (checkout id + central prefix only; local paths stay on the slave).
+- On local change or accepted slave CAS: write the tree, recompute affected directory hashes, push to interested checkouts. Do not queue payloads for disconnected slaves.
+
+**Slave** (`arborsync slave`)
+
+- Reads TOML. Validates no local-path overlap before connecting.
+- One QUIC connection to the master. Identifies as `slave_id`, bound to its static key.
+- Per-checkout watchers and indexes (keys prefixed by checkout id).
+- Translates canonical ↔ local using that checkout’s mapping.
+- Drives reconcile after subscribe, every rescan interval, and on reconnect.
+
+**Shared library** (`arborsync-core`): types, framing, path-Merkle, storage trait, delta helpers, transport.
+
+**Interest rule** (single definition): a checkout is interested in a canonical path `P` iff `checkout.central` is a prefix of `P`. Prefix means `P == central` or `P` starts with `central` + `/`. `/` matches everything. Sibling `/src` does not match `/src2`.
+
+**Data-flow example**
+
+1. Slave `dev-alice` has checkout `src` (`/src/project1` → `/opt/app1/src`) and checkout `bak` (`/` → `/backup/central`).
+2. Slave `backup` has checkout `all` (`/` → `/backup/central`).
+3. `/opt/app1/src/foo.rs` changes on alice/`src`. Alice updates that checkout’s index and sends `FileAnnounce { checkout_id = "src", ... }`.
+4. Master CAS-applies onto `central_root` + global index, `CasAccept`s alice/`src`, then announces to every other interested checkout. Alice/`bak` and `backup`/`all` both apply.
+
+---
+
+### 3. Checkout identity and overlap
+
 ```toml
-[dependencies]
-arborsync-core = { path = "core" }  # workspace
-
-# Core
-tokio = { version = "1", features = ["full"] }
-quinn = "0.11"                    # QUIC transport
-quinn-hyphae = "0.1"              # Noise handshake over Quinn (full PSK support)
-copia = "0.3"                     # rsync delta-transfer (embeddable)
-notify = "8"
-notify-debouncer-mini = "0.5"
-rs_merkle = "1"
-redb = "2"                     # primary (see §5)
-bincode = "2"
-serde = { version = "1", features = ["derive"] }
-blake3 = "1"                   # for Merkle leaves + content hashing
-time = { version = "0.3", features = ["serde"] }  # for mtime
-clap = { version = "4", features = ["derive"] }
-log = "0.4"
-env_logger = "0.11"
+checkouts = [
+    { id = "src", central = "/src", local = "/opt/projects/src" },
+    { id = "bak", central = "/",    local = "/backup/central" },
+]
 ```
 
-Note on `quinn-hyphae`: Uses the crate `quinn-hyphae` (or the maintained fork `asport-quinn-hyphae` which re-exports as `quinn_hyphae` for API compatibility). It provides full Noise pattern control + PSK injection.
+- Changing `id` or `central` is a remove + add: drop that id’s index rows; leave files on disk.
+- Removing a checkout unsubscribes it and drops its index; files on disk are untouched.
+- Adding a checkout subscribes and runs initial reconcile (slave root empty or leftover files vs master).
+- Config file is watched; those add/remove rules apply at runtime.
 
-**Workspace structure**
+**Overlap test (local):** two absolute paths overlap iff they are equal or one is a parent of the other after canonicalization (symlink-resolved at config load only). Reject the config.
+
+**Overlap (central):** allowed. Master emits one announce per interested `(slave_id, checkout_id)`.
+
+---
+
+### 4. Identity and prefix ACL
+
+Every node has a persisted X25519 static keypair (`arborsync keygen`).
+
+- Slave config: `slave_id`, `slave_key_path`, `master_public_keys` (one or more pins, for master-key rotation).
+- Master config: `master_key_path` and a list of slaves:
+
+```toml
+[[slaves]]
+id = "dev-alice"
+public_keys = ["hex:…"]          # current, plus previous during rotation
+allowed_prefixes = ["/src", "/docs"]
 ```
-arborsync/
-├── Cargo.toml
-├── core/          # shared types, protocol, merkle, storage trait
-├── master/
-├── slave/
-└── cli/           # optional admin CLI
+
+Handshake: Noise `XX_25519_ChaChaPoly_BLAKE2s` via `quinn-hyphae`. After XX, each side has the peer’s static public key.
+
+- Slave disconnects if the master’s key is not in `master_public_keys`.
+- Master looks up the peer key in `[[slaves]]`. Unknown key: disconnect. `slave_id` in `Subscribe` must match that ACL row.
+- Every `Subscribe` checkout `central` must be under at least one `allowed_prefixes` entry (same prefix rule as interest). Otherwise `SubscribeReject`.
+- Announces, deletes, and mkdirs from a slave for a path outside its ACL are rejected.
+- `allowed_prefixes = ["/"]` is a full-replica grant.
+- One live connection per `slave_id`. A new session with a valid key for that id replaces the old connection.
+
+**Rotation**
+
+- Slave key: add the new public key to `public_keys`, reload master, switch the slave key, then drop the old key.
+- Master key: add the new public key to every slave’s `master_public_keys` first, rotate the master key, then remove the old pin.
+
+**Reloadable** without restart: log level, rate limits, ACL rows (add/remove slaves, prefixes, extra public keys).  
+**Not reloadable:** `listen_addr`, `db_path`, `central_root`, key *paths*, `master_addr`.
+
+---
+
+### 5. Path Merkle
+
+One tree per index (master global; one per slave checkout). This is a **directory hash tree**, not a flat `rs_merkle` leaf list. Do not use `rs_merkle`.
+
+**Kinds:** `File = 1`, `Dir = 2`, `Symlink = 3`.
+
+**File / symlink node** (the CAS object for a non-dir):
+
+```
+FileNode = BLAKE3(
+    u8 kind
+    || content_hash          # 32 bytes
+    || u64be size
+    || i64be mtime_ns        # Unix nanoseconds; negative allowed
+    || u32be mode            # st_mode including type bits
+)
 ```
 
-### 4. Database Backend Arbitration & Abstraction
-**Recommendation: redb as primary/default backend** (as of April 2026).
+- File `content_hash` = BLAKE3 of raw file bytes.
+- Symlink `content_hash` = BLAKE3 of the target bytes as returned by the OS (no extra NUL). `size` is the target length.
 
-**Rationale (research summary):**
-- redb: Stable 1.0+ since 2023, actively maintained, pure Rust, B+tree, MVCC, crash-safe, single-file, excellent benchmarks (often beats sled/lmdb/rocksdb on individual writes, random reads, and bulk loads for our workload). Typed tables, multi-table support, transactions out-of-the-box. No on-disk format instability.
-- sled: Still in prolonged beta (0.x/alpha releases), on-disk format changes historically, community notes migration risks and slower stabilization. Good read-heavy performance in older comparisons but redb is the clear modern choice for new projects.
-- redb fits perfectly: low-to-medium cardinality index (files in a hierarchy), frequent small writes from watcher, concurrent reads from network.
+**Directory node:**
 
-**Abstraction (mandatory for switchability):**
-In `core/src/storage.rs` define:
+```
+# each child, names sorted as raw UTF-8 bytes:
+entry = u8 kind || u32be name_len || name || 32-byte child_FileNode_or_DirNode
+DirNode = BLAKE3(concat(entries))
+```
+
+The empty directory hash is `BLAKE3("")` (no entries). Directories are first-class: an empty dir is a node.
+
+**Path is location, not payload.** `/src/foo.rs` is the walk `/` → `src` → `foo.rs`. Do not hash the path into the node.
+
+**Subtree root** of a checkout is `DirNode(central)` if `central` is a directory, or the `FileNode` if someone maps a single file (allowed). Master caches every directory’s `DirNode` in the DB.
+
+**Reconcile is a tree walk, not an inclusion proof.** If two roots differ, exchange that directory’s child list `(name, kind, node_hash)`, recurse where hashes differ, then transfer or delete only those files. Complexity follows the size of the symmetric difference, not a binary-tree proof.
+
+Insert and delete change only ancestor `DirNode`s. No global leaf-index shift.
+
+---
+
+### 6. Metadata
+
 ```rust
-pub trait Storage: Send + Sync + 'static {
-    type Error: std::error::Error + Send + Sync;
-    fn open(path: &std::path::Path) -> Result<Self, Self::Error>;
-    // Table definitions via associated types or generic methods
-    // For slaves: keys prefixed with checkout_id (e.g., "1:/path"); master: no prefix
-    fn get_file_metadata(&self, checkout_id: Option<&str>, path: &str) -> Result<Option<FileMetadata>, Self::Error>;
-    fn put_file_metadata(&self, checkout_id: Option<&str>, path: &str, meta: FileMetadata) -> Result<(), Self::Error>;
-    fn get_subtree_merkle_root(&self, checkout_id: Option<&str>, subtree: &str) -> Result<Option<MerkleRoot>, Self::Error>;
-    fn put_subtree_merkle_root(&self, checkout_id: Option<&str>, subtree: &str, root: MerkleRoot) -> Result<(), Self::Error>;
-    // Transactions, range queries for subtree walks, etc.
-    fn transaction<F, R>(&self, f: F) -> Result<R, Self::Error> where F: FnOnce(&mut Transaction) -> Result<R, Self::Error>;
-    // ... more methods as needed
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FileMetadata {
+    pub kind: EntryKind,       // File | Dir | Symlink
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub mode: u32,
+    pub content_hash: [u8; 32],
 }
 
-pub struct RedbStorage { /* ... */ }  // implements Storage
-// pub struct SledStorage { /* ... */ } // stub for future
-```
-Config flag: `--db-backend redb|sled` (default: redb). Master uses `checkout_id=None`; slaves use `Some("id")`. This adds ~100 lines but future-proofs everything.
-
-### 5. Merkle Tree Design (rs_merkle)
-- **Why rs_merkle**: Low-level control (vs high-level `merkle_hash`). Supports custom `Hasher`, transactional updates, proofs, rollback.
-- **Leaf format** (custom): Each leaf = BLAKE3 hash of serialized tuple:
-  ```
-  leaf_data = path_hash (blake3 of canonical path) || content_hash (blake3 of file bytes) || size || mtime (unix ns) || mode (u32)
-  ```
-  → `rs_merkle::MerkleTree<Blake3Hasher>` where you pre-compute 32-byte leaf hashes.
-- Master maintains one global Merkle tree (or one per top-level subtree) + cached subtree roots in DB (no prefixing).
-- On change (watcher or push): recompute only affected path upward (efficient with rs_merkle’s API).
-- Slaves maintain per-checkout Merkle trees + cached subtree roots in DB (keys prefixed with checkout_id).
-- Delta request: Slave sends delta for changed files in checkout vs master's global view.
-- Synchronization: Changes in checkout update master's global Merkle, then propagate to other checkouts.
-
-### 6. Change Detection
-- `notify-debouncer-mini`: Recursive watch on master (full tree) and on each slave (per-checkout local paths).
-- Debounce 200–500 ms.
-- Background rescan every 60 s (full Merkle walk on changed subtrees only, per checkout) for robustness (missed events, NFS, etc.).
-- On event: update DB metadata in respective checkout index → recompute Merkle → sync with master.
-
-### 7. Delta Transfer (copia)
-- Use `copia::Sync` (or `SyncBuilder`) directly in memory/streams.
-- Master/slave: When sending a file:
-  1. Recipient sends signature of its basis file.
-  2. Sender computes delta → transmit only changed blocks.
-- Fallback: whole-file if < 4 KB or first sync.
-
-### 8. Network / Transport Layer (NEW – QUIC + quinn-hyphae)
-**Primary Transport:** QUIC (IETF RFC 9000) via `quinn` + **Noise handshake via `quinn-hyphae`**.  
-**Why this combination:**
-- Native stream multiplexing (each delta, Merkle update, subscription, heartbeat gets its own QUIC stream → zero head-of-line blocking).
-- 0-RTT resumption with PSK.
-- Built-in connection migration, better NAT traversal, modern congestion control.
-- Exact PSK security model you requested (no certificates).
-
-**Handshake Details:**
-- Noise pattern: `Noise_XX_25519_ChaChaPoly_BLAKE2s` (or any supported by hyphae; XX recommended for mutual auth with PSK).
-- PSK injected as 32-byte preshared key (config field `psk`).
-- ALPN: `arborsync-v1` for version negotiation.
-- Post-handshake: All protocol messages flow over QUIC bidirectional streams (no length-prefixing required; Quinn handles framing/reliability).
-
-**Configuration Additions**
-```toml
-# master.toml / slave.toml
-transport = "quic"                  # default; "tcp" optional fallback (future)
-listen_addr = "0.0.0.0:8443"        # UDP port for QUIC
-psk = "hex:32bytekeyhere..."        # enforced 32 bytes
-quic_max_concurrent_streams = 256
-quic_idle_timeout_ms = 300000
-quic_initial_mtu = 1200
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub enum EntryKind { File = 1, Dir = 2, Symlink = 3 }
 ```
 
-**Master Implementation:**
-- `quinn::Endpoint::server(...)` + `quinn_hyphae::NoiseConfig` with PSK.
-- Accept connections → run hyphae Noise handshake → spawn per-connection handler.
+`FileNode` / `DirNode` are computed from this plus, for dirs, the child list.
 
-**Slave Implementation:**
-- `quinn::Endpoint::client(...)` → `connect` → hyphae handshake with PSK.
-- Open control stream for subscriptions; open new streams on-demand for deltas.
+**Collection:** `std::fs::metadata` + streaming BLAKE3. Hash only when size or mtime differs from the index, or the row is missing (rescan). Watcher events always re-read metadata; hash files when kind is File and content may have changed (Write/Create), and always re-hash on size/mtime mismatch.
 
-**Protocol Messages (unchanged enum):**
+**Mode:** preserve type bits, `rwx` for ugo, setuid/setgid/sticky. Never read or write UID/GID. Apply file/dir perms with `std::fs::set_permissions` using `mode & 0o7777`. Set mtime with the `filetime` crate (not `std::os::unix::fs::FileExt` — that API is `read_at`/`write_at`).
+
+**Symlinks:** resolve *only* the checkout `local` and master’s `central_root` at config load. In-tree symlinks are first-class: store the target, do not follow. Following would escape the checkout and duplicate leaves.
+
+**Skipped:** device files, sockets, FIFOs. Log and continue. Hardlinks are two independent paths (same bytes, two index rows).
+
+**Reserved names** at a checkout root (and at `central_root`): `.arborsync-tmp`, `.arborsync-conflicts`. Not indexed, not watched, not synced.
+
+---
+
+### 7. Change detection
+
+- `notify` + `notify-debouncer-mini`, recursive, debounce default 200 ms (configurable 200–500).
+- Master: one watch on `central_root`.
+- Slave: one watch per checkout `local`.
+- Events: Create, Write, Remove, Rename, chmod/mtime (`Modify(Metadata)`).
+- **Rename:** if both `from` and `to` land in the same debounce window *and* both are inside the same checkout, announce `Rename`. Otherwise treat as Delete + Create.
+- **Rescan every 60 s** (configurable): full `stat` walk of the checkout (or `central_root`). Not “changed subtrees only” — the rescan exists because events were missed. Hash only on size/mtime mismatch or missing row. Then reconcile with master.
+- **Echo suppression:** each side keeps `inflight: (checkout_id, canonical_path) → expected content_hash`. A watcher event whose current content hash equals `inflight` is ignored and the entry cleared. After apply, set the announced mtime *before* releasing inflight, so the write does not look like a new local edit.
+- Never push a path whose local `FileNode` equals `last_synced`.
+
+---
+
+### 8. CAS, apply, and conflicts
+
+Master is the replica of record. The **winner** is whatever CAS commits on the master. Every live path converges to that. The **loser** is preserved.
+
+**Version identity:** `FileNode` (content + meta).  
+**Conflict** (sidecar) only when **content_hash** differs. Meta-only CAS failure: adopt the winner’s metadata, no sidecar.
+
+**Slave → master announce**
+
+```
+FileAnnounce { checkout_id, path, new: FileMetadata, basis: Option<FileNode> }
+```
+
+`checkout_id` is the announcing checkout (slave → master) or the target checkout (master → slave). Master skips fan-out to the pair that just committed; it does not put origin fields on the wire.
+
+- Create: `basis = None`; master accepts if the path is absent.
+- Update: master accepts if current `FileNode == basis`.
+- Success: master writes the file under `central_root` (atomic apply), updates index, recomputes ancestor `DirNode`s, replies `CasAccept { checkout_id, path, file_node: Some(...) }`, fans out one `FileAnnounce` per other interested checkout. The origin slave sets `last_synced` from `CasAccept`.
+- Failure: `CasReject { checkout_id, path, current }`. Slave writes its local bytes to the sidecar (if content differs), then pulls `current` onto the live path and sets `last_synced`.
+- `kind = Dir`: announce only, no bulk stream. `kind = Symlink`: bulk body is the target bytes (`Whole`).
+
+**Delete**
+
+```
+Delete { checkout_id, path, basis: FileNode }
+```
+
+Master accepts iff current `FileNode == basis`, then removes the path, replies `CasAccept { checkout_id, path, file_node: None }`, fans out `Delete` with that basis.
+
+Replica delete on a slave: delete the live path only if local `FileNode == last_synced` (or `==` announced basis). If local content differs, sidecar the local bytes, then delete the live path (master won).
+
+**Master → slave announce** (watcher or fan-out)
+
+Same `FileAnnounce` / `Delete` with `origin` = master (no checkout) and `basis` = the pre-change `FileNode` (or `None` for create). Slave:
+
+| Local state | Action |
+|---|---|
+| absent, create | apply |
+| `FileNode == basis` | apply |
+| `FileNode == new` | no-op, refresh `last_synced` |
+| content_hash differs | sidecar local, apply incoming |
+| content_hash same, meta differs | apply incoming meta |
+
+**Atomic apply:** write to `{checkout_local}/.arborsync-tmp/<unique>` (same filesystem), `fsync`, `rename` over the target, then update the index. Never patch in place. Directories: `create_dir_all` with mode; deletes are children-first. Corrupt delta → request `WholeFile` once; still fail → leave last good live file, log, wait for next reconcile.
+
+**Sidecar path:** `{checkout_local}/.arborsync-conflicts/{canonical-relative}--{content_hash_hex[0..16]}`. Create parent dirs as needed. Never place conflict files beside the original under a syncable name.
+
+**Type change** (file ↔ dir ↔ symlink): Delete + Create in one master transaction, each CAS-guarded.
+
+**Same-slave central overlap:** apply per checkout independently. Origin checkout is skipped on fan-out; the other local copy is updated via announce, not by copying locally out-of-band.
+
+There is no `latest-wins` / `local-wins` / `manual` policy knob and no `max_update_age_seconds`.
+
+---
+
+### 9. Content transfer (`copia`)
+
+Recipient-driven. Never compute a forward delta against a cached snapshot of the other side.
+
+1. After a successful CAS decision (or a pull the slave already knows it wants), the **recipient** of bytes sends `SignatureRequest { checkout_id, path, want_hash, signature }` where `signature` is `copia`’s signature of the local basis, or empty if there is no basis / size < 4 KiB / first create / symlink.
+2. Sender replies on a **bulk stream**: raw file bytes (`Whole`), symlink target bytes (`Whole`), or a `copia` delta (`Delta`). Directories have no bulk transfer.
+3. Recipient verifies BLAKE3 == `want_hash` before rename (`want_hash` is `content_hash`, not `FileNode`).
+
+`copia` is the delta engine only. Do not use its hub/bisync CLI protocol.
+
+---
+
+### 10. Reconcile (slave-driven)
+
+After `SubscribeAck`, every rescan interval, and on reconnect:
+
+1. Slave sends `RootReport { checkout_id, path: central, root }` for each checkout.
+2. Master replies `RootAck { match, master_root }`.
+3. On mismatch (or empty slave), slave walks:
+   - `DirListRequest` / `DirListResponse` for the directory (`name`, `kind`, `node_hash`).
+   - Name only on master → pull create (or `Mkdir`).
+   - Name only on slave → if `last_synced` absent, `FileAnnounce` create; if `last_synced` present and local == it, `Delete`; if local differs, announce CAS (slave thinks it changed) or, if master deleted, slave will `CasReject` and follow §8.
+   - Both present, hashes differ → recurse if dir; if file, 3-way on `last_synced`:
+     - local == last_synced, master != last_synced → pull;
+     - local != last_synced, master == last_synced → announce CAS;
+     - both differ and local != master → announce CAS; expect `CasReject` or win; §8 handles the loser.
+
+Initial populate is this walk with `last_synced` empty.
+
+Master does **not** buffer updates for offline slaves. Reconnect + reconcile is the only catch-up.
+
+---
+
+### 11. Wire protocol
+
+**Framing.** Quinn streams are byte streams. Every control message is:
+
+```
+u32be length || bincode(Envelope)
+Envelope { version: u16 = 1, msg: ProtocolMessage }
+```
+
+One long-lived **control stream** (opened by the slave after handshake). **Bulk streams** are one transfer each: a framed `BulkHeader`, then exactly `size` raw bytes. Do not put file bodies inside bincode.
+
+Handshake preamble / first Noise payload: ASCII `arborsync-v1`. Hyphae has no ALPN; this is the version pin. Mismatch → disconnect.
+
 ```rust
-#[derive(Serialize, Deserialize)]
+pub struct CheckoutRef { pub id: String, pub central: String }
+pub struct CheckoutAck { pub id: String, pub central: String, pub master_root: [u8; 32] }
+
 pub enum ProtocolMessage {
-    CheckoutSubscribe { checkouts: Vec<Checkout> },  // checkouts with id, canonical, local
-    MerkleUpdate { subtree: String, new_root: [u8; 32], proof: Vec<u8> },
-    DeltaRequest { file_path: String, signature: Vec<u8> },
-    DeltaResponse { delta: Vec<u8> },
-    FileMetadataPush { path: String, meta: FileMetadata },
-    // ...
+    Subscribe { slave_id: String, checkouts: Vec<CheckoutRef> },
+    SubscribeAck { checkouts: Vec<CheckoutAck> }, // id, central, master_root
+    SubscribeReject { reason: String, denied_centrals: Vec<String> },
+
+    RootReport { checkout_id: String, path: String, root: [u8; 32] },
+    RootAck { checkout_id: String, path: String, matched: bool, master_root: [u8; 32] },
+    DirListRequest { checkout_id: String, path: String },
+    DirListResponse { checkout_id: String, path: String, entries: Vec<DirEntry> },
+
+    FileAnnounce {
+        checkout_id: String,           // origin (slave→master) or target (master→slave)
+        path: String,
+        new: FileMetadata,
+        basis: Option<[u8; 32]>,       // FileNode; None = create
+    },
+    Delete {
+        checkout_id: String,
+        path: String,
+        basis: [u8; 32],
+    },
+    Rename {
+        checkout_id: String,
+        from: String,
+        to: String,
+        from_basis: [u8; 32],
+        to_new: FileMetadata,
+    },
+    CasAccept { checkout_id: String, path: String, file_node: Option<[u8; 32]> }, // None = delete
+    CasReject { checkout_id: String, path: String, current: Option<FileMetadata> },
+
+    SignatureRequest { checkout_id: String, path: String, want_hash: [u8; 32], signature: Vec<u8> },
+    Error { code: String, message: String },
+    Disconnect { reason: String },
+}
+
+pub struct DirEntry { pub name: String, pub kind: EntryKind, pub node_hash: [u8; 32] }
+
+pub struct BulkHeader {
+    pub path: String,
+    pub checkout_id: String,
+    pub want_hash: [u8; 32],
+    pub encoding: BulkEncoding, // Whole = 1, Delta = 2
+    pub size: u64,
 }
 ```
-Messages are sent/received directly on QUIC streams using `bincode`.
 
-### 9. Configuration
-**Master** (`/etc/arborsync/master.toml` or `--config`):
+Paths in every message are canonical. `checkout_id` is required on slave-scoped messages so a slave with central overlap can route to the right local tree. Keep-alive is QUIC’s; no application `Heartbeat`.
+
+---
+
+### 12. Transport
+
+- Library: `quinn` 0.11 + `quinn-hyphae` 0.1 (Noise XX + static keys). The hyphae **PSK modifier and QUIC 0-RTT are not implemented** — do not specify them.
+- Pattern: `Noise_XX_25519_ChaChaPoly_BLAKE2s`.
+- Listen: UDP, default `0.0.0.0:8443`.
+- Slave verifies master static key; master maps slave static key → ACL.
+- Unknown keys and ACL misses are disconnects, rate-limited per source IP.
+- Reconnect: exponential backoff, then `Subscribe` + reconcile. No 0-RTT, no replay of announces.
+- A `Transport` trait may exist for tests (in-memory). v1 ships QUIC only.
+
+---
+
+### 13. Storage
+
+**redb only.** No backend switch.
+
+```rust
+pub struct CheckoutId(pub String); // master: CheckoutId("")
+
+pub trait Storage: Send + Sync + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn open(path: &std::path::Path) -> Result<Self, Self::Error> where Self: Sized;
+
+    fn begin_write(&self) -> Result<WriteBatch<'_>, Self::Error>;
+}
+
+pub trait WriteBatch {
+    fn put_meta(&mut self, ck: &CheckoutId, path: &str, meta: &FileMetadata) -> Result<(), Error>;
+    fn del_meta(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Error>;
+    fn put_dir_node(&mut self, ck: &CheckoutId, path: &str, node: [u8; 32]) -> Result<(), Error>;
+    fn del_dir_node(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Error>;
+    fn put_last_synced(&mut self, ck: &CheckoutId, path: &str, file_node: [u8; 32]) -> Result<(), Error>;
+    fn del_last_synced(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Error>;
+    fn commit(self) -> Result<(), Error>;
+}
+
+// Reads (consistent snapshot) live on Storage:
+// get_meta, get_dir_node, get_last_synced,
+// range_meta(prefix), range_dir_nodes(prefix),
+// delete_checkout_prefix(ck) — used when a checkout is removed
+```
+
+A metadata change and its ancestor `DirNode` updates and `last_synced` write commit in **one** batch. The earlier sketch with `get`/`put` outside `transaction()` is not the API.
+
+**Tables:** `meta` (ck, path) → `FileMetadata`; `dir_nodes` (ck, path) → `[u8;32]`; `last_synced` (ck, path) → `FileNode`. Master `ck` is the empty string.
+
+---
+
+### 14. Configuration (summary)
+
+**Master** `/etc/arborsync/master.toml`
+
 ```toml
 central_root = "/central"
 listen_addr = "0.0.0.0:8443"
-psk = "hex:32bytekeyhere..."
+master_key_path = "/etc/arborsync/master.key"
 db_path = "/var/lib/arborsync/index.redb"
 log_level = "info"
-# No checkouts defined; master watches central_root directly
+watcher_debounce_ms = 200
+rescan_interval_seconds = 60
+max_checkouts_per_slave = 100
+max_connections = 100
+max_connection_attempts_per_minute = 60
+
+[[slaves]]
+id = "dev-alice"
+public_keys = ["hex:32-byte-x25519-public"]
+allowed_prefixes = ["/src", "/docs"]
+
+[[slaves]]
+id = "backup-1"
+public_keys = ["hex:32-byte-x25519-public"]
+allowed_prefixes = ["/"]
 ```
 
-**Slave** (`~/.config/arborsync/slave.toml` or per-host):
+**Slave** `~/.config/arborsync/slave.toml`
+
 ```toml
+slave_id = "dev-alice"
 master_addr = "master.example.com:8443"
-psk = "hex:32bytekeyhere..."
+slave_key_path = "~/.config/arborsync/slave.key"
+master_public_keys = ["hex:32-byte-master-public"]
 db_path = "/var/cache/arborsync/cache.redb"
+log_level = "info"
+max_checkouts_per_slave = 100
+watcher_debounce_ms = 200
+rescan_interval_seconds = 60
+
 checkouts = [
-    { id = 1, canonical_prefix = "/src", local_path = "/opt/projects/src" },
-    { id = 2, canonical_prefix = "/", local_path = "/backup/central" },
+    { id = "src", central = "/src", local = "/opt/projects/src" },
+    { id = "bak", central = "/",    local = "/backup/central" },
 ]
-# Local paths must not overlap (e.g., no "/a" and "/a/b")
-# Checkout management: config file watched for changes; additions trigger dynamic subscription to master, removals drop metadata from indexes (files untouched)
 ```
 
-### 10. Conflict & Permission Handling
-- On receive: compare local mtime vs incoming.
-- If incoming newer → overwrite + set mode.
-- If tie → create `.conflict-YYYYMMDD-HHMMSS.ext` (or configurable policy).
-- `std::fs::set_permissions` (mode only) after write.
-- mtime preserved via `filetime` crate or `std::os::unix::fs::FileExt`.
+Both sides enforce the same `max_checkouts_per_slave`. Config files are `0600` (they hold key *paths*, and slaves hold master pins). Private key files are `0600`.
 
-### 11. Error Handling, Logging, Security
-- All ops in `anyhow`/`thiserror` chains.
-- Structured logging (JSON option).
-- QUIC-specific: `quinn::ConnectionError` handling, automatic reconnect with exponential backoff (Quinn handles most of it).
-- PSK must be 32 bytes (enforced); rotate via config reload.
-- No root required (run as dedicated user).
-- Rate limiting / DoS protection on master (tokio).
+CLI overrides: `--config PATH`. Env: `ARBORSYNC_CONFIG`, `ARBORSYNC_LOG_LEVEL`. Do not put key material in the environment.
 
-### 12. Implementation Roadmap (LLM-friendly chunks)
-1. Core crate: Storage trait + redb impl (with checkout_id prefixing), Checkout struct, FileMetadata struct, Merkle helpers, Transport trait (with `QuicHyphaeTransport` impl).
-2. Master: watcher on central + global index updater + QUIC endpoint + hyphae handshake.
-3. Slave: config parser with checkouts + per-checkout watchers + local index updaters + QUIC connector + delta sender.
-4. Protocol messages over QUIC streams (no changes needed for local indexing).
-5. Delta round-trip with copia (scoped to checkouts).
-6. Full bidirectional tests (unit + integration with temp dirs, multi-checkout scenarios).
-7. CLI flags, systemd units, packaging.
-8. Checkout management: watch config file for additions/removals, dynamic subscriptions, metadata cleanup on removal.
+---
 
-Transport Modularity: Define trait Transport in core so you can swap QUIC ↔ TCP later with minimal changes.
+### 15. Workspace and dependencies
 
-**Next Steps for Implementation**
-- Start with `cargo new arborsync --bin` + workspace.
-- Implement `core` first (Storage + Merkle).
-- I can provide skeleton code, exact `Cargo.toml`, or step-by-step module implementations on request.
+```
+arborsync/
+├── Cargo.toml          # workspace, binary `arborsync`
+├── core/               # arborsync-core
+└── src/                # master / slave / keygen subcommands
+```
 
-This specification is self-contained, leverages the requested crates exactly, and is deliberately modular for iterative LLM coding. It will produce a tiny, static, high-performance binary pair that matches your vision with zero bloat. Let me know which part to expand first (e.g., protocol enum definition, Storage trait full impl, or a minimal PoC main.rs).
+```toml
+[dependencies]
+arborsync-core = { path = "core" }
+tokio = { version = "1", features = ["full"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
+quinn-hyphae = "0.1"
+copia = "0.3"
+notify = "8"
+notify-debouncer-mini = "0.5"
+redb = "2"
+bincode = "2"
+serde = { version = "1", features = ["derive"] }
+blake3 = "1"
+time = { version = "0.3", features = ["serde"] }
+filetime = "0.2"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+anyhow = "1"
+```
+
+`quinn` default features may be trimmed further so hyphae supplies crypto; follow hyphae’s current Quinn setup. Disable TLS if unused.
+
+---
+
+### 16. Implementation roadmap
+
+1. `core`: `FileMetadata`, path-Merkle encode/hash, `Storage` + redb, frame codec, canonical-path helpers, reserved-name filter, local-overlap check.
+2. `keygen` + config parse/validate (ACL, pins, checkouts).
+3. Master: watch `central_root`, index, QUIC XX accept, ACL, Subscribe, CAS apply to disk, fan-out.
+4. Slave: connect, pin check, Subscribe, per-checkout watch, announce, apply, sidecar.
+5. Bulk `copia` streams; whole-file fallback.
+6. Reconcile walk + rescan + reconnect.
+7. Config watch for checkout add/remove; SIGHUP ACL/log reload.
+8. Tests: temp dirs, two checkouts on one slave (`/src` + `/`), CAS conflict, echo suppression, ACL deny, missed-watcher recover.
+
+Topic documents:
+
+| File | Expands |
+|---|---|
+| `subscriptions.md` | §3, §4, interest, Subscribe |
+| `building-updating-merkle-trees.md` | §5, §10 |
+| `collecting-metadata.md` | §6 |
+| `indexing.md` | §13 |
+| `filesystem-scanning-watching.md` | §7 |
+| `applying-updates.md` | §8, §9 |
+| `pushing-updates.md` | §8–§10 (master push + fan-out) |
+| `quic-transport.md` | §11, §12 |
+| `configuration.md` | §14 |

@@ -1,220 +1,111 @@
-# QUIC Transport Layer
+# QUIC Transport
 
-## Overview
+Normative source: `spec.md` §11 and §12.
 
-ArborSync uses QUIC as its primary transport protocol, providing secure, multiplexed, and efficient communication between master and slave nodes. The transport layer integrates Noise protocol framework for authenticated encryption using preshared keys (PSK).
+## Stack
 
-## Core Components
+- QUIC (RFC 9000) via `quinn` 0.11.
+- Noise handshake via `quinn-hyphae` 0.1: pattern `Noise_XX_25519_ChaChaPoly_BLAKE2s`.
+- Persisted X25519 **static keys** on both sides. This is what XX actually authenticates.
 
-### QUIC Implementation
-- **Library**: `quinn` v0.11
-- **Features**: IETF RFC 9000 compliant, UDP-based, stream multiplexing
-- **Benefits**: Zero head-of-line blocking, connection migration, modern congestion control
+**Not in this crate, not in v1:** Noise PSK modifier, a 32-byte cluster `psk` field, QUIC 0-RTT, ALPN (hyphae does not implement ALPN; version is the first Noise payload / preamble: ASCII `arborsync-v1`). Mutating messages are sent only after the handshake completes.
 
-### Noise Handshake
-- **Library**: `quinn-hyphae` v0.1 (Noise over Quinn)
-- **Pattern**: `Noise_XX_25519_ChaChaPoly_BLAKE2s`
-- **Authentication**: Mutual authentication with 32-byte PSK
-- **ALPN**: `arborsync-v1` for protocol negotiation
+## Endpoints
 
-## Transport Architecture
+**Master:** `quinn::Endpoint` + hyphae `HandshakeBuilder` with the master static key. Bind UDP `listen_addr` (default `0.0.0.0:8443`). One task per accepted connection.
 
-### Master Side
-- **Endpoint**: `quinn::Endpoint::server()` with Noise configuration
-- **Listener**: Accepts incoming QUIC connections on UDP port
-- **Handler**: Spawns per-connection task for each slave
+**Slave:** client endpoint, connect to `master_addr`. Present the slave static key.
 
-### Slave Side
-- **Endpoint**: `quinn::Endpoint::client()` 
-- **Connector**: Initiates connection to master address
-- **Streams**: Opens bidirectional streams as needed
+After XX:
 
-## Connection Establishment
+- Slave disconnects if the peer static key ∉ `master_public_keys`.
+- Master looks up the peer static key in `[[slaves]]`. Unknown → disconnect (rate-limited per source IP). Known → that row’s `id` is the only legal `slave_id` on `Subscribe`.
 
-### Handshake Process
-1. **UDP Connection**: Slave connects to master's UDP endpoint
-2. **Noise Handshake**: XX pattern with PSK authentication
-3. **ALPN Negotiation**: Confirms `arborsync-v1` protocol
-4. **Stream Setup**: Initial control stream for protocol messages
+## Streams
 
-### Security Properties
-- **Forward Secrecy**: Ephemeral keys per connection
-- **Authentication**: Mutual verification via PSK
-- **Encryption**: ChaChaPoly AEAD cipher
-- **Replay Protection**: Built into Noise protocol
+| Stream | Use |
+|---|---|
+| Control (one, slave-opened) | Framed `Envelope` messages |
+| Bulk (on demand, one transfer) | Framed `BulkHeader` + exactly `size` raw bytes |
 
-## Stream Management
+Quinn gives **byte streams**. “No framing needed” was wrong. Control frame:
 
-### Stream Types
-- **Control Stream**: Initial bidirectional stream for subscriptions and heartbeats
-- **Data Streams**: Separate streams for file deltas and Merkle updates
-- **Unidirectional**: Used for one-way notifications (push updates)
-
-### Multiplexing Benefits
-- **Concurrency**: Multiple transfers simultaneously without blocking
-- **Prioritization**: Control messages can bypass large data transfers
-- **Efficiency**: No connection overhead for parallel operations
-
-### Stream Lifecycle
-1. **Open**: Created on-demand for specific operations
-2. **Active**: Bidirectional data flow with flow control
-3. **Close**: Graceful shutdown with FIN frames
-4. **Error**: Immediate termination on protocol violations
-
-## Protocol Messages
-
-### Serialization
-- **Format**: Bincode for efficient binary serialization
-- **Compatibility**: Versioned message types for protocol evolution
-
-### Message Types
-```rust
-#[derive(Serialize, Deserialize)]
-pub enum ProtocolMessage {
-    // Subscription management
-    Subscribe { mappings: Vec<(String, String)> },  // central → local paths
-
-    // Merkle tree synchronization
-    MerkleUpdate { subtree: String, new_root: [u8; 32], proof: Vec<u8> },
-
-    // Slave state reporting and verification
-    SlaveRootReport { subtree: String, current_root: [u8; 32] },
-    SubtreeProofRequest { subtree: String },
-    SubtreeProofResponse { subtree: String, proof: Vec<u8> },
-
-    // Delta transfer
-    DeltaRequest { file_path: String, signature: Vec<u8> },
-    DeltaResponse { delta: Vec<u8> },
-
-    // Metadata propagation
-    FileMetadataPush { path: String, meta: FileMetadata },
-
-    // Connection management
-    Heartbeat,
-    Disconnect { reason: String },
-}
+```
+u32be length || bincode(Envelope { version: u16 = 1, msg: ProtocolMessage })
 ```
 
-### Message Flow
-- **Subscription**: Slave → Master (initial setup)
-- **Updates**: Master → Slave (push notifications)
-- **Deltas**: Bidirectional (slave changes or master responses)
-- **State Verification**:
-  - Slave → Master: `SlaveRootReport` (periodic root checks)
-  - Master → Slave: `SubtreeProofRequest` (on mismatch detection)
-  - Slave → Master: `SubtreeProofResponse` (proof for narrowing)
-  - Followed by targeted `DeltaRequest`/`DeltaResponse` exchanges
+Maximum control frame: 1 MiB. Larger → disconnect (file bodies do not belong here). Bulk header uses the same frame prefix; the body is raw and not length-prefixed again (`size` in the header is authoritative).
 
-## Configuration
+One message per bulk stream. Close the stream after the body. Control stream stays open for the session.
 
-### Master Configuration
+Keep-alive: QUIC idle timeout + quinn’s native ping. No `Heartbeat` message.
+
+## Message catalog
+
+Exact types: `spec.md` §11.
+
+Direction (normative):
+
+| Message | Who sends |
+|---|---|
+| `Subscribe` | slave |
+| `SubscribeAck` / `SubscribeReject` | master |
+| `RootReport` | slave |
+| `RootAck` | master |
+| `DirListRequest` | slave (walk); master only if a future extension needs it — v1 slave-driven |
+| `DirListResponse` | the peer who has that directory listing (master for pull, slave for compare) |
+| `FileAnnounce` / `Delete` / `Rename` | either side |
+| `CasAccept` / `CasReject` | master |
+| `SignatureRequest` | the side that needs bytes (usually the applying slave; master when pulling a slave create) |
+| bulk `Whole` / `Delta` | the side that has `want_hash` |
+| `Error` / `Disconnect` | either |
+
+`DirListResponse` in v1: when the slave requests a path, the master answers from the global index. When the walk needs the slave’s view, the slave already has it locally and does not need the master to ask — 3-way uses the slave’s index + master’s listing.
+
+## Reconnect
+
+Exponential backoff (1s, 2s, 4s, … cap 60s). Full handshake (no 0-RTT). `Subscribe` + reconcile. Do not replay in-flight announces from the previous connection.
+
+A new successful session for the same `slave_id` replaces the old one (master drops the previous connection).
+
+## Limits
+
 ```toml
-transport = "quic"
-listen_addr = "0.0.0.0:8443"        # UDP port
-psk = "hex:32bytekeyhere..."        # 32-byte PSK
 quic_max_concurrent_streams = 256
-quic_idle_timeout_ms = 300000       # 5 minutes
+quic_idle_timeout_ms = 300000
 quic_initial_mtu = 1200
+max_connections = 100
+max_connection_attempts_per_minute = 60
 ```
 
-### Slave Configuration
-```toml
-master_addr = "master.example.com:8443"
-psk = "hex:32bytekeyhere..."
-transport = "quic"
-```
+Idle timeout closes the QUIC connection; the slave reconnects. Unknown-key and broken-frame disconnects count toward the per-IP attempt limiter.
 
-### QUIC Parameters
-- **Max Streams**: Limits concurrent operations per connection
-- **Idle Timeout**: Automatic cleanup of stale connections
-- **MTU**: Optimized for various network conditions
+## Security
 
-## Connection Management
+- Mutual static-key authentication (XX).
+- Prefix ACL after `Subscribe` and on every slave-originated mutate (`spec.md` §4).
+- No shared secret that makes slaves interchangeable.
+- Forward secrecy: XX ephemeral DH. Session keys are not the static keys.
+- Do not send announces, deletes, or bulk bodies in any 0-RTT space if a future hyphae release grows it.
+- Key material: files `0600`, never logged, never put in the environment.
 
-### Lifecycle
-1. **Establish**: Noise handshake completes
-2. **Active**: Bidirectional communication
-3. **Idle**: Keep-alive with heartbeats
-4. **Close**: Graceful shutdown or error termination
+Rotation procedures: `spec.md` §4.
 
-### Reconnection
-- **Automatic**: Exponential backoff on connection loss
-- **State Recovery**: Resumes subscriptions after reconnect
-- **Seamless**: No data loss during brief disconnections
+## Errors
 
-### Load Balancing
-- **Master**: Accepts multiple concurrent slave connections
-- **Fairness**: Quinn's built-in flow control prevents starvation
-- **Resource Limits**: Configurable connection and stream limits
+- Handshake / pin / unknown key: disconnect, log at `warn` without printing keys.
+- Protocol version ≠ 1 or preamble ≠ `arborsync-v1`: disconnect.
+- Frame length > cap or bincode fail: disconnect (do not try to resync a corrupted control stream).
+- `Error` on a still-valid session: log; the affected path is retried at the next reconcile.
 
-## Performance Optimizations
+## Tests / in-memory
 
-### 0-RTT Resumption
-- **PSK Sessions**: Resume without full handshake
-- **Faster Reconnections**: Reduced latency for frequent connects
-- **Security**: Maintains forward secrecy guarantees
+A `Transport` trait that can be an in-memory pair of control+bulk channels is allowed for unit tests. v1 production path is QUIC only. No TCP fallback.
 
-### Congestion Control
-- **Modern Algorithms**: BBR/CUBIC implementations in Quinn
-- **Adaptive**: Adjusts to network conditions
-- **Fairness**: Coexists well with other traffic
+## Struck from earlier drafts
 
-### Memory Usage
-- **Streaming**: Process large files without full buffering
-- **Flow Control**: Prevents memory exhaustion
-- **Pooling**: Reuse connection resources
-
-## Security Considerations
-
-### Encryption
-- **AEAD**: Authenticated encryption for all data
-- **Perfect Forward Secrecy**: Ephemeral key agreement
-- **Key Rotation**: PSK can be rotated via config reload
-
-### Authentication
-- **Mutual**: Both parties verify each other
-- **PSK-based**: No certificate management required
-- **Session-based**: Per-connection authentication
-
-### DoS Protection
-- **Rate Limiting**: Throttle connection attempts
-- **Resource Bounds**: Limit memory per connection
-- **Timeouts**: Prevent resource exhaustion
-
-## Error Handling
-
-### Connection Errors
-- **Network Issues**: Automatic retry with backoff
-- **Protocol Violations**: Immediate connection termination
-- **Resource Exhaustion**: Graceful degradation
-
-### Recovery Mechanisms
-- **State Synchronization**: Merkle trees detect inconsistencies
-- **Partial Transfers**: Resume interrupted file transfers
-- **Logging**: Detailed error reporting for debugging
-
-## Integration Points
-
-### Filesystem Watching
-- Triggers data transmission over established connections
-- Maintains persistent connections for efficiency
-
-### Delta Engine
-- Uses QUIC streams for efficient block transfer
-- Multiplexing enables parallel delta operations
-
-### Configuration System
-- Runtime config reload for PSK rotation
-- Dynamic parameter adjustment
-
-## Future Extensibility
-
-### Transport Abstraction
-- **Trait-based**: `Transport` trait allows TCP fallback
-- **Modular**: Easy addition of new transport protocols
-- **Configuration-driven**: Runtime transport selection
-
-### Protocol Evolution
-- **Version Negotiation**: ALPN for protocol versioning
-- **Backward Compatibility**: Graceful handling of older clients
-- **Feature Flags**: Negotiate optional capabilities
+- `psk = "hex:…"`, `transport = "quic"|"tcp"`.
+- 0-RTT resumption “with forward secrecy and replay protection.”
+- ALPN `arborsync-v1` as a QUIC-TLS feature.
+- Application heartbeats.
+- “Seamless, no data loss during brief disconnects” via a push queue — replace with reconcile.

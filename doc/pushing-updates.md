@@ -1,222 +1,86 @@
-# Pushing Updates from Master
+# Pushing Updates from the Master
 
-## Overview
+Normative source: `spec.md` §8–§10.
 
-The master daemon detects filesystem changes and proactively pushes updates to all interested slave nodes. This push-based architecture ensures efficient bidirectional synchronization with minimal polling overhead.
+The master pushes **decisions**, not guessed deltas. Disconnected slaves are not queued; they catch up with reconcile.
 
-## Change Detection Flow
+## Fast path (someone just committed)
 
-### Event Trigger
-1. **Filesystem Event**: Watcher detects file modification
-2. **Debounce Period**: 200-500ms to coalesce rapid changes
-3. **Metadata Update**: Refresh file metadata in database
-4. **Merkle Recomputation**: Update affected subtree roots
+A commit is either:
 
-### Impact Assessment
-1. **Path Analysis**: Identify changed file path
-2. **Subtree Identification**: Find affected subtree prefixes
-3. **Subscriber Lookup**: Query which slaves map affected subtrees
-4. **Notification Planning**: Prepare update messages per slave
+- the master watcher/rescan applied a local FS change to the global index, or
+- the master accepted a slave `FileAnnounce` / `Delete` / `Rename` (CAS succeeded).
 
-## Subscriber Notification
+Then:
 
-### Interest Matching
-For each changed file, find slaves with relevant mappings:
-- Direct mapping: `/src/project1` maps `/central/src/project1/file.txt`
-- Parent mapping: `/` maps any file in hierarchy
-- Sibling isolation: `/src/project2` doesn't match `/src/project1` changes
+1. Recompute ancestor `DirNode`s (`building-updating-merkle-trees.md`).
+2. Look up interested **connected** checkouts: `central` is a prefix of the changed path (`spec.md` §2).
+3. Skip the `(slave_id, checkout_id)` pair that just committed, when the commit came from a slave.
+4. For each remaining `(slave_id, checkout_id)`, send `FileAnnounce` / `Delete` / `Rename` with that target `checkout_id`. `basis` is the pre-commit `FileNode`.
+5. The **recipient** asks for bytes (`SignatureRequest` + bulk stream) if it decides to apply (`applying-updates.md`).
 
-### Registry Structure
-- **Data Structure**: Path trie for efficient prefix matching
-- **Lookup**: O(path_depth) for subscriber identification
-- **Caching**: Maintain active connection list per slave
+Do not send `MerkleUpdate` proofs. Do not generate a `copia` delta until a recipient has sent a signature (or asked for whole-file).
 
-## Update Generation
+## Interest examples
 
-### Merkle Proof Creation
-1. **Current State**: Slave sends known subtree root
-2. **Proof Generation**: rs_merkle creates inclusion proof
-3. **Delta Computation**: Identify changed files via proof
+Changed `/src/project1/file.txt`:
 
-### Content Preparation
-1. **File Selection**: Only files changed since slave's last sync
-2. **Delta Generation**: Use copia to create binary diffs
-3. **Metadata Bundle**: Include mode, mtime, size updates
+| Checkout `central` | Notified? |
+|---|---|
+| `/` | yes |
+| `/src` | yes |
+| `/src/project1` | yes |
+| `/src/project1/file.txt` | yes (single-file map) |
+| `/src/project1/subdir` | no |
+| `/src/project2` | no |
+| `/src2` | no |
 
-### Batch Optimization
-- Group multiple changes in single push operation
-- Prioritize critical files (config > docs)
-- Compress metadata for efficient transfer
+## Slave-originated commit
 
-## Push Mechanism
+1. Slave watcher or rescan sees a real local change (`FileNode != last_synced`, not `inflight`).
+2. Slave sends `FileAnnounce` with `checkout_id` = that checkout and `basis = last_synced` (`None` if never synced).
+3. Master CAS (`applying-updates.md`). On success: write `central_root`, index, `CasAccept { checkout_id, path, file_node: Some(new FileNode) }`, fan-out. On failure: `CasReject`; slave sidecars if needed and pulls.
+4. Origin slave sets `last_synced` from `CasAccept` (`None` file_node → clear `last_synced` after a delete). Other slaves set `last_synced` after they apply.
 
-### QUIC Stream Allocation
-- **Control Stream**: Initial subscription and heartbeats
-- **Data Streams**: Dedicated per update operation
-- **Multiplexing**: Parallel pushes to multiple slaves
+## Slow path (reconcile)
 
-### Message Sequence
-1. **MerkleUpdate**: Send proof of changes
-2. **DeltaRequest**: Slave requests specific file deltas
-3. **DeltaResponse**: Stream binary patches
-4. **FileMetadataPush**: Update metadata records
+Missed watchers, offline periods, apply failures:
 
-### Flow Control
-- Respect QUIC stream limits
-- Backpressure on slow slaves
-- Prioritize active connections
+1. Slave `RootReport` for each checkout central.
+2. Master `RootAck` (compare to `dir_nodes[central]`).
+3. On mismatch, slave walks `DirList*` and 3-way (`spec.md` §10). Walks are bidirectional: the slave both pulls and announces. Initial sync is the same walk with empty `last_synced`.
 
-## Bidirectional Synchronization
+Master never walks a slave unsolicited. Master never stores a per-slave update queue, “max_queued_updates,” or retry buffer of file contents.
 
-### Slave-Initiated Changes
+Reconnect = new connection + `Subscribe` + this slow path. “Resume interrupted transfer” = the next walk notices the path still differs and transfers again. There is no byte-range resume.
 
-#### Direct Push Mechanism
-1. **Local Change**: Slave watcher detects file modification
-2. **Delta Computation**: Slave computes binary delta against known master state
-3. **Delta Upload**: Slave sends delta to master via QUIC stream
-4. **Master Integration**: Master applies delta, updates global index and Merkle tree
-5. **Fan-Out**: Push update to all other interested slaves
+## What is not a push trigger
 
-#### Root Comparison Recovery
-For changes missed by watchers, slaves implement periodic state verification:
+- Application heartbeats (QUIC keep-alive only).
+- Wall-clock age of a file.
+- File-type priority (config vs docs).
+- Administrative “force push this blob to offline nodes.”
 
-1. **Root Reporting**: Slave sends current Merkle roots for all checked-out subtrees
-2. **Master Comparison**: Master compares against global roots in database
-3. **Mismatch Handling**:
-   - If roots match: No action needed
-   - If roots differ: Initiate difference narrowing protocol
+A manual resync is: trigger the slave’s reconcile walk (SIGHUP on the slave or a future `arborsync slave reconcile` subcommand).
 
-#### Difference Narrowing Protocol
-1. **Subtree Proof Request**: Master requests Merkle proof from slave for mismatched subtree
-2. **Proof Analysis**: Master identifies specific changed files using rs_merkle verification
-3. **Targeted Delta Requests**: Master requests deltas only for identified changed files
-4. **Batch Application**: Master applies all changes in transaction
-5. **Integrity Verification**: Updated Merkle root computed and stored
+## Backpressure
 
-#### Push Triggers
-- **Watcher Events**: Immediate push on detected local changes
-- **Periodic Verification**: Root comparison every 60 seconds
-- **Reconnection**: Full state sync after network recovery
-- **Administrative**: Manual resync commands
+If a slave’s control stream is blocked, stop sending it more announces; the next `RootReport` after it catches up repairs anything missed. Do not grow an unbounded in-memory queue. `max_concurrent` bulk streams per connection is `quic_max_concurrent_streams` (config). Slow apply on the slave is the slave’s problem; the master does not snapshot file contents for it.
 
-### Conflict Resolution
-- **Master Authority**: Acts as central conflict resolver
-- **Mtime Arbitration**: Latest modification time wins
-- **Notification**: All parties receive resolved state
+## Offline
 
-## Performance Optimizations
+Disconnect drops interest. The 1000-update queue in earlier drafts is gone. Catch-up cost is the Merkle walk, not a replay log.
 
-### Selective Pushing
-- Only notify slaves with relevant mappings
-- Skip slaves already up-to-date
-- Batch small changes into larger updates
+## Observability
 
-### Parallel Processing
-- Concurrent pushes to multiple slaves
-- Asynchronous delta generation
-- Stream multiplexing for efficiency
+Log at `info`: connect/disconnect, Subscribe accept/reject, CAS accept/reject counts, reconcile starts, apply failures. No metrics port in v1.
 
-### Caching and Reuse
-- Cache Merkle proofs for common subtrees
-- Reuse deltas across similar slave configurations
-- Persistent connection pooling
+## Config knobs that remain
 
-## Error Handling
-
-### Connection Issues
-- **Retry Logic**: Exponential backoff on failed pushes
-- **Queue Management**: Buffer updates for offline slaves
-- **Timeout Handling**: Abandon stalled transfers
-
-### Slave Failures
-- **Detection**: Heartbeat monitoring
-- **Cleanup**: Remove failed slaves from active lists
-- **Recovery**: Resume pushes when slaves reconnect
-
-### Resource Limits
-- **Memory Bounds**: Limit queued updates per slave
-- **Rate Limiting**: Prevent update storms
-- **Priority Queues**: Critical updates bypass limits
-
-## Scalability Considerations
-
-### Large Deployments
-- **Sharding**: Partition subscriber registries
-- **Load Balancing**: Distribute master load across instances
-- **Hierarchical**: Master-of-masters for global scale
-
-### High-Frequency Changes
-- **Debouncing**: Aggregate rapid file changes
-- **Snapshotting**: Periodic full state synchronization
-- **Incremental**: Avoid redundant delta computation
-
-## Security and Access Control
-
-### Authentication
-- Only authenticated slaves receive pushes
-- PSK validation on all connections
-- Connection state tracking
-
-### Authorization
-- Path-based access control
-- Subscriber verification per update
-- Audit logging of all push operations
-
-## Monitoring and Observability
-
-### Metrics Collection
-- Updates pushed per second/minute
-- Subscriber counts and active connections
-- Delta sizes and transfer times
-
-### Logging
-- Structured logs for push operations
-- Error tracking for failed deliveries
-- Performance monitoring for bottlenecks
-
-### Health Checks
-- Connection health monitoring
-- Queue depth alerts
-- Slave reachability verification
-
-## Configuration Options
-
-### Push Behavior
 ```toml
-push_debounce_ms = 200
-max_concurrent_pushes = 50
-push_batch_size = 100
-push_timeout_seconds = 300
+watcher_debounce_ms = 200
+rescan_interval_seconds = 60
+quic_max_concurrent_streams = 256
 ```
 
-### Resource Limits
-```toml
-max_queued_updates_per_slave = 1000
-max_push_attempts = 3
-push_retry_delay_ms = 1000
-```
-
-### Performance Tuning
-```toml
-enable_delta_caching = true
-max_delta_cache_size_mb = 100
-parallel_delta_generation = true
-```
-
-## Integration Points
-
-### Filesystem Watching
-- Primary trigger for update generation
-- Provides real-time change detection
-
-### Database Layer
-- Supplies metadata for delta computation
-- Tracks subscriber mappings
-
-### Transport Layer
-- Handles reliable update delivery
-- Manages connection lifecycle
-
-### Merkle System
-- Generates proofs for change verification
-- Ensures update integrity
+Removed: `push_debounce_ms` as a second debounce (the watcher debounce is enough), `max_queued_updates_per_slave`, `max_push_attempts`, `enable_delta_caching`, `max_delta_cache_size_mb`, `push_batch_size` as a correctness parameter. A sender may coalesce multiple control messages in one syscall; that is not a specified batch protocol.

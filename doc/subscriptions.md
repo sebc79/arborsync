@@ -1,197 +1,83 @@
 # Subscriptions and Mappings
 
-## Overview
+Normative source: `spec.md` §2–§4 and §11.
 
-ArborSync's subscription system enables flexible, selective synchronization of filesystem subtrees. Slaves declare interest in specific central hierarchy paths and map them to local directories, allowing for customized checkouts and multiple overlapping mappings.
-
-## Subscription Model
-
-### Mapping Structure
-Each slave defines a list of mappings from central subtrees to local paths:
+## Mapping
 
 ```toml
 checkouts = [
-    { central = "/src/project1", local = "/opt/app1/src" },
-    { central = "/src/project2", local = "/opt/app2/src" },
-    { central = "/", local = "/backup/central" },  # Full replica
+    { id = "p1",  central = "/src/project1", local = "/opt/app1/src" },
+    { id = "p2",  central = "/src/project2", local = "/opt/app2/src" },
+    { id = "bak", central = "/",             local = "/backup/central" },
 ]
 ```
 
-### Mapping Properties
-- **Central Path**: Absolute path in master's hierarchy (e.g., `/src/project1`)
-- **Local Path**: Absolute path on slave's filesystem (e.g., `/opt/app1/src`)
-- **Arbitrary Depth**: Can map any subtree level
-- **Multiple Mappings**: Same central subtree can map to multiple local paths
-- **Overlapping**: Mappings can overlap (nested or sibling subtrees)
+| Field | Meaning |
+|---|---|
+| `id` | Stable string. Unique on that slave. Index prefix. Not reused for a different `(central, local)` without a remove + add. |
+| `central` | Canonical prefix (`spec.md` §1). `/` is the full tree. |
+| `local` | Absolute host path. Canonicalized (symlinks resolved) at config load. |
 
-## Subscription Process
+The slave does **not** send `local` to the master. `Subscribe` carries `{ id, central }` only.
 
-### Connection Establishment
-1. Slave connects to master via QUIC
-2. Completes Noise handshake with PSK
-3. Opens control stream
-4. Sends `Subscribe` message with mappings list
+## Overlap
 
-### Master Validation
-1. Receives subscription request
-2. Validates mapping paths (existence, permissions)
-3. Registers slave with active mappings
-4. Confirms subscription or rejects with error
+- **Local:** forbidden. Reject config if two locals are equal or one is a parent of the other. `/opt/a` and `/opt/a/b` overlap; `/opt/a` and `/opt/ab` do not.
+- **Central:** allowed, including on the same slave. `/src` + `/` is the backup-plus-subset pattern. Inner mappings do **not** “win.” Each checkout is an independent replica of its prefix. The same canonical file may exist as two local files; apply is per `checkout_id`.
+- **Across slaves:** any number of slaves may map the same `central`.
 
-### Active Subscription
-- **Persistent**: Remains active until disconnection
-- **Dynamic**: Can be updated during connection
-- **Tracked**: Master maintains slave-to-mapping registry
+“Circular mappings” are not a thing in a star topology. Do not check for them.
 
-## Mapping Semantics
+## Interest
 
-### Path Resolution
-- **Central Paths**: Always absolute from hierarchy root
-- **Local Paths**: Always absolute on slave filesystem
-- **Canonicalization**: All paths normalized and canonicalized
-- **Symlink Handling**: Resolved consistently across platforms
+A checkout is interested in canonical path `P` iff `central` is a prefix of `P`: `P == central` or `P` starts with `central + "/"`. `/` matches all. `/src` does not match `/src2`.
 
-### Overlap Handling
-- **Nested Mappings**: Inner mappings take precedence
-- **Sibling Conflicts**: Independent synchronization
-- **Duplicate Files**: Allowed (same central file in multiple locals)
+This is the opposite of “self or deeper mapping paths.” A parent mapping (`/src`) **does** receive `/src/project1/file.txt`. A child mapping (`/src/project1/subdir`) does **not**.
 
-### Full Replica Mapping
-```toml
-{ central = "/", local = "/backup/central" }
-```
-- Maps entire central hierarchy to local directory
-- Common for backup slaves
-- Receives all changes from master
+Master keeps an in-memory trie of `(slave_id, checkout_id, central)` for connected slaves only.
 
-## Change Propagation
+## Subscribe
 
-### Interest-Based Notifications
-- Master tracks which slaves subscribe to each subtree
-- On file change in `/src/project1/file.txt`:
-  - Only slaves mapping `/src/project1` or deeper receive update
-  - Slaves mapping `/src/project2` are not notified
+1. Slave completes Noise XX. Master now has the slave’s static public key and the ACL row (`spec.md` §4).
+2. Slave opens the control stream, sends framed `Subscribe { slave_id, checkouts }`.
+3. `slave_id` must match the ACL row for that key. Each `central` must sit under at least one `allowed_prefixes` entry (same prefix rule). Count must be ≤ `max_checkouts_per_slave` (same name and default on both sides: 100).
+4. Central paths need not exist yet. Pre-subscribe is allowed; creates under the ACL succeed later.
+5. Success: `SubscribeAck` with master’s current `DirNode` (or `FileNode`) for each `central`. Failure: `SubscribeReject` with `denied_centrals` and a reason; slave logs and does not retry those prefixes until config or ACL changes.
+6. A second `Subscribe` on the same connection **replaces** the set. Removed ids are forgotten on the master; the slave drops those index prefixes. Added ids start reconcile.
 
-### Multiple Recipients
-- Single change can trigger updates to multiple slaves
-- Parallel QUIC streams for efficiency
-- Independent delta computation per mapping
+`Subscribe` is not authenticated by a shared PSK. The key *is* the identity. There is no separate “path authorization” mechanism beyond `allowed_prefixes`.
 
-### Bidirectional Flow
-- **Slave Changes**: Pushed to master, then propagated to interested slaves
-- **Master Changes**: Pushed directly to subscribed slaves
-- **Conflict Resolution**: Latest mtime wins across all nodes
+## Lifecycle
 
-## Subscription Management
+- Disconnect: drop that slave’s in-memory interest. No payload queue.
+- Reconnect: new XX, `Subscribe`, `RootReport` / walk (`spec.md` §10).
+- Same `slave_id` already connected: the new session replaces the old.
+- Config watch: add/remove checkouts as above. Changing `id` or `central` is remove + add.
 
-### Dynamic Updates
-- Slaves can modify mappings during connection
-- Master updates internal registries
-- Seamless transition without reconnection
+## Path safety
 
-### Connection Recovery
-- On reconnect: Slave resends current mappings
-- Master verifies and restores subscription state
-- Resumes synchronization from last known state
+- Reject `central` that is not absolute, that contains `.` / `..` components after normalization, or that is not valid UTF-8.
+- After normalization, `central` must start with `/`.
+- Master never writes outside `central_root`. Slave never writes outside `local` (join + canonicalize, then prefix-check).
 
-### State Verification
-- **Periodic Root Reporting**: Slaves send current Merkle roots for subscribed subtrees every 60 seconds
-- **Integrity Checking**: Master compares reported roots against global state
-- **Difference Resolution**: Triggers narrowing protocol for mismatches
-- **Recovery Assurance**: Ensures bidirectional sync consistency
+## Examples
 
-### Cleanup
-- Disconnected slaves automatically unsubscribed
-- Stale mappings removed from registries
-- Resource cleanup prevents memory leaks
+Development slave (ACL `allowed_prefixes = ["/src", "/docs"]`):
 
-## Validation and Security
-
-### Path Validation
-- **Existence**: Central paths must exist (or be creatable)
-- **Permissions**: Master validates access rights
-- **Sanity Checks**: Prevent directory traversal attacks
-- **Canonical Paths**: Normalize to prevent ambiguities
-
-### Access Control
-- **PSK Authentication**: Only authenticated slaves can subscribe
-- **Path Authorization**: Configurable allowed subtree access
-- **Rate Limiting**: Prevent subscription spam
-
-### Conflict Prevention
-- **Mapping Conflicts**: Detect and reject conflicting local paths
-- **Circular Dependencies**: Prevent self-referential mappings
-- **Resource Limits**: Maximum mappings per slave
-
-## Performance Considerations
-
-### Subscription Registry
-- **Data Structure**: Efficient path prefix matching
-- **Indexing**: Fast lookup of interested slaves per path
-- **Memory Usage**: Minimal overhead for large numbers of mappings
-
-### Notification Efficiency
-- **Batch Updates**: Group changes for same subtree
-- **Parallel Processing**: Multiple slaves updated concurrently
-- **Stream Multiplexing**: QUIC handles concurrent notifications
-
-### Scalability
-- **Large Hierarchies**: Path trie structures for fast prefix matching
-- **Many Slaves**: Distributed registry with sharding if needed
-- **High Frequency**: Debounced updates prevent notification storms
-
-## Error Handling
-
-### Subscription Failures
-- **Invalid Paths**: Detailed error messages to slave
-- **Permission Denied**: Clear access control feedback
-- **Resource Limits**: Graceful rejection with retry guidance
-
-### Runtime Issues
-- **Network Disconnects**: Automatic resubscription on reconnect
-- **Path Changes**: Handle moved/deleted central directories
-- **Slave Overload**: Backpressure mechanisms for busy slaves
-
-## Configuration Examples
-
-### Development Slave
 ```toml
 checkouts = [
-    { central = "/src/backend", local = "/home/dev/backend" },
-    { central = "/src/frontend", local = "/home/dev/frontend" },
-    { central = "/docs", local = "/home/dev/docs" },
+    { id = "backend",  central = "/src/backend",  local = "/home/dev/backend" },
+    { id = "frontend", central = "/src/frontend", local = "/home/dev/frontend" },
+    { id = "docs",     central = "/docs",         local = "/home/dev/docs" },
 ]
 ```
 
-### Production Slave
+`{ id = "root", central = "/", local = "/home/dev/all" }` is rejected by that ACL.
+
+Backup slave (ACL `/`):
+
 ```toml
 checkouts = [
-    { central = "/src/app", local = "/opt/myapp/src" },
-    { central = "/config/prod", local = "/opt/myapp/config" },
+    { id = "all", central = "/", local = "/backup/central" },
 ]
 ```
-
-### Backup Slave
-```toml
-checkouts = [
-    { central = "/", local = "/backup/central" },
-]
-```
-
-## Integration Points
-
-### Transport Layer
-- Subscriptions sent over initial QUIC control stream
-- Persistent connections maintain subscription state
-
-### Merkle Trees
-- Subscriptions determine which subtree roots to track
-- Enables selective Merkle proof generation
-
-### Delta Engine
-- Mappings determine local vs remote path resolution
-- Affects delta computation and application
-
-### Configuration System
-- Runtime mapping updates without restart
-- Configuration validation at subscription time

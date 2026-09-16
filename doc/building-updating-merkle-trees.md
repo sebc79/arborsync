@@ -1,192 +1,101 @@
-# Building and Updating Merkle Trees
+# Building and Updating Path Merkle Trees
 
-## Overview
+Normative source: `spec.md` §5 and §10. This document is the procedure for those sections.
 
-ArborSync uses Merkle trees for efficient change detection and delta synchronization.
-The system maintains cryptographic integrity proofs for file hierarchies, enabling selective subtree synchronization with minimal data transfer.
+## Role
 
-## Merkle Tree Implementation
+ArborSync compares **directory hashes**, not inclusion proofs over a flat leaf list. Each index (the master’s global tree, and one tree per slave checkout) is a path-addressed tree: a directory’s hash is BLAKE3 of its sorted children; a file or symlink’s hash is a `FileNode` over content and metadata. The path is the walk from `/`, not a field inside the leaf.
 
-### Library
-- **rs_merkle** v1: Low-level Merkle tree construction with custom hashing
-- **Hasher**: BLAKE3 (32-byte outputs)
-- **Tree Structure**: Binary Merkle tree with configurable branching
+Do not use `rs_merkle`. That crate’s proofs cannot enumerate a set difference, and its leaf indices move on insert or delete.
 
-### Leaf Construction
+## Node encodings
 
-Each file/directory gets one leaf in the Merkle tree:
+These byte layouts are part of the on-disk and on-the-wire contract. Change them only with an `Envelope.version` bump and a rebuild of every index.
 
-```rust
-// Leaf data format
-struct LeafData {
-    path_hash: [u8; 32],      // BLAKE3(canonical_path)
-    content_hash: [u8; 32],   // BLAKE3(file_bytes) or dir_hash
-    size: u64,
-    mtime: i128,              // Unix nanoseconds
-    mode: u32,
-}
+**Kinds:** `File = 1`, `Dir = 2`, `Symlink = 3`.
 
-// Serialized and hashed to 32-byte leaf
-leaf = BLAKE3(serialize(LeafData))
+```
+FileNode = BLAKE3(
+    u8 kind                         # 1 or 3
+    || content_hash                 # 32 bytes
+    || u64be size
+    || i64be mtime_ns
+    || u32be mode
+)
+
+# children sorted by name as raw UTF-8
+entry    = u8 kind || u32be name_len || name || [u8; 32] child_node
+DirNode  = BLAKE3(concat(entries))
 ```
 
-The canonical path is the relative path from the _central_ root to the file/directory.
+- File `content_hash` = BLAKE3(file bytes), streamed.
+- Symlink `content_hash` = BLAKE3(target bytes from the OS).
+- Empty directory: `DirNode = BLAKE3("")` (no entries). First-class; do not omit empty dirs from the parent.
 
-### Directory Handling
-- For a directory:
-  - content_hash is computed from children hashes (sorted, concatenated, hashed)
-  - size is the sum of children sizes
-  - mtime and mode are set normally (from filesystem metadata)
-- Maintains hierarchical integrity
+`FileNode` is the CAS object for a non-directory. `DirNode` is never CAS’d as content; it is recomputed after child mutations.
 
-## Tree Architecture
+## What is stored
 
-### Global Tree (Master)
-- Single Merkle tree for entire central hierarchy
-- Leaves ordered by canonical path (lexicographic)
-- Root hash represents complete filesystem state
+| Key | Value |
+|---|---|
+| `(checkout_id, file path)` in `meta` | `FileMetadata` |
+| `(checkout_id, dir path)` in `dir_nodes` | `DirNode` |
+| `(checkout_id, path)` in `last_synced` | last agreed `FileNode` (files/symlinks only) |
 
-### Subtree Roots
-- Cached in database: `subtree_path → merkle_root`
-- Computed on-demand or during updates
-- Enables selective synchronization
+Master uses `checkout_id = ""`. Cache **every** directory node, not a handful of “important” subtrees. The subtree root of a checkout is `dir_nodes[central]` (or the file’s `FileNode` if `central` names a file).
 
-### Slave Caches
-- Per checkout mapping: local Merkle tree
-- Mirrors subscribed subtrees from master
-- Used for delta computation
+## Initial build
 
-## Construction Process
+1. Walk the tree (`central_root` or checkout `local`). Skip reserved names (`.arborsync-tmp`, `.arborsync-conflicts`).
+2. Collect `FileMetadata` for files, symlinks, and directories (see `collecting-metadata.md`).
+3. Bottom-up: compute `FileNode` for each non-dir; compute `DirNode` from sorted children; write `meta` + `dir_nodes` in one batch per directory if memory requires chunking, otherwise one batch for the tree.
+4. `last_synced` stays empty until the first successful reconcile/apply for that path.
 
-### Initial Build
-1. Recursive filesystem scan
-2. Collect all file metadata
-3. Sort paths lexicographically
-4. Build leaves with BLAKE3 hashes
-5. Construct Merkle tree bottom-up
-6. Store subtree roots in database
+## Incremental update
 
-### Incremental Updates
-1. File change detected (path P)
-2. Find leaf index for path P
-3. Recompute leaf hash with new metadata
-4. Update tree from leaf to root
-5. Recompute affected subtree roots
-6. Update database cache
+On a changed path `P` (file, symlink, or directory metadata):
 
-## Update Mechanics
+1. Re-read metadata; recompute `FileNode` or, for a directory, recompute `DirNode` from current children.
+2. Write `meta` (and new `DirNode` if `P` is a dir).
+3. Walk parents from `dirname(P)` to the tree root (checkout `central` on a slave; `/` on the master). For each parent, reload children from the index (not a full FS walk), recompute `DirNode`, write it.
+4. Commit one write batch covering the leaf change and every ancestor `DirNode`.
 
-### Path to Index Mapping
-- Maintain sorted path list
-- Binary search for changed path
-- Handle insertions/deletions (tree rebuild for major changes)
+Insert: new `meta` row, then ancestor recompute.  
+Delete: remove `meta` (and `dir_nodes` if it was a dir, plus all descendants), then ancestor recompute.  
+Rename (same checkout, one debounce window): delete `from` + insert `to` in the same batch, recompute ancestors of both (shared ancestors once).
 
-### Efficient Recomputation
-```rust
-// rs_merkle API usage
-tree.update_leaf(index, new_leaf_hash);
-tree.commit();  // Recomputes hashes upward
-root = tree.root();
-```
+No global leaf array, no “rebuild on insert.”
 
-### Subtree Root Updates
-- Identify affected subtrees (prefix matching)
-- Recompute roots for changed subtrees
-- Batch database updates
+## Comparing two trees
 
-## Delta Synchronization
+Given roots `A` and `B` for the same canonical directory path:
 
-### Proof Generation
-- Client sends current subtree root
-- Server generates Merkle proof for differences
-- Proof includes changed leaf hashes + path
+- Equal → that subtree is in sync.
+- Differ → exchange `DirList` (`name`, `kind`, `node_hash`) for that directory, then:
+  - name only in A or only in B → that child is a create or delete (see `spec.md` §10 for which side announces);
+  - both present, `kind` differs → type change (delete + create);
+  - both present, hashes differ, both dirs → recurse;
+  - both present, hashes differ, both files/symlinks → 3-way using `last_synced` (`spec.md` §10).
 
-### Verification
-- Client verifies proof against known root
-- Identifies exactly which files changed
-- Requests deltas only for changed files
+This is the entire “difference narrowing” protocol. There is no Merkle inclusion proof and no `proof: Vec<u8>` field.
 
-### Difference Narrowing for Recovery
-When filesystem watchers miss changes, the system uses Merkle proofs for efficient difference detection:
+Complexity is O(directory entries touched + size of the symmetric difference), not O(log n) in the total file count. That is the correct bound for a path tree.
 
-1. **Root Mismatch**: Slave reports local subtree root differing from master's global root
-2. **Proof Request**: Master requests Merkle proof from slave for the suspected subtree
-3. **Proof Analysis**: Master uses rs_merkle to verify proof and identify changed leaves
-4. **Targeted Sync**: Only changed files trigger delta computation and transfer
-5. **Integrity Assurance**: Proof verification ensures no spurious changes are propagated
+## Slave tree vs master tree
 
-This mechanism provides O(log n) difference detection for large hierarchies without full rescans.
+A slave checkout of `/src` stores only nodes under `/src` (paths still stored as canonical `/src/...`, not rewritten to be relative to `/src`). Its root is `DirNode("/src")`. That value is **equal** to the master’s `dir_nodes["/src"]` when the checkout is in sync, because the encoding does not include siblings of `/src`.
 
-## Performance Optimizations
+A flat global binary tree cannot make that equality hold. This encoding can.
 
-### Lazy Subtree Computation
-- Compute subtree roots on first access
-- Cache in database with invalidation
-- Avoid full tree recomputation
+## Integrity
 
-### Batch Updates
-- Group multiple changes in single transaction
-- Amortize tree updates across debounced events
-- Minimize database writes
+- After every committed batch, `DirNode(P)` must equal a recomputation from children in `meta` / `dir_nodes`. A debug assertion on small trees; a periodic full recompute on master if an operator requests it.
+- A mismatched root is not “corrupt”; it is a reconcile trigger. Rebuild from the filesystem only when the index is unreadable (redb recovery failure). Then reconcile.
 
-### Memory Management
-- Streaming leaf construction for large hierarchies
-- Tree pruning for unused subtrees
-- Configurable tree depth limits
+## Non-goals (struck from earlier drafts)
 
-## Database Integration
-
-### Storage Schema
-```rust
-// Subtree roots cache
-fn get_subtree_merkle_root(&self, subtree: &str) -> Result<Option<[u8; 32]>>;
-fn put_subtree_merkle_root(&self, subtree: &str, root: [u8; 32]) -> Result<()>;
-```
-
-### Transactional Updates
-- Merkle updates wrapped in DB transactions
-- Atomic tree + metadata updates
-- Rollback on failures
-
-## Consistency and Integrity
-
-### Cryptographic Guarantees
-- BLAKE3 provides collision resistance
-- Tree structure prevents spoofing
-- Proofs verify against trusted roots
-
-### Path Ordering
-- Consistent lexicographic sorting
-- Deterministic tree construction
-- Reproducible roots across nodes
-
-## Error Handling
-
-### Tree Corruption
-- Detect invalid proofs
-- Rebuild tree from filesystem
-- Log integrity violations
-
-### Path Conflicts
-- Handle duplicate paths (impossible in filesystem)
-- Validate path canonicalization
-- Reject malformed updates
-
-### Memory Limits
-- Stream processing for large trees
-- Configurable batch sizes
-- Graceful degradation on OOM
-
-## Integration Points
-
-### Change Detection
-- Triggers Merkle recomputation on file events
-- Provides integrity checking for rescans
-
-### Transport Layer
-- Merkle proofs sent over QUIC streams
-- Efficient binary serialization
-
-### Delta Engine
-- Uses Merkle differences for selective sync
-- Minimizes data transfer via proofs
+- Cached “subtree roots” that are internal nodes of a binary hash tree.
+- `tree.update_leaf(index, hash)` / leaf-index maps.
+- O(log n) set reconciliation via proofs.
+- Hashing the canonical path into the leaf.
+- Configurable tree depth limits, “tree pruning for unused subtrees,” or streaming a flat leaf vector.
