@@ -1,3 +1,9 @@
+use std::fs;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -91,4 +97,52 @@ impl FileMetadata {
             content_hash,
         }
     }
+}
+
+pub fn hash_bytes(bytes: &[u8]) -> ContentHash {
+    ContentHash::from_bytes(*blake3::hash(bytes).as_bytes())
+}
+
+/// Streaming so a large file never lands in memory whole.
+pub fn hash_file(host: &Path) -> Result<ContentHash, io::Error> {
+    let mut hasher = blake3::Hasher::new();
+    io::copy(&mut fs::File::open(host)?, &mut hasher)?;
+    Ok(ContentHash::from_bytes(*hasher.finalize().as_bytes()))
+}
+
+/// Read one host path as an index row (`spec.md` §6). `None` for a path
+/// that is gone and for the types the spec skips: device files, sockets,
+/// FIFOs. Symlinks are stored, never followed.
+pub fn collect_from_path(host: &Path) -> Result<Option<FileMetadata>, io::Error> {
+    let md = match fs::symlink_metadata(host) {
+        Ok(md) => md,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let mode = md.mode();
+    let mtime_ns = md.mtime() * 1_000_000_000 + md.mtime_nsec();
+    let kind = md.file_type();
+
+    if kind.is_symlink() {
+        let target = fs::read_link(host)?;
+        let bytes = target.as_os_str().as_bytes();
+        return Ok(Some(FileMetadata::symlink(
+            bytes.len() as u64,
+            mtime_ns,
+            mode,
+            hash_bytes(bytes),
+        )));
+    }
+    if kind.is_dir() {
+        return Ok(Some(FileMetadata::directory(mtime_ns, mode)));
+    }
+    if !kind.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(FileMetadata::file(
+        md.len(),
+        mtime_ns,
+        mode,
+        hash_file(host)?,
+    )))
 }
