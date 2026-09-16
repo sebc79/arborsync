@@ -1,188 +1,106 @@
-# Indexing System and Database Backend
+# Indexing and Database
 
-## Overview
+Normative source: `spec.md` §13. redb is the only backend.
 
-ArborSync's indexing system provides persistent storage for filesystem metadata, Merkle tree state, and synchronization tracking. The system uses an embedded database with transactional guarantees and efficient querying for subtree operations.
+## Why redb
 
-## Database Backend Selection
+Embedded, single-file, crash-safe, MVCC, range queries on path keys. v1 does not ship `sled`, Postgres, or a `--db-backend` flag. There is no zero-downtime backend switch and no export/import story beyond “copy the redb file while the daemon is stopped.”
 
-### Primary Backend: redb v2
-- **Architecture**: Pure Rust, B+tree based, MVCC concurrency
-- **Features**: Single-file database, crash-safe, ACID transactions
-- **Performance**: Excellent for ArborSync's workload (frequent small writes, range queries)
-- **Stability**: 1.0+ since 2023, active maintenance
+## Trait
 
-### Abstraction Layer
-- **Trait**: `Storage` in `core/src/storage.rs`
-- **Purpose**: Backend-agnostic interface for switchability
-- **Implementations**: `RedbStorage` (current), `SledStorage` (stub)
-
-## Storage Trait Interface
+Reads use a consistent snapshot. Writes go through a batch that **must** be able to update metadata, directory nodes, and `last_synced` together. The old sketch with `get`/`put` beside an undefined `transaction()` closure is not the API.
 
 ```rust
+pub struct CheckoutId(pub String);
+
 pub trait Storage: Send + Sync + 'static {
-    type Error: std::error::Error + Send + Sync;
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn open(path: &std::path::Path) -> Result<Self, Self::Error> where Self: Sized;
 
-    fn open(path: &std::path::Path) -> Result<Self, Self::Error>;
+    fn get_meta(&self, ck: &CheckoutId, path: &str) -> Result<Option<FileMetadata>, Self::Error>;
+    fn get_dir_node(&self, ck: &CheckoutId, path: &str) -> Result<Option<[u8; 32]>, Self::Error>;
+    fn get_last_synced(&self, ck: &CheckoutId, path: &str) -> Result<Option<[u8; 32]>, Self::Error>;
+    fn range_meta(&self, ck: &CheckoutId, prefix: &str)
+        -> Result<Vec<(String, FileMetadata)>, Self::Error>;
+    fn range_dir_nodes(&self, ck: &CheckoutId, prefix: &str)
+        -> Result<Vec<(String, [u8; 32])>, Self::Error>;
 
-    // Core metadata operations (slaves: checkout_id prefixes keys)
-    fn get_file_metadata(&self, checkout_id: Option<&str>, path: &str) -> Result<Option<FileMetadata>, Self::Error>;
-    fn put_file_metadata(&self, checkout_id: Option<&str>, path: &str, meta: FileMetadata) -> Result<(), Self::Error>;
+    fn begin_write(&self) -> Result<WriteBatch<'_>, Self::Error>;
+    fn delete_checkout(&self, ck: &CheckoutId) -> Result<(), Self::Error>;
+}
 
-    // Merkle tree state (slaves: checkout_id prefixes keys)
-    fn get_subtree_merkle_root(&self, checkout_id: Option<&str>, subtree: &str) -> Result<Option<[u8; 32]>, Self::Error>;
-    fn put_subtree_merkle_root(&self, checkout_id: Option<&str>, subtree: &str, root: [u8; 32]) -> Result<(), Self::Error>;
-
-    // Advanced operations
-    fn transaction<F, R>(&self, f: F) -> Result<R, Self::Error>
-    where F: FnOnce(&mut Transaction) -> Result<R, Self::Error>;
-
-    // Range queries for subtree walks (scoped to checkout_id)
-    fn get_subtree_files(&self, checkout_id: Option<&str>, prefix: &str) -> Result<Vec<(String, FileMetadata)>, Self::Error>;
-    fn delete_subtree_metadata(&self, checkout_id: Option<&str>, prefix: &str) -> Result<(), Self::Error>;
+pub trait WriteBatch {
+    fn put_meta(&mut self, ck: &CheckoutId, path: &str, meta: &FileMetadata) -> Result<(), Error>;
+    fn del_meta(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Error>;
+    fn del_meta_prefix(&mut self, ck: &CheckoutId, prefix: &str) -> Result<(), Error>;
+    fn put_dir_node(&mut self, ck: &CheckoutId, path: &str, node: [u8; 32]) -> Result<(), Error>;
+    fn del_dir_node(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Error>;
+    fn del_dir_prefix(&mut self, ck: &CheckoutId, prefix: &str) -> Result<(), Error>;
+    fn put_last_synced(&mut self, ck: &CheckoutId, path: &str, file_node: [u8; 32]) -> Result<(), Error>;
+    fn del_last_synced(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Error>;
+    fn commit(self) -> Result<(), Error>;
 }
 ```
 
-## Database Schema
+`CheckoutId("")` is the master’s global tree. Slaves pass the checkout’s stable string id. Do not stringify optional integers and do not use `Option<&str>`.
 
-### Tables
-1. **file_metadata**: Path → FileMetadata
-    - Primary key: UTF-8 canonical path (slaves prefix with "checkout_id:")
-    - Value: Bincode-serialized FileMetadata
+`range_*` is inclusive of `prefix` itself and every canonical path where `interest(prefix, path)` holds (`spec.md` §2). Implement with a redb range on the concatenated key.
 
-2. **subtree_roots**: Subtree path → Merkle root
-    - Primary key: Subtree prefix string (slaves prefix with "checkout_id:")
-    - Value: 32-byte BLAKE3 hash
+## Key layout
 
-3. **slave_subscriptions**: Slave ID → Subscription mappings
-    - Tracks active slave connections and checkouts
+```
+key = checkout_id bytes || 0x00 || canonical path UTF-8
+```
 
-### Indexing Strategy
-- **Primary Indexes**: B+tree on path strings for range queries
-- **Prefix Queries**: Efficient subtree enumeration
-- **Secondary Indexes**: Path to slave mappings for notifications
+`0x00` cannot appear in UTF-8, so prefix ranges stay inside one checkout. Tables:
 
-## Transaction Model
+1. `meta` — key → bincode `FileMetadata`
+2. `dir_nodes` — key → 32 raw bytes
+3. `last_synced` — key → 32 raw bytes (`FileNode` of the last CAS-agreed version)
 
-### Atomic Operations
-- File metadata updates bundled with Merkle recomputation
-- Subtree root updates in same transaction
-- Rollback on any failure
+No `slave_subscriptions` table. Active interest is process memory, rebuilt from `Subscribe` after connect. Persisting it would go stale on crash; the slave always resubscribes.
 
-### Concurrency
-- MVCC allows concurrent reads during writes
-- Write transactions serialize access
-- Read-only snapshots for long-running operations
+## Transactions
 
-## Query Patterns
+One batch per debounce window, per accepted CAS, or per reconcile directory. Order inside a batch:
 
-### Subtree Enumeration
+1. Apply leaf `meta` / deletes (and descendant prefix deletes for a directory remove).
+2. Recompute and `put_dir_node` for each affected ancestor, root-ward.
+3. Update `last_synced` for paths whose live content now matches the agreed version.
+4. `commit`.
+
+If apply-to-disk fails, do not commit. If commit fails, the live file may already have been renamed; the next rescan + reconcile repairs `last_synced` / `DirNode`.
+
+## Queries
+
 ```rust
-// Master: Find all files under /central/src/
-let files = storage.get_subtree_files(None, "/central/src/");
-// Slave checkout 1: Find all files under /src/ in checkout
-let files = storage.get_subtree_files(Some("1"), "/src/");
-// Returns sorted list of (path, metadata) pairs scoped to checkout
+// Master: every file under /src
+storage.range_meta(&CheckoutId("".into()), "/src")?;
+// Slave checkout "bak": same canonical prefix, isolated by ck
+storage.range_meta(&CheckoutId("bak".into()), "/src")?;
 ```
 
-### Prefix Matching
-- Range queries on path keys (prefixed for slaves)
-- Efficient for hierarchical operations per checkout
-- Supports arbitrary subtree depths
+Directory child lists for reconcile come from `range_meta` / `range_dir_nodes` restricted to **direct** children (path has exactly one extra component). Do not send the entire descendant range on the wire.
 
-### Change Tracking
-- Transaction logs for incremental updates
-- Avoids full rescans after interruptions
+## Checkout removal
 
-## Performance Characteristics
+`delete_checkout(ck)` drops all three tables’ keys for that id. Files on disk are not touched.
 
-### Write Performance
-- Optimized for frequent small updates (watcher events)
-- B+tree provides O(log n) insertions
-- Batch operations for bulk metadata collection
+## Crash safety
 
-### Read Performance
-- Fast range queries for subtree operations
-- Memory-mapped for read-heavy workloads
-- Concurrent readers don't block writers
+redb WAL + commit. On open, if a table is missing, create it. If `DirNode("/")` (or the checkout central) does not match a recompute from children, treat as dirty and run a full metadata walk + recompute before accepting network CAS.
 
-### Storage Efficiency
-- Single file database (~10-20% overhead)
-- Compression for large metadata sets
-- Automatic compaction and cleanup
+There is no “graceful degradation to read-only with automatic reconnect” — this is a local file, not a server. Open errors are fatal to startup (log and exit). Runtime commit errors are logged; the daemon stays up and retries on the next event.
 
-## Crash Safety and Recovery
+## Config
 
-### ACID Guarantees
-- Atomic commits with write-ahead logging
-- MVCC prevents partial updates
-- Automatic recovery on startup
-
-### Consistency Checks
-- Validate Merkle roots against stored metadata
-- Rebuild corrupted indexes from filesystem
-- Log integrity violations
-
-## Configuration Options
-
-### Master Configuration
 ```toml
-db_path = "/var/lib/arborsync/index.redb"
-db_backend = "redb"  # redb | sled
+db_path = "/var/lib/arborsync/index.redb"   # master
+# db_path = "/var/cache/arborsync/cache.redb"  # slave
 ```
 
-### Slave Configuration
-```toml
-db_path = "/var/cache/arborsync/cache.redb"
-db_backend = "redb"
-```
+No `db_backend`, no `db_max_readers` requirement. Optional redb cache sizing may be added later as a single integer; it is not part of v1.
 
-## Backend Switchability
+## Maintenance
 
-### Migration Support
-- Export/import functionality for data migration
-- Schema compatibility checks
-- Zero-downtime backend switches
-
-### Future Backends
-- **sled**: Alternative embedded database
-- **PostgreSQL/MySQL**: For distributed deployments
-- **Custom**: Application-specific optimizations
-
-## Monitoring and Maintenance
-
-### Statistics
-- Database size, operation counts
-- Query performance metrics
-- Background compaction status
-
-### Maintenance Tasks
-- Periodic compaction runs
-- Index rebuilds for optimization
-- Backup and restore procedures
-
-## Error Handling
-
-### Connection Failures
-- Automatic reconnection with retries
-- Graceful degradation to read-only mode
-- Detailed error logging
-
-### Corruption Detection
-- Checksum verification on reads
-- Automatic repair from filesystem state
-- Alert generation for manual intervention
-
-## Integration Points
-
-### Filesystem Watching
-- Triggers metadata updates in transactions
-- Provides persistence across restarts
-
-### Merkle Trees
-- Caches subtree roots for efficiency
-- Ensures tree state matches filesystem
-
-### Transport Layer
-- Supplies metadata for delta computations
-- Tracks synchronization state per slave
+Compaction is redb’s. A SIGHUP or a future admin subcommand may call it. Not a second database product.

@@ -1,136 +1,72 @@
 # Collecting Metadata
 
-## Overview
+Normative source: `spec.md` §6.
 
-ArborSync collects and maintains comprehensive metadata for all files in the filesystem hierarchy. This metadata is crucial for change detection, conflict resolution, and efficient synchronization. The system preserves essential Unix attributes while ignoring user/group ownership.
-
-## Metadata Structure
-
-### FileMetadata
+## Structure
 
 ```rust
-#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FileMetadata {
-    pub size: u64,                    // File size in bytes
-    pub mtime: i128,                  // Modification time (Unix nanoseconds)
-    pub mode: u32,                    // Unix mode bits (permissions + file type)
-    pub content_hash: [u8; 32],       // BLAKE3 hash of file contents
+    pub kind: EntryKind,        // File | Dir | Symlink
+    pub size: u64,
+    pub mtime_ns: i64,          // Unix nanoseconds
+    pub mode: u32,              // st_mode, including type bits
+    pub content_hash: [u8; 32], // file bytes, symlink target, or unused for dirs
 }
+
+pub enum EntryKind { File = 1, Dir = 2, Symlink = 3 }
 ```
 
-### Path Representation
-- Canonical absolute paths within the hierarchy
-- UTF-8 encoded strings
-- Consistent path separators across platforms
+Directories still have a `FileMetadata` row (kind `Dir`, `size` = 0, `content_hash` = 32 zero bytes). The directory’s identity in the Merkle tree is `DirNode`, stored separately. Do not put `DirNode` into `content_hash`.
 
-## Collection Process
+## Paths
 
-### Initial Scan
-1. Recursive filesystem walk starting from root
-2. For each file/directory:
-   - Read file attributes using `std::fs::metadata`
-   - Compute BLAKE3 content hash
-   - Store in database with canonical path
+Index keys are **canonical** (`spec.md` §1): `/src/foo.rs`, never `/central/src/foo.rs` and never the slave’s local path. Conversion:
 
-### Incremental Updates
-1. Watcher detects file change
-2. Read updated metadata immediately
-3. Recompute content hash if content changed
-4. Update database record
+- Master: `canonical = "/" + relative(central_root, os_path)` with `/` for the root itself.
+- Slave: `canonical = checkout.central` joined with `relative(checkout.local, os_path)`.
 
-### Content Hashing
-- **Algorithm**: BLAKE3 (32-byte output)
-- **Input**: Raw file bytes
-- **Performance**: Streaming hash for large files
-- **Purpose**: Change detection, delta computation
+UTF-8 only. Reject non-UTF-8 names (log, skip). After config load, `central_root` and each `local` are `canonicalize`d (symlinks resolved **there only**).
 
-## Metadata Sources
+## Scan
 
-### Primary Attributes (std::fs::Metadata)
-- `len()` → size
-- `modified()` → mtime (converted to Unix nanoseconds)
-- `permissions().mode()` → mode (filtered to Unix permissions)
+**Initial and rescan:** recursive walk. Skip `.arborsync-tmp` and `.arborsync-conflicts` at the tree root being walked. For each entry:
 
-### Computed Attributes
-- Content hash via BLAKE3 hasher
-- Path hash for Merkle leaf construction
+1. `symlink_metadata` (do not follow).
+2. Classify: file / dir / symlink / other. Other (devices, sockets, FIFOs): log, skip.
+3. Fill `size`, `mtime_ns` (`modified()` → duration since epoch; if unavailable, skip and log), `mode` (`PermissionsExt::mode()` on Unix).
+4. **Hash decision:**
+   - File: hash if no index row, or stored size/mtime/kind differ, or the caller is a Write/Create watcher event.
+   - Symlink: always read the target and hash it (cheap).
+   - Dir: no content hash.
+5. Streaming BLAKE3 for files.
 
-## Unix Mode Handling
+Rescan is a **full `stat` walk** of the checkout or `central_root`. It is not limited to “changed subtrees.” Hashing stays lazy via size+mtime.
 
-### Preserved Bits
-- File type: regular file, directory, symlink, etc.
-- Permissions: r/w/x for user/group/other
-- Special bits: setuid, setgid, sticky
+**Watcher:** after debounce, re-read each affected path with the same rules. `Remove` → drop the row (and descendants if a dir). ENOENT during a read that was not a Remove: treat as delete.
 
-### Ignored Bits
-- UID/GID ownership (always ignored per spec)
+## Unix mode
 
-### Mode Application
-- On slaves: `std::fs::set_permissions` after file write
-- Preserves executable bits, directory permissions
-- Handles special file types appropriately
+**Kept:** file type bits, `rwx` ugo, setuid, setgid, sticky.  
+**Ignored:** UID, GID, xattrs, ACLs, BSD flags.
 
-## Mtime Precision
+Apply: `set_permissions` with `mode & 0o7777` on files and directories after the rename lands. Symlink permissions are platform-specific; do not fail the apply if setting them is unsupported. mtime via `filetime::set_symlink_file_times` (or `set_file_mtime` for non-links) using the announced `mtime_ns`.
 
-### Storage Format
-- i128 for Unix nanoseconds (nanosecond precision)
-- Compatible with `time` crate v0.3
+## Symlinks
 
-### Comparison Logic
-- Used for conflict resolution ("latest mtime wins")
-- NTP synchronization assumed for accurate comparison
-- Ties handled via conflict files
+In-tree: first-class. `content_hash = BLAKE3(target)`, `size = target.len()`. Apply with `std::os::unix::fs::symlink` after removing the previous entry if needed. Broken targets are valid.
 
-## Database Integration
+Do not resolve in-tree links during scan, index, or apply. Resolving duplicates the target as a second leaf and can walk out of the checkout.
 
-### Storage Trait Methods
-```rust
-fn get_file_metadata(&self, path: &str) -> Result<Option<FileMetadata>>;
-fn put_file_metadata(&self, path: &str, meta: FileMetadata) -> Result<()>;
-```
+## Errors
 
-### Indexing
-- Primary key: canonical path string
-- Secondary indexes: subtree prefix queries
-- Transactional updates during scans
+- `EACCES`: log, skip that name, continue the walk. The index simply lacks that path; a later successful stat is a create.
+- Transient I/O: retry once; then skip and leave the previous index row (rescan will try again).
+- Partial trees are allowed. Do not abort a scan because one name failed.
 
-## Performance Optimizations
+## Batching
 
-### Lazy Content Hashing
-- Only hash when content actually changes
-- Use size + mtime as cheap change indicator
-- Full hash only when needed for deltas
+Rescans buffer metadata and commit per directory (leaf rows + that `DirNode` + ancestors in the same batch as `spec.md` §13). Watcher events for one debounce window are one batch.
 
-### Batch Operations
-- Collect metadata in batches during rescans
-- Transactional database updates
-- Minimize I/O during watcher events
+## Hardlinks
 
-## Error Handling
-
-### Missing Files
-- Handle ENOENT during metadata read
-- Mark as deleted in database
-- Clean up orphaned records
-
-### Permission Errors
-- Log access denied but continue scan
-- Partial hierarchy support
-- Graceful degradation
-
-### Corrupt Files
-- Skip unreadable files
-- Log errors without failing entire scan
-- Retry logic for transient issues
-
-## Consistency Guarantees
-
-### Atomic Updates
-- Metadata + content hash updated together
-- Database transactions ensure consistency
-- Rollback on partial failures
-
-### Path Canonicalization
-- All paths converted to canonical form
-- Symlink resolution handled consistently
-- Avoid duplicate entries for same file
+Two names, two rows, two `FileNode`s. Applying one name does not try to recreate a hardlink. Content may be identical; that is fine.
