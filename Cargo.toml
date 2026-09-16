@@ -27,6 +27,7 @@ serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["serde"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 
