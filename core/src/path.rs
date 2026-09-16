@@ -54,6 +54,28 @@ impl CanonicalPath {
         &self.0
     }
 
+    /// `None` at the hierarchy root. `/src/a` yields `/src`, `/src` yields `/`.
+    pub fn parent(&self) -> Option<CanonicalPath> {
+        if self.0 == "/" {
+            return None;
+        }
+        let (head, _) = self.0.rsplit_once('/')?;
+        if head.is_empty() {
+            return Some(Self::root());
+        }
+        Some(Self(head.into()))
+    }
+
+    /// Strict ancestors, nearest first, ending at `/`. Empty at `/`.
+    pub fn ancestors(&self) -> impl Iterator<Item = CanonicalPath> {
+        let mut next = self.parent();
+        std::iter::from_fn(move || {
+            let current = next.take()?;
+            next = current.parent();
+            Some(current)
+        })
+    }
+
     /// True iff `other` is this path or below it: `/src` covers `/src` and
     /// `/src/foo.rs`, but not the sibling `/src2` (`spec.md` §2). `/` covers
     /// everything.
@@ -146,6 +168,16 @@ pub fn host_to_canonical(root: &Path, host_path: &Path) -> Result<CanonicalPath,
     canonical.push('/');
     canonical.push_str(rel_str);
     Ok(CanonicalPath(normalize_canonical(&canonical)?))
+}
+
+/// The inverse of [`host_to_canonical`]: `central_root` plus the canonical
+/// path's components. `/` is the root itself.
+pub fn canonical_to_host(central_root: &Path, path: &CanonicalPath) -> PathBuf {
+    let relative = path.as_str().trim_start_matches('/');
+    if relative.is_empty() {
+        return central_root.to_path_buf();
+    }
+    central_root.join(relative)
 }
 
 pub fn join_central(central: &CanonicalPath, relative: &str) -> Result<CanonicalPath, PathError> {
