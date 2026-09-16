@@ -85,6 +85,61 @@ fn range_follows_interest_and_isolates_checkouts() {
 }
 
 #[test]
+fn range_and_prefix_delete_keep_descendants_past_sorting_siblings() {
+    let (_dir, store) = open_tmp();
+    let master = CheckoutId::master();
+    let mut batch = store.begin_write().unwrap();
+    batch
+        .put_meta(
+            &master,
+            "/src.foo",
+            &FileMetadata::file(1, 0, 0o100644, [4; 32]),
+        )
+        .unwrap();
+    batch
+        .put_meta(
+            &master,
+            "/src/foo.rs",
+            &FileMetadata::file(1, 0, 0o100644, [5; 32]),
+        )
+        .unwrap();
+    batch.put_dir_node(&master, "/src", [6; 32]).unwrap();
+    batch.put_dir_node(&master, "/src.foo", [7; 32]).unwrap();
+    batch.commit().unwrap();
+
+    let under_src = store.range_meta(&master, "/src").unwrap();
+    assert_eq!(
+        under_src
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>(),
+        ["/src/foo.rs"]
+    );
+    let dirs = store.range_dir_nodes(&master, "/src").unwrap();
+    assert_eq!(dirs, vec![("/src".into(), [6; 32])]);
+
+    let mut batch = store.begin_write().unwrap();
+    batch.del_meta_prefix(&master, "/src").unwrap();
+    batch.del_dir_prefix(&master, "/src").unwrap();
+    batch.commit().unwrap();
+
+    assert!(store.get_meta(&master, "/src/foo.rs").unwrap().is_none());
+    assert!(store.get_dir_node(&master, "/src").unwrap().is_none());
+    assert_eq!(
+        store
+            .get_meta(&master, "/src.foo")
+            .unwrap()
+            .unwrap()
+            .content_hash,
+        [4; 32]
+    );
+    assert_eq!(
+        store.get_dir_node(&master, "/src.foo").unwrap(),
+        Some([7; 32])
+    );
+}
+
+#[test]
 fn prefix_delete_and_checkout_delete() {
     let (_dir, store) = open_tmp();
     let master = CheckoutId::master();

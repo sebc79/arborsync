@@ -392,9 +392,6 @@ where
             continue;
         };
         if !is_interested(prefix, &path) {
-            if path.as_str() > prefix {
-                break;
-            }
             continue;
         }
         visit(path, value.value())?;
