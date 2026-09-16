@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use arborsync_core::path::{
-    RESERVED_CONFLICTS, RESERVED_TMP, conflict_sidecar_path, host_to_canonical, is_interested,
-    is_reserved_root_entry, join_central, local_paths_overlap, normalize_canonical,
+    PathError, RESERVED_CONFLICTS, RESERVED_TMP, conflict_sidecar_path, host_to_canonical,
+    is_interested, is_reserved_root_entry, join_central, local_paths_overlap, normalize_canonical,
 };
 
 #[test]
@@ -63,10 +63,28 @@ fn slave_join_central_builds_logical_path() {
 
 #[test]
 fn normalize_rejects_dot_and_relative() {
-    assert!(normalize_canonical("src/foo").is_err());
-    assert!(normalize_canonical("/src/../etc").is_err());
-    assert!(normalize_canonical("/src/./foo").is_err());
+    assert!(matches!(
+        normalize_canonical("src/foo"),
+        Err(PathError::NotAbsolute(_))
+    ));
+    assert!(matches!(
+        normalize_canonical("/src/../etc"),
+        Err(PathError::DotComponent(_))
+    ));
+    assert!(matches!(
+        normalize_canonical("/src/./foo"),
+        Err(PathError::DotComponent(_))
+    ));
     assert_eq!(normalize_canonical("/src/foo").unwrap(), "/src/foo");
+    assert_eq!(normalize_canonical("/").unwrap(), "/");
+}
+
+#[test]
+fn host_path_outside_root_is_error() {
+    assert_eq!(
+        host_to_canonical(Path::new("/central"), Path::new("/other/foo")).unwrap_err(),
+        PathError::EscapesRoot
+    );
 }
 
 #[test]

@@ -14,4 +14,4 @@ pub mod test_support;
 
 pub use meta::{EntryKind, FileMetadata};
 pub use path::{RESERVED_CONFLICTS, RESERVED_TMP, is_interested, is_reserved_root_entry};
-pub use storage::{CheckoutId, Storage, WriteBatch};
+pub use storage::{CheckoutId, RedbStorage, Storage, WriteBatch};

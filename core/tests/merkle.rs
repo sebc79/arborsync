@@ -16,6 +16,7 @@ fn sample_file() -> FileMetadata {
 #[test]
 fn empty_directory_is_blake3_of_empty_bytes() {
     assert_eq!(empty_dir_node(), *blake3::hash(b"").as_bytes());
+    assert_eq!(empty_dir_node(), dir_node(&[]));
 }
 
 #[test]
