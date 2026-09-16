@@ -1,5 +1,10 @@
 use std::path::PathBuf;
 
-pub fn run(_out: Option<PathBuf>) -> anyhow::Result<()> {
-    anyhow::bail!("arborsync keygen is not implemented yet")
+use arborsync_core::{format_hex_key, write_static_key};
+
+pub fn run(out: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = out.ok_or_else(|| anyhow::anyhow!("--out is required"))?;
+    let public = write_static_key(&path)?;
+    println!("{}", format_hex_key(&public));
+    Ok(())
 }
