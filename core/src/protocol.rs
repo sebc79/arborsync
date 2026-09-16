@@ -157,27 +157,23 @@ pub enum ProtocolMessage {
     },
 }
 
-fn bincode_config() -> impl bincode::config::Config {
+fn wire_bincode_config() -> impl bincode::config::Config {
     bincode::config::standard()
 }
 
-pub(crate) fn encode_bincode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
-    bincode::serde::encode_to_vec(value, bincode_config()).map_err(|e| e.to_string())
+fn encode_wire<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    bincode::serde::encode_to_vec(value, wire_bincode_config()).map_err(|e| e.to_string())
 }
 
-pub(crate) fn decode_bincode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
-    let (value, _) =
-        bincode::serde::decode_from_slice(bytes, bincode_config()).map_err(|e| e.to_string())?;
-    Ok(value)
+fn decode_wire<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<(T, usize), String> {
+    bincode::serde::decode_from_slice(bytes, wire_bincode_config()).map_err(|e| e.to_string())
 }
 
-/// `u32be length || bincode(Envelope)`.
+/// `u32be length || bincode(version) || bincode(msg)`, the byte layout of
+/// `bincode(Envelope)`.
 pub fn encode_control(msg: &ProtocolMessage) -> Result<Vec<u8>, FrameError> {
-    let env = Envelope {
-        version: PROTOCOL_VERSION,
-        msg: msg.clone(),
-    };
-    let payload = encode_bincode(&env).map_err(FrameError::Bincode)?;
+    let mut payload = encode_wire(&PROTOCOL_VERSION).map_err(FrameError::Bincode)?;
+    payload.extend(encode_wire(msg).map_err(FrameError::Bincode)?);
     if payload.len() > MAX_CONTROL_FRAME {
         return Err(FrameError::TooLarge);
     }
@@ -201,9 +197,11 @@ pub fn decode_control(buf: &[u8]) -> Result<(ProtocolMessage, usize), FrameError
     if buf.len() < total {
         return Err(FrameError::Truncated);
     }
-    let env: Envelope = decode_bincode(&buf[4..total]).map_err(FrameError::Bincode)?;
-    if env.version != PROTOCOL_VERSION {
-        return Err(FrameError::UnsupportedVersion(env.version));
+    let payload = &buf[4..total];
+    let (version, consumed): (u16, usize) = decode_wire(payload).map_err(FrameError::Bincode)?;
+    if version != PROTOCOL_VERSION {
+        return Err(FrameError::UnsupportedVersion(version));
     }
-    Ok((env.msg, total))
+    let (msg, _) = decode_wire(&payload[consumed..]).map_err(FrameError::Bincode)?;
+    Ok((msg, total))
 }
