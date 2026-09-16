@@ -1,0 +1,542 @@
+use arborsync_core::LoadedMaster;
+use arborsync_core::config::SlaveAcl;
+use arborsync_core::hash::{ContentHash, FileNode};
+use arborsync_core::keys::format_hex_key;
+use arborsync_core::master::{CasDecision, LocalEvent, Master, MemoryContent, Reply, decide_cas};
+use arborsync_core::merkle::{self, DirChild, file_node};
+use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};
+use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
+use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
+
+const ALICE: [u8; 32] = [0xA1; 32];
+const BACKUP: [u8; 32] = [0xB1; 32];
+const MTIME: i64 = 1_700_000_000_000;
+
+fn file(byte: u8) -> FileMetadata {
+    FileMetadata::file(3, MTIME, 0o100644, ContentHash::from_bytes([byte; 32]))
+}
+
+fn dir() -> FileMetadata {
+    FileMetadata::directory(MTIME, 0o040755)
+}
+
+fn slave_acl(id: &str, key: [u8; 32], prefixes: &[&str]) -> SlaveAcl {
+    SlaveAcl {
+        id: id.into(),
+        public_keys: vec![format_hex_key(&key)],
+        allowed_prefixes: prefixes.iter().map(|s| (*s).to_string()).collect(),
+    }
+}
+
+fn subscribe(id: &str, checkouts: &[(&str, &str)]) -> ProtocolMessage {
+    ProtocolMessage::Subscribe {
+        slave_id: id.into(),
+        checkouts: checkouts
+            .iter()
+            .map(|(id, central)| CheckoutRef {
+                id: (*id).into(),
+                central: p(central),
+            })
+            .collect(),
+    }
+}
+
+fn two_slave_master(
+    sandbox: &SyncSandbox,
+    bodies: MemoryContent,
+) -> Master<MemoryStorage, MemoryContent> {
+    let cfg_path = sandbox.write_master_config(vec![
+        slave_acl("dev-alice", ALICE, &["/src"]),
+        slave_acl("backup-1", BACKUP, &["/"]),
+    ]);
+    let cfg = LoadedMaster::load(&cfg_path).unwrap();
+    Master::open(cfg, MemoryStorage::new(), bodies).unwrap()
+}
+
+#[test]
+fn cas_accepts_only_a_create_on_absence_or_a_same_kind_match_on_basis() {
+    let live = file(1);
+    let rival = file(2);
+    let live_dir = dir();
+
+    type Case<'a> = (
+        &'a str,
+        Option<&'a FileMetadata>,
+        Option<FileNode>,
+        Option<EntryKind>,
+        CasDecision,
+    );
+    let cases: Vec<Case<'_>> = vec![
+        (
+            "create an absent file",
+            None,
+            None,
+            Some(EntryKind::File),
+            CasDecision::Accept,
+        ),
+        (
+            "create an absent directory",
+            None,
+            None,
+            Some(EntryKind::Dir),
+            CasDecision::Accept,
+        ),
+        (
+            "create over a live file",
+            Some(&live),
+            None,
+            Some(EntryKind::File),
+            CasDecision::Reject {
+                current: Some(live.clone()),
+            },
+        ),
+        (
+            "update on a matching basis",
+            Some(&live),
+            Some(file_node(&live)),
+            Some(EntryKind::File),
+            CasDecision::Accept,
+        ),
+        (
+            "update on a stale basis",
+            Some(&live),
+            Some(file_node(&rival)),
+            Some(EntryKind::File),
+            CasDecision::Reject {
+                current: Some(live.clone()),
+            },
+        ),
+        (
+            "delete on a matching basis",
+            Some(&live),
+            Some(file_node(&live)),
+            None,
+            CasDecision::Accept,
+        ),
+        (
+            "basis for a path that is gone",
+            None,
+            Some(file_node(&live)),
+            Some(EntryKind::File),
+            CasDecision::Reject { current: None },
+        ),
+        (
+            "file replaced by a directory",
+            Some(&live),
+            Some(file_node(&live)),
+            Some(EntryKind::Dir),
+            CasDecision::Reject {
+                current: Some(live.clone()),
+            },
+        ),
+        (
+            "a directory carries no file-node token",
+            Some(&live_dir),
+            Some(file_node(&live_dir)),
+            Some(EntryKind::Dir),
+            CasDecision::Reject {
+                current: Some(live_dir.clone()),
+            },
+        ),
+    ];
+
+    for (label, current, basis, new_kind, expected) in cases {
+        assert_eq!(decide_cas(current, basis, new_kind), expected, "{label}");
+    }
+}
+
+#[test]
+fn subscribe_cas_fanout() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut master = two_slave_master(&sandbox, bodies);
+
+    let ack = master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    match ack {
+        Reply::Send(ProtocolMessage::SubscribeAck { checkouts }) => {
+            assert_eq!(checkouts.len(), 1);
+            assert_eq!(checkouts[0].id, "src");
+            assert_eq!(checkouts[0].central, p("/src"));
+            assert_eq!(checkouts[0].master_root, merkle::empty_dir_node().into());
+        }
+        other => panic!("expected SubscribeAck, got {other:?}"),
+    }
+
+    let denied = master
+        .handle(ALICE, subscribe("dev-alice", &[("root", "/")]))
+        .unwrap();
+    match denied {
+        Reply::Send(ProtocolMessage::SubscribeReject {
+            denied_centrals, ..
+        }) => assert_eq!(denied_centrals, vec![p("/")]),
+        other => panic!("expected SubscribeReject, got {other:?}"),
+    }
+
+    master
+        .handle(
+            BACKUP,
+            subscribe("backup-1", &[("src", "/src"), ("bak", "/")]),
+        )
+        .unwrap();
+
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o644, hash);
+    let accept = master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: new.clone(),
+                basis: None,
+            },
+        )
+        .unwrap();
+    match accept {
+        Reply::Send(ProtocolMessage::CasAccept {
+            checkout_id,
+            path,
+            file_node: node,
+        }) => {
+            assert_eq!(checkout_id, "src");
+            assert_eq!(path, p("/src/hello.txt"));
+            assert_eq!(node, Some(file_node(&new)));
+        }
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(sandbox.central_root().join("src/hello.txt")).unwrap(),
+        hello
+    );
+    assert_eq!(
+        master.meta(&p("/src/hello.txt")).unwrap().unwrap(),
+        new.clone()
+    );
+
+    let pushed = master.poll(BACKUP);
+    assert_eq!(pushed.len(), 2);
+    let mut ids: Vec<String> = pushed
+        .into_iter()
+        .map(|msg| match msg {
+            ProtocolMessage::FileAnnounce {
+                checkout_id,
+                path,
+                new: announced,
+                basis,
+            } => {
+                assert_eq!(path, p("/src/hello.txt"));
+                assert_eq!(announced, new);
+                assert_eq!(basis, None);
+                checkout_id
+            }
+            other => panic!("expected FileAnnounce, got {other:?}"),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["bak", "src"]);
+    assert!(master.poll(ALICE).is_empty());
+
+    let reject = master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new,
+                basis: None,
+            },
+        )
+        .unwrap();
+    match reject {
+        Reply::Send(ProtocolMessage::CasReject { current, .. }) => {
+            assert_eq!(current.unwrap().content_hash, hash)
+        }
+        other => panic!("expected CasReject, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(sandbox.central_root().join("src/hello.txt")).unwrap(),
+        hello
+    );
+    assert!(master.poll(BACKUP).is_empty());
+}
+
+#[test]
+fn a_local_event_for_the_masters_own_write_does_not_fan_out_again() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut master = two_slave_master(&sandbox, bodies);
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    master
+        .handle(BACKUP, subscribe("backup-1", &[("bak", "/")]))
+        .unwrap();
+
+    master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: FileMetadata::file(hello.len() as u64, MTIME, 0o644, hash),
+                basis: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(master.poll(BACKUP).len(), 1);
+
+    master
+        .note_local(LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap();
+    assert!(master.poll(BACKUP).is_empty());
+}
+
+#[test]
+fn a_local_edit_the_master_did_not_write_fans_out() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(BACKUP, subscribe("backup-1", &[("bak", "/")]))
+        .unwrap();
+
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("src/edit.txt", b"typed by hand");
+    master
+        .note_local(LocalEvent::Changed(p("/src/edit.txt")))
+        .unwrap();
+
+    let pushed = master.poll(BACKUP);
+    assert_eq!(pushed.len(), 1);
+    match &pushed[0] {
+        ProtocolMessage::FileAnnounce {
+            path, new, basis, ..
+        } => {
+            assert_eq!(path, &p("/src/edit.txt"));
+            assert_eq!(new.content_hash, hash_bytes(b"typed by hand"));
+            assert_eq!(*basis, None);
+        }
+        other => panic!("expected FileAnnounce, got {other:?}"),
+    }
+
+    std::fs::remove_file(sandbox.central_root().join("src/edit.txt")).unwrap();
+    let removed = master.meta(&p("/src/edit.txt")).unwrap().unwrap();
+    master
+        .note_local(LocalEvent::Removed(p("/src/edit.txt")))
+        .unwrap();
+    assert_eq!(master.meta(&p("/src/edit.txt")).unwrap(), None);
+
+    let pushed = master.poll(BACKUP);
+    assert_eq!(pushed.len(), 1);
+    match &pushed[0] {
+        ProtocolMessage::Delete { path, basis, .. } => {
+            assert_eq!(path, &p("/src/edit.txt"));
+            assert_eq!(*basis, file_node(&removed));
+        }
+        other => panic!("expected Delete, got {other:?}"),
+    }
+}
+
+#[test]
+fn subscribe_ack_reports_the_directory_hash_the_commit_rebuilt() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut master = two_slave_master(&sandbox, bodies);
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o644, hash);
+    master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: new.clone(),
+                basis: None,
+            },
+        )
+        .unwrap();
+
+    let expected = merkle::dir_node(&[DirChild::File {
+        name: name("hello.txt"),
+        node: file_node(&new),
+    }]);
+    match master
+        .handle(BACKUP, subscribe("backup-1", &[("src", "/src")]))
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::SubscribeAck { checkouts }) => {
+            assert_eq!(checkouts[0].master_root, expected.into())
+        }
+        other => panic!("expected SubscribeAck, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unwritable_peer_grows_no_outbox() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut master = two_slave_master(&sandbox, bodies);
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    master
+        .handle(BACKUP, subscribe("backup-1", &[("bak", "/")]))
+        .unwrap();
+
+    let announce = |path: &str| ProtocolMessage::FileAnnounce {
+        checkout_id: "src".into(),
+        path: p(path),
+        new: FileMetadata::file(hello.len() as u64, MTIME, 0o644, hash),
+        basis: None,
+    };
+
+    master.set_writable(BACKUP, false);
+    master.handle(ALICE, announce("/src/first.txt")).unwrap();
+    assert!(master.poll(BACKUP).is_empty());
+
+    master.set_writable(BACKUP, true);
+    master.handle(ALICE, announce("/src/second.txt")).unwrap();
+    let pushed = master.poll(BACKUP);
+    assert_eq!(pushed.len(), 1);
+    match &pushed[0] {
+        ProtocolMessage::FileAnnounce { path, .. } => assert_eq!(path, &p("/src/second.txt")),
+        other => panic!("expected FileAnnounce, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unknown_static_key_is_hung_up_before_any_index_read() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    match master
+        .handle([0xEE; 32], subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap()
+    {
+        Reply::Hangup { .. } => {}
+        other => panic!("expected Hangup, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_announce_outside_the_subscribed_central_is_an_error_not_a_cas_reject() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut master = two_slave_master(&sandbox, bodies);
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let reply = master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/docs/hello.txt"),
+                new: FileMetadata::file(hello.len() as u64, MTIME, 0o644, hash),
+                basis: None,
+            },
+        )
+        .unwrap();
+    match reply {
+        Reply::Send(ProtocolMessage::Error { code, .. }) => assert_eq!(code, "outside_central"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    assert!(!sandbox.central_root().join("docs/hello.txt").exists());
+}
+
+#[test]
+fn resubscribing_from_a_rotated_key_makes_the_old_key_inert() {
+    const ALICE_NEW: [u8; 32] = [0xA2; 32];
+    let sandbox = SyncSandbox::new();
+    let cfg_path = sandbox.write_master_config(vec![SlaveAcl {
+        id: "dev-alice".into(),
+        public_keys: vec![format_hex_key(&ALICE), format_hex_key(&ALICE_NEW)],
+        allowed_prefixes: vec!["/src".into()],
+    }]);
+    let cfg = LoadedMaster::load(&cfg_path).unwrap();
+    let mut master = Master::open(cfg, MemoryStorage::new(), MemoryContent::new()).unwrap();
+
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    master
+        .handle(ALICE_NEW, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: file(1),
+                basis: None,
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::Error { code, .. }) => assert_eq!(code, "not_subscribed"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    master.disconnect(ALICE);
+
+    match master
+        .handle(
+            ALICE_NEW,
+            ProtocolMessage::Delete {
+                checkout_id: "src".into(),
+                path: p("/src/absent.txt"),
+                basis: file_node(&file(1)),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasReject { path, .. }) => {
+            assert_eq!(path, p("/src/absent.txt"))
+        }
+        other => panic!("the live session survived the stale disconnect, got {other:?}"),
+    }
+}
+
+#[test]
+fn open_indexes_a_central_tree_that_predates_the_index() {
+    let sandbox = SyncSandbox::new();
+    let tree = sandbox.tree(&sandbox.central_root());
+    tree.file("src/hello.txt", b"hello");
+    tree.mkdir("docs");
+
+    let master = two_slave_master(&sandbox, MemoryContent::new());
+
+    let indexed = master.meta(&p("/src/hello.txt")).unwrap().unwrap();
+    assert_eq!(indexed.kind, EntryKind::File);
+    assert_eq!(indexed.size, 5);
+    assert_eq!(indexed.content_hash, hash_bytes(b"hello"));
+    assert_eq!(
+        master.meta(&p("/docs")).unwrap().unwrap().kind,
+        EntryKind::Dir
+    );
+    assert_eq!(
+        master.meta(&p("/src")).unwrap().unwrap().kind,
+        EntryKind::Dir
+    );
+}

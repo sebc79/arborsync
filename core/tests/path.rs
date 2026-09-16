@@ -2,8 +2,9 @@ use std::path::Path;
 
 use arborsync_core::hash::ContentHash;
 use arborsync_core::path::{
-    CanonicalPath, EntryName, PathError, RESERVED_CONFLICTS, RESERVED_TMP, conflict_sidecar_path,
-    host_to_canonical, is_interested, is_reserved_root_entry, join_central, local_paths_overlap,
+    CanonicalPath, EntryName, PathError, RESERVED_CONFLICTS, RESERVED_TMP, canonical_to_host,
+    conflict_sidecar_path, host_to_canonical, is_interested, is_reserved_root_entry, join_central,
+    local_paths_overlap,
 };
 use arborsync_core::test_support::p;
 
@@ -145,6 +146,40 @@ fn local_overlap_is_parent_or_equal_not_string_prefix() {
         Path::new("/opt/a"),
         Path::new("/opt/ab")
     ));
+}
+
+#[test]
+fn parent_stops_at_the_hierarchy_root() {
+    assert_eq!(p("/src/a/b").parent(), Some(p("/src/a")));
+    assert_eq!(p("/src").parent(), Some(p("/")));
+    assert_eq!(p("/").parent(), None);
+}
+
+#[test]
+fn ancestors_walk_root_ward_and_exclude_self() {
+    assert_eq!(
+        p("/src/a/b").ancestors().collect::<Vec<_>>(),
+        vec![p("/src/a"), p("/src"), p("/")]
+    );
+    assert_eq!(p("/src").ancestors().collect::<Vec<_>>(), vec![p("/")]);
+    assert_eq!(p("/").ancestors().collect::<Vec<_>>(), Vec::new());
+}
+
+#[test]
+fn canonical_to_host_rejoins_the_central_root() {
+    let root = Path::new("/central");
+    assert_eq!(
+        canonical_to_host(root, &p("/src/foo.rs")),
+        Path::new("/central/src/foo.rs")
+    );
+    assert_eq!(canonical_to_host(root, &p("/")), Path::new("/central"));
+}
+
+#[test]
+fn canonical_to_host_round_trips_host_to_canonical() {
+    let root = Path::new("/central");
+    let host = canonical_to_host(root, &p("/src/foo.rs"));
+    assert_eq!(host_to_canonical(root, &host).unwrap(), p("/src/foo.rs"));
 }
 
 #[test]

@@ -5,7 +5,36 @@ use redb::{Database, ReadableTable, TableDefinition};
 use crate::hash::{DirNode, FileNode};
 use crate::meta::FileMetadata;
 use crate::path::CanonicalPath;
-use crate::protocol::{decode_bincode, encode_bincode};
+
+/// Layout of a stored `meta` value. Bumped when the row encoding changes.
+const META_SCHEMA_VERSION: u16 = 1;
+
+fn meta_bincode_config() -> impl bincode::config::Config {
+    bincode::config::standard()
+}
+
+/// `u16le META_SCHEMA_VERSION || bincode(FileMetadata)`.
+fn encode_meta(meta: &FileMetadata) -> Result<Vec<u8>, RedbStoreError> {
+    let mut out = META_SCHEMA_VERSION.to_le_bytes().to_vec();
+    out.extend(
+        bincode::serde::encode_to_vec(meta, meta_bincode_config())
+            .map_err(|e| RedbStoreError::Bincode(e.to_string()))?,
+    );
+    Ok(out)
+}
+
+fn decode_meta(bytes: &[u8]) -> Result<FileMetadata, RedbStoreError> {
+    let (prefix, body) = bytes
+        .split_at_checked(2)
+        .ok_or_else(|| RedbStoreError::Bincode("meta row has no schema prefix".into()))?;
+    let version = u16::from_le_bytes([prefix[0], prefix[1]]);
+    if version != META_SCHEMA_VERSION {
+        return Err(RedbStoreError::UnsupportedMetaSchema(version));
+    }
+    let (meta, _) = bincode::serde::decode_from_slice(body, meta_bincode_config())
+        .map_err(|e| RedbStoreError::Bincode(e.to_string()))?;
+    Ok(meta)
+}
 
 /// Master uses the empty string. Slaves pass the checkout’s stable id.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -135,6 +164,8 @@ pub enum RedbStoreError {
     Redb(Box<redb::Error>),
     #[error("bincode: {0}")]
     Bincode(String),
+    #[error("unsupported meta schema version {0}")]
+    UnsupportedMetaSchema(u16),
     #[error("stored hash is not 32 bytes")]
     BadHash,
 }
@@ -206,7 +237,7 @@ impl Storage for RedbStorage {
         ck: &CheckoutId,
         path: &CanonicalPath,
     ) -> Result<Option<FileMetadata>, Self::Error> {
-        get_bincode(&self.db, META, ck, path)
+        get_meta_row(&self.db, META, ck, path)
     }
 
     fn get_dir_node(
@@ -234,7 +265,7 @@ impl Storage for RedbStorage {
         let table = txn.open_table(META)?;
         let mut out = Vec::new();
         for_each_in_prefix(&table, ck, prefix, |path, value| {
-            let meta = decode_bincode(value).map_err(RedbStoreError::Bincode)?;
+            let meta = decode_meta(value)?;
             out.push((path, meta));
             Ok(())
         })?;
@@ -286,7 +317,7 @@ impl WriteBatch for RedbWriteBatch {
         meta: &FileMetadata,
     ) -> Result<(), Self::Error> {
         let key = storage_key(ck, path);
-        let value = encode_bincode(meta).map_err(RedbStoreError::Bincode)?;
+        let value = encode_meta(meta)?;
         let mut table = self.txn.open_table(META)?;
         table.insert(key.as_slice(), value.as_slice())?;
         Ok(())
@@ -398,7 +429,7 @@ fn decode_file_node(bytes: &[u8]) -> Result<FileNode, RedbStoreError> {
     ))
 }
 
-fn get_bincode(
+fn get_meta_row(
     db: &Database,
     table_def: TableDefinition<&[u8], &[u8]>,
     ck: &CheckoutId,
@@ -408,9 +439,7 @@ fn get_bincode(
     let table = txn.open_table(table_def)?;
     let key = storage_key(ck, path);
     match table.get(key.as_slice())? {
-        Some(guard) => Ok(Some(
-            decode_bincode(guard.value()).map_err(RedbStoreError::Bincode)?,
-        )),
+        Some(guard) => Ok(Some(decode_meta(guard.value())?)),
         None => Ok(None),
     }
 }

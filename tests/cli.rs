@@ -1,9 +1,21 @@
 use std::fs;
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use arborsync_core::test_support::SyncSandbox;
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_arborsync"))
+}
+
+fn master_sandbox() -> (SyncSandbox, std::path::PathBuf) {
+    let sandbox = SyncSandbox::new();
+    let key = sandbox.path().join("master/master.key");
+    let keygen = bin().args(["keygen", "--out"]).arg(&key).output().unwrap();
+    assert!(keygen.status.success());
+    let config = sandbox.write_master_config(Vec::new());
+    (sandbox, config)
 }
 
 #[test]
@@ -56,4 +68,67 @@ fn keygen_out_writes_32_bytes_and_prints_hex_public() {
     assert!(printed.as_bytes()[4..].iter().all(u8::is_ascii_hexdigit));
     assert_eq!(fs::read(&key).unwrap().len(), 32);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn master_keeps_running_on_a_valid_config() {
+    let (sandbox, config) = master_sandbox();
+    let mut child = bin()
+        .arg("master")
+        .arg("--config")
+        .arg(&config)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn master");
+
+    sleep(Duration::from_millis(1500));
+    if let Some(status) = child.try_wait().unwrap() {
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "master exited with {status}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(sandbox);
+}
+
+#[test]
+fn master_reads_the_config_path_from_the_environment() {
+    let (sandbox, config) = master_sandbox();
+    let mut child = bin()
+        .arg("master")
+        .env("ARBORSYNC_CONFIG", &config)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn master");
+
+    sleep(Duration::from_millis(1500));
+    if let Some(status) = child.try_wait().unwrap() {
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "master exited with {status}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(sandbox);
+}
+
+#[test]
+fn master_reports_the_missing_key_path_it_could_not_read() {
+    let sandbox = SyncSandbox::new();
+    let config = sandbox.write_master_config(Vec::new());
+    let output = bin()
+        .arg("master")
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .expect("run master");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("master.key"), "stderr={stderr}");
 }

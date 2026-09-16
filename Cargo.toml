@@ -49,7 +49,9 @@ arborsync-core.workspace = true
 clap.workspace = true
 env_logger.workspace = true
 log.workspace = true
+notify-debouncer-mini.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 arborsync-core.workspace = true
+tempfile.workspace = true

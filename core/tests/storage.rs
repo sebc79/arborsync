@@ -2,6 +2,9 @@ use arborsync_core::hash::{ContentHash, DirNode, FileNode};
 use arborsync_core::meta::FileMetadata;
 use arborsync_core::storage::{CheckoutId, RedbStorage, Storage, WriteBatch};
 use arborsync_core::test_support::p;
+use redb::{Database, ReadableTable, TableDefinition};
+
+const META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("meta");
 
 fn open_tmp() -> (tempfile::TempDir, RedbStorage) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -286,6 +289,39 @@ fn del_entry_clears_one_path_from_all_three_tables() {
         store.get_meta(&master, &p("/src/foo.rs")).unwrap(),
         Some(meta(2))
     );
+}
+
+#[test]
+fn a_meta_row_from_a_future_schema_is_refused_not_reinterpreted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.redb");
+    let ck = CheckoutId::master();
+    {
+        let store = RedbStorage::open(&path).unwrap();
+        let mut batch = store.begin_write().unwrap();
+        batch.put_meta(&ck, &p("/src/foo.rs"), &meta(1)).unwrap();
+        batch.commit().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(META).unwrap();
+        let (key, value) = {
+            let mut rows = table.iter().unwrap();
+            let (key, value) = rows.next().unwrap().unwrap();
+            (key.value().to_vec(), value.value().to_vec())
+        };
+        let mut bumped = 2u16.to_le_bytes().to_vec();
+        bumped.extend_from_slice(&value[2..]);
+        table.insert(key.as_slice(), bumped.as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+    drop(db);
+
+    let store = RedbStorage::open(&path).unwrap();
+    let err = store.get_meta(&ck, &p("/src/foo.rs")).unwrap_err();
+    assert_eq!(err.to_string(), "unsupported meta schema version 2");
 }
 
 #[test]

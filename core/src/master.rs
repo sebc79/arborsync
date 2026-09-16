@@ -1,0 +1,811 @@
+//! One synchronous writer of `central_root` and the global index.
+//! The binary serializes QUIC, `notify`, and rate limits into
+//! [`Master::handle`], [`Master::note_local`], and [`Master::poll`].
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use crate::apply;
+use crate::config::LoadedMaster;
+use crate::hash::{ContentHash, FileNode};
+use crate::index;
+use crate::keys::format_hex_key;
+use crate::merkle::file_node;
+use crate::meta::{self, EntryKind, FileMetadata};
+use crate::path::{
+    CanonicalPath, PathError, canonical_to_host, is_reserved_root_entry, join_central,
+};
+use crate::protocol::{CheckoutAck, CheckoutRef, ProtocolMessage};
+use crate::storage::{CheckoutId, Storage};
+
+pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
+
+/// Checkout id on the wire. Distinct from [`CheckoutId`], the index namespace.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CheckoutName(String);
+
+impl CheckoutName {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SlaveId(String);
+
+impl SlaveId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct InterestKey {
+    slave: SlaveId,
+    checkout: CheckoutName,
+}
+
+#[derive(Clone, Debug)]
+pub enum Origin {
+    Slave {
+        slave: SlaveId,
+        checkout: CheckoutName,
+    },
+    Local,
+}
+
+impl Origin {
+    fn committed(&self, key: &InterestKey) -> bool {
+        match self {
+            Self::Slave { slave, checkout } => slave == &key.slave && checkout == &key.checkout,
+            Self::Local => false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Reply {
+    Send(ProtocolMessage),
+    Hangup { reason: String },
+}
+
+#[derive(Clone, Debug)]
+pub enum LocalEvent {
+    Changed(CanonicalPath),
+    Removed(CanonicalPath),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MasterError {
+    #[error("{path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(transparent)]
+    Apply(#[from] apply::ApplyError),
+    #[error("index: {0}")]
+    Index(Box<dyn std::error::Error + Send + Sync>),
+    #[error("central_root holds a name that is not a canonical path component: {0}")]
+    BadHostName(#[from] PathError),
+}
+
+impl MasterError {
+    fn index<E: std::error::Error + Send + Sync + 'static>(err: E) -> Self {
+        Self::Index(Box::new(err))
+    }
+
+    fn io(path: &std::path::Path) -> impl Fn(io::Error) -> Self + '_ {
+        move |source| Self::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CasDecision {
+    Accept,
+    Reject { current: Option<FileMetadata> },
+}
+
+/// Pure CAS check. `new_kind` is `None` for a delete.
+pub fn decide_cas(
+    current: Option<&FileMetadata>,
+    basis: Option<FileNode>,
+    new_kind: Option<EntryKind>,
+) -> CasDecision {
+    let reject = || CasDecision::Reject {
+        current: current.cloned(),
+    };
+    match (current, basis) {
+        (None, None) if new_kind.is_some() => CasDecision::Accept,
+        (Some(live), Some(basis)) => {
+            if live.kind == EntryKind::Dir
+                || file_node(live) != basis
+                || new_kind.is_some_and(|kind| kind != live.kind)
+            {
+                reject()
+            } else {
+                CasDecision::Accept
+            }
+        }
+        _ => reject(),
+    }
+}
+
+struct InflightEntry {
+    hash: ContentHash,
+    until: Instant,
+}
+
+struct Inflight {
+    window: Duration,
+    entries: HashMap<CanonicalPath, InflightEntry>,
+}
+
+impl Inflight {
+    fn new(debounce: Duration) -> Self {
+        Self {
+            window: debounce * 2,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn arm(&mut self, path: CanonicalPath, hash: ContentHash) {
+        let until = Instant::now() + self.window;
+        self.entries.insert(path, InflightEntry { hash, until });
+    }
+
+    fn consume_if_echo(&mut self, path: &CanonicalPath, hash: &ContentHash) -> bool {
+        let now = Instant::now();
+        self.entries.retain(|_, entry| entry.until > now);
+        if self.entries.get(path).is_some_and(|e| &e.hash == hash) {
+            self.entries.remove(path);
+            return true;
+        }
+        false
+    }
+}
+
+struct LiveSlave {
+    peer: [u8; 32],
+    checkouts: HashMap<CheckoutName, CanonicalPath>,
+    outbox: Vec<ProtocolMessage>,
+    writable: bool,
+}
+
+#[derive(Default)]
+struct Roster {
+    by_slave: HashMap<SlaveId, LiveSlave>,
+    by_peer: HashMap<[u8; 32], SlaveId>,
+    by_central: HashMap<CanonicalPath, HashSet<InterestKey>>,
+}
+
+impl Roster {
+    fn install(
+        &mut self,
+        peer: [u8; 32],
+        slave: SlaveId,
+        checkouts: HashMap<CheckoutName, CanonicalPath>,
+    ) -> Option<[u8; 32]> {
+        if let Some(previous) = self.by_peer.get(&peer).cloned() {
+            self.forget(&previous);
+        }
+        let displaced = self.by_slave.get(&slave).map(|live| live.peer);
+        self.forget(&slave);
+        for (checkout, central) in &checkouts {
+            self.by_central
+                .entry(central.clone())
+                .or_default()
+                .insert(InterestKey {
+                    slave: slave.clone(),
+                    checkout: checkout.clone(),
+                });
+        }
+        self.by_peer.insert(peer, slave.clone());
+        self.by_slave.insert(
+            slave,
+            LiveSlave {
+                peer,
+                checkouts,
+                outbox: Vec::new(),
+                writable: true,
+            },
+        );
+        displaced.filter(|old| old != &peer)
+    }
+
+    fn forget(&mut self, slave: &SlaveId) {
+        let Some(live) = self.by_slave.remove(slave) else {
+            return;
+        };
+        self.by_peer.remove(&live.peer);
+        for (checkout, central) in &live.checkouts {
+            let Some(keys) = self.by_central.get_mut(central) else {
+                continue;
+            };
+            keys.remove(&InterestKey {
+                slave: slave.clone(),
+                checkout: checkout.clone(),
+            });
+            if keys.is_empty() {
+                self.by_central.remove(central);
+            }
+        }
+    }
+
+    fn disconnect_peer(&mut self, peer: &[u8; 32]) {
+        let Some(slave) = self.by_peer.get(peer).cloned() else {
+            return;
+        };
+        self.forget(&slave);
+    }
+
+    fn slave_of(&self, peer: &[u8; 32]) -> Option<&SlaveId> {
+        self.by_peer.get(peer)
+    }
+
+    fn checkout_central(&self, peer: &[u8; 32], ck: &CheckoutName) -> Option<&CanonicalPath> {
+        self.by_slave
+            .get(self.by_peer.get(peer)?)?
+            .checkouts
+            .get(ck)
+    }
+
+    fn interested(&self, path: &CanonicalPath) -> Vec<InterestKey> {
+        std::iter::once(path.clone())
+            .chain(path.ancestors())
+            .filter_map(|candidate| self.by_central.get(&candidate))
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    fn push(&mut self, key: &InterestKey, msg: ProtocolMessage) {
+        let Some(live) = self.by_slave.get_mut(&key.slave) else {
+            return;
+        };
+        if live.writable {
+            live.outbox.push(msg);
+        }
+    }
+
+    fn take_outbox(&mut self, peer: &[u8; 32]) -> Vec<ProtocolMessage> {
+        let Some(slave) = self.by_peer.get(peer).cloned() else {
+            return Vec::new();
+        };
+        match self.by_slave.get_mut(&slave) {
+            Some(live) => std::mem::take(&mut live.outbox),
+            None => Vec::new(),
+        }
+    }
+
+    fn set_writable(&mut self, peer: &[u8; 32], writable: bool) {
+        let Some(slave) = self.by_peer.get(peer).cloned() else {
+            return;
+        };
+        let Some(live) = self.by_slave.get_mut(&slave) else {
+            return;
+        };
+        live.writable = writable;
+        if !writable {
+            live.outbox.clear();
+        }
+    }
+}
+
+struct Session {
+    slave: SlaveId,
+    central: CanonicalPath,
+}
+
+enum NotSubscribed {
+    NoSession,
+    UnknownCheckout,
+}
+
+impl NotSubscribed {
+    fn into_error(self, checkout: &CheckoutName) -> ProtocolMessage {
+        ProtocolMessage::Error {
+            code: "not_subscribed".into(),
+            message: match self {
+                Self::NoSession => "no live session for this key".into(),
+                Self::UnknownCheckout => {
+                    format!("checkout {} is not in the live set", checkout.as_str())
+                }
+            },
+        }
+    }
+}
+
+enum Fanout {
+    Announce {
+        new: FileMetadata,
+        basis: Option<FileNode>,
+    },
+    Remove {
+        basis: FileNode,
+    },
+}
+
+pub struct Master<S: Storage, C: ContentHook> {
+    cfg: LoadedMaster,
+    store: S,
+    central_root: PathBuf,
+    roster: Roster,
+    inflight: Inflight,
+    bodies: C,
+}
+
+impl<S: Storage, C: ContentHook> Master<S, C> {
+    pub fn open(cfg: LoadedMaster, store: S, bodies: C) -> Result<Self, MasterError> {
+        let configured = cfg.central_root().to_path_buf();
+        fs::create_dir_all(&configured).map_err(MasterError::io(&configured))?;
+        let central_root = fs::canonicalize(&configured).map_err(MasterError::io(&configured))?;
+        apply::wipe_tmp(&central_root)?;
+
+        let debounce = Duration::from_millis(cfg.watcher_debounce_ms());
+        let mut master = Self {
+            cfg,
+            store,
+            central_root,
+            roster: Roster::default(),
+            inflight: Inflight::new(debounce),
+            bodies,
+        };
+        if index::root_is_dirty(&master.store).map_err(MasterError::index)? {
+            master.rescan()?;
+        }
+        Ok(master)
+    }
+
+    pub fn handle(&mut self, peer: [u8; 32], msg: ProtocolMessage) -> Result<Reply, MasterError> {
+        if self.cfg.acl_for_public_key(&peer).is_none() {
+            return Ok(Reply::Hangup {
+                reason: "unknown static key".into(),
+            });
+        }
+        match msg {
+            ProtocolMessage::Subscribe {
+                slave_id,
+                checkouts,
+            } => Ok(Reply::Send(self.on_subscribe(peer, slave_id, checkouts)?)),
+            ProtocolMessage::FileAnnounce {
+                checkout_id,
+                path,
+                new,
+                basis,
+            } => Ok(Reply::Send(self.on_announce(
+                peer,
+                checkout_id,
+                path,
+                new,
+                basis,
+            )?)),
+            ProtocolMessage::Delete {
+                checkout_id,
+                path,
+                basis,
+            } => Ok(Reply::Send(self.on_delete(
+                peer,
+                checkout_id,
+                path,
+                basis,
+            )?)),
+            ProtocolMessage::Disconnect { .. } => {
+                self.disconnect(peer);
+                Ok(Reply::Hangup {
+                    reason: "peer disconnect".into(),
+                })
+            }
+            other => Ok(Reply::Send(ProtocolMessage::Error {
+                code: "unsupported".into(),
+                message: format!("{other:?}"),
+            })),
+        }
+    }
+
+    pub fn note_local(&mut self, event: LocalEvent) -> Result<(), MasterError> {
+        match event {
+            LocalEvent::Changed(path) => self.note_changed(path),
+            LocalEvent::Removed(path) => self.note_removed(&path),
+        }
+    }
+
+    pub fn rescan(&mut self) -> Result<(), MasterError> {
+        let disk = self.walk_central()?;
+        let indexed = self
+            .store
+            .range_meta(&CheckoutId::master(), &CanonicalPath::root())
+            .map_err(MasterError::index)?;
+
+        for (path, previous) in indexed {
+            if disk.contains_key(&path) {
+                continue;
+            }
+            if self.meta(&path)?.is_none() {
+                continue;
+            }
+            self.commit(&Origin::Local, &path, None, Some(&previous))?;
+        }
+        for (path, found) in &disk {
+            let current = self.meta(path)?;
+            if current.as_ref() == Some(found) {
+                continue;
+            }
+            self.commit(&Origin::Local, path, Some(found), current.as_ref())?;
+        }
+        Ok(())
+    }
+
+    pub fn disconnect(&mut self, peer: [u8; 32]) {
+        self.roster.disconnect_peer(&peer);
+    }
+
+    pub fn poll(&mut self, peer: [u8; 32]) -> Vec<ProtocolMessage> {
+        self.roster.take_outbox(&peer)
+    }
+
+    pub fn set_writable(&mut self, peer: [u8; 32], writable: bool) {
+        self.roster.set_writable(&peer, writable);
+    }
+
+    pub fn central_root(&self) -> &std::path::Path {
+        &self.central_root
+    }
+
+    pub fn meta(&self, path: &CanonicalPath) -> Result<Option<FileMetadata>, MasterError> {
+        self.store
+            .get_meta(&CheckoutId::master(), path)
+            .map_err(MasterError::index)
+    }
+
+    fn on_subscribe(
+        &mut self,
+        peer: [u8; 32],
+        slave_id: String,
+        checkouts: Vec<CheckoutRef>,
+    ) -> Result<ProtocolMessage, MasterError> {
+        let Some(acl) = self.cfg.acl_for_public_key(&peer) else {
+            return Ok(reject_all(&checkouts, "unknown static key"));
+        };
+        if acl.id() != slave_id {
+            return Ok(reject_all(
+                &checkouts,
+                &format!("slave_id {slave_id} is not bound to this key"),
+            ));
+        }
+        if checkouts.len() > self.cfg.max_checkouts_per_slave() as usize {
+            return Ok(reject_all(&checkouts, "too many checkouts"));
+        }
+
+        let mut live: HashMap<CheckoutName, CanonicalPath> = HashMap::new();
+        let mut denied = Vec::new();
+        for checkout in &checkouts {
+            if !acl.allows_central(&checkout.central) {
+                denied.push(checkout.central.clone());
+                continue;
+            }
+            if live
+                .insert(CheckoutName::new(&checkout.id), checkout.central.clone())
+                .is_some()
+            {
+                return Ok(reject_all(
+                    &checkouts,
+                    &format!("duplicate checkout id {}", checkout.id),
+                ));
+            }
+        }
+        if !denied.is_empty() {
+            return Ok(ProtocolMessage::SubscribeReject {
+                reason: "central is outside allowed_prefixes".into(),
+                denied_centrals: denied,
+            });
+        }
+
+        let slave = SlaveId::new(slave_id);
+        if let Some(displaced) = self.roster.install(peer, slave.clone(), live) {
+            log::info!(
+                "slave {} replaced its session; {} is no longer live",
+                slave.as_str(),
+                format_hex_key(&displaced)
+            );
+        }
+        let mut acks = Vec::with_capacity(checkouts.len());
+        for checkout in checkouts {
+            acks.push(CheckoutAck {
+                master_root: index::subtree_root(&self.store, &checkout.central)
+                    .map_err(MasterError::index)?,
+                id: checkout.id,
+                central: checkout.central,
+            });
+        }
+        Ok(ProtocolMessage::SubscribeAck { checkouts: acks })
+    }
+
+    fn on_announce(
+        &mut self,
+        peer: [u8; 32],
+        checkout_id: String,
+        path: CanonicalPath,
+        new: FileMetadata,
+        basis: Option<FileNode>,
+    ) -> Result<ProtocolMessage, MasterError> {
+        let checkout = CheckoutName::new(checkout_id.clone());
+        let session = match self.live_checkout(&peer, &checkout) {
+            Ok(session) => session,
+            Err(refusal) => return Ok(refusal.into_error(&checkout)),
+        };
+        if !session.central.covers(&path) {
+            return Ok(outside_central(&path));
+        }
+
+        let current = self.meta(&path)?;
+        if let CasDecision::Reject { current } = decide_cas(current.as_ref(), basis, Some(new.kind))
+        {
+            return Ok(ProtocolMessage::CasReject {
+                checkout_id,
+                path,
+                current,
+            });
+        }
+
+        match new.kind {
+            EntryKind::Dir => {
+                self.index_ancestors(&path)?;
+                apply::mkdir_live(&self.central_root, &path, &new)?;
+            }
+            EntryKind::File | EntryKind::Symlink => match self.bodies.fetch(new.content_hash) {
+                ContentBytes::AskSender => {
+                    return Ok(ProtocolMessage::SignatureRequest {
+                        checkout_id,
+                        path,
+                        want_hash: new.content_hash,
+                        signature: Vec::new(),
+                    });
+                }
+                ContentBytes::Whole(body) => {
+                    if let Some(previous) = &current {
+                        apply::sidecar_if_content_differs(
+                            &self.central_root,
+                            &path,
+                            previous,
+                            new.content_hash,
+                        )?;
+                    }
+                    self.index_ancestors(&path)?;
+                    if new.kind == EntryKind::File {
+                        apply::atomic_put(&self.central_root, &path, &new, &body)?;
+                    } else {
+                        apply::atomic_symlink(&self.central_root, &path, &new, &body)?;
+                    }
+                    self.inflight.arm(path.clone(), new.content_hash);
+                }
+            },
+        }
+
+        let committed = file_node(&new);
+        let origin = Origin::Slave {
+            slave: session.slave,
+            checkout,
+        };
+        self.commit(&origin, &path, Some(&new), current.as_ref())?;
+        Ok(ProtocolMessage::CasAccept {
+            checkout_id,
+            path,
+            file_node: Some(committed),
+        })
+    }
+
+    fn on_delete(
+        &mut self,
+        peer: [u8; 32],
+        checkout_id: String,
+        path: CanonicalPath,
+        basis: FileNode,
+    ) -> Result<ProtocolMessage, MasterError> {
+        let checkout = CheckoutName::new(checkout_id.clone());
+        let session = match self.live_checkout(&peer, &checkout) {
+            Ok(session) => session,
+            Err(refusal) => return Ok(refusal.into_error(&checkout)),
+        };
+        if !session.central.covers(&path) {
+            return Ok(outside_central(&path));
+        }
+
+        let current = self.meta(&path)?;
+        if let CasDecision::Reject { current } = decide_cas(current.as_ref(), Some(basis), None) {
+            return Ok(ProtocolMessage::CasReject {
+                checkout_id,
+                path,
+                current,
+            });
+        }
+
+        apply::remove_live(&self.central_root, &path)?;
+        let origin = Origin::Slave {
+            slave: session.slave,
+            checkout,
+        };
+        self.commit(&origin, &path, None, current.as_ref())?;
+        Ok(ProtocolMessage::CasAccept {
+            checkout_id,
+            path,
+            file_node: None,
+        })
+    }
+
+    fn live_checkout(
+        &self,
+        peer: &[u8; 32],
+        checkout: &CheckoutName,
+    ) -> Result<Session, NotSubscribed> {
+        let Some(slave) = self.roster.slave_of(peer).cloned() else {
+            return Err(NotSubscribed::NoSession);
+        };
+        let Some(central) = self.roster.checkout_central(peer, checkout).cloned() else {
+            return Err(NotSubscribed::UnknownCheckout);
+        };
+        Ok(Session { slave, central })
+    }
+
+    fn commit(
+        &mut self,
+        origin: &Origin,
+        path: &CanonicalPath,
+        new: Option<&FileMetadata>,
+        previous: Option<&FileMetadata>,
+    ) -> Result<(), MasterError> {
+        index::commit_leaf(&self.store, path, new).map_err(MasterError::index)?;
+
+        let payload = match (new, previous) {
+            (Some(new), previous) => Fanout::Announce {
+                new: new.clone(),
+                basis: previous.map(file_node),
+            },
+            (None, Some(previous)) => Fanout::Remove {
+                basis: file_node(previous),
+            },
+            (None, None) => return Ok(()),
+        };
+        for key in self.roster.interested(path) {
+            if origin.committed(&key) {
+                continue;
+            }
+            let checkout_id = key.checkout.as_str().to_string();
+            let msg = match &payload {
+                Fanout::Announce { new, basis } => ProtocolMessage::FileAnnounce {
+                    checkout_id,
+                    path: path.clone(),
+                    new: new.clone(),
+                    basis: *basis,
+                },
+                Fanout::Remove { basis } => ProtocolMessage::Delete {
+                    checkout_id,
+                    path: path.clone(),
+                    basis: *basis,
+                },
+            };
+            self.roster.push(&key, msg);
+        }
+        Ok(())
+    }
+
+    fn index_ancestors(&mut self, path: &CanonicalPath) -> Result<(), MasterError> {
+        let mut ancestors: Vec<CanonicalPath> = path.ancestors().collect();
+        ancestors.reverse();
+        for dir in ancestors {
+            if self.meta(&dir)?.is_some() {
+                continue;
+            }
+            let host = canonical_to_host(&self.central_root, &dir);
+            fs::create_dir_all(&host).map_err(MasterError::io(&host))?;
+            let Some(found) = meta::collect_from_path(&host).map_err(MasterError::io(&host))?
+            else {
+                continue;
+            };
+            index::commit_leaf(&self.store, &dir, Some(&found)).map_err(MasterError::index)?;
+        }
+        Ok(())
+    }
+
+    fn note_changed(&mut self, path: CanonicalPath) -> Result<(), MasterError> {
+        if is_reserved(&path) {
+            return Ok(());
+        }
+        let host = canonical_to_host(&self.central_root, &path);
+        let Some(found) = meta::collect_from_path(&host).map_err(MasterError::io(&host))? else {
+            return self.note_removed(&path);
+        };
+        if self.inflight.consume_if_echo(&path, &found.content_hash) {
+            return Ok(());
+        }
+        let current = self.meta(&path)?;
+        if current.as_ref() == Some(&found) {
+            return Ok(());
+        }
+        self.index_ancestors(&path)?;
+        self.commit(&Origin::Local, &path, Some(&found), current.as_ref())
+    }
+
+    fn note_removed(&mut self, path: &CanonicalPath) -> Result<(), MasterError> {
+        if is_reserved(path) {
+            return Ok(());
+        }
+        let Some(previous) = self.meta(path)? else {
+            return Ok(());
+        };
+        self.commit(&Origin::Local, path, None, Some(&previous))
+    }
+
+    fn walk_central(&self) -> Result<BTreeMap<CanonicalPath, FileMetadata>, MasterError> {
+        let mut found = BTreeMap::new();
+        if let Some(root) = meta::collect_from_path(&self.central_root)
+            .map_err(MasterError::io(&self.central_root))?
+        {
+            found.insert(CanonicalPath::root(), root);
+        }
+        let mut pending = vec![CanonicalPath::root()];
+        while let Some(dir) = pending.pop() {
+            let host = canonical_to_host(&self.central_root, &dir);
+            for entry in fs::read_dir(&host).map_err(MasterError::io(&host))? {
+                let entry = entry.map_err(MasterError::io(&host))?;
+                let raw = entry.file_name();
+                let Some(name) = raw.to_str() else {
+                    log::warn!("skipping non-UTF-8 name under {}", host.display());
+                    continue;
+                };
+                if dir.as_str() == "/" && is_reserved_root_entry(name) {
+                    continue;
+                }
+                let child = join_central(&dir, name)?;
+                let host_child = entry.path();
+                let Some(meta) =
+                    meta::collect_from_path(&host_child).map_err(MasterError::io(&host_child))?
+                else {
+                    continue;
+                };
+                if meta.kind == EntryKind::Dir {
+                    pending.push(child.clone());
+                }
+                found.insert(child, meta);
+            }
+        }
+        Ok(found)
+    }
+}
+
+fn is_reserved(path: &CanonicalPath) -> bool {
+    path.as_str()
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .is_some_and(is_reserved_root_entry)
+}
+
+fn outside_central(path: &CanonicalPath) -> ProtocolMessage {
+    ProtocolMessage::Error {
+        code: "outside_central".into(),
+        message: format!("{} is not under the subscribed central", path.as_str()),
+    }
+}
+
+fn reject_all(checkouts: &[CheckoutRef], reason: &str) -> ProtocolMessage {
+    ProtocolMessage::SubscribeReject {
+        reason: reason.into(),
+        denied_centrals: checkouts.iter().map(|c| c.central.clone()).collect(),
+    }
+}

@@ -132,3 +132,16 @@ fn decode_rejects_unsupported_envelope_version() {
         FrameError::UnsupportedVersion(2)
     );
 }
+
+#[test]
+fn decode_rejects_unknown_v2_variant_as_unsupported_version() {
+    let mut payload = bincode::serde::encode_to_vec(2u16, bincode::config::standard()).unwrap();
+    payload.extend(bincode::serde::encode_to_vec(15u32, bincode::config::standard()).unwrap());
+    let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&payload);
+
+    assert_eq!(
+        decode_control(&frame).unwrap_err(),
+        FrameError::UnsupportedVersion(2)
+    );
+}
