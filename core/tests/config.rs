@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use arborsync_core::path::PathError;
+use arborsync_core::test_support::p;
 use arborsync_core::{ConfigError, LoadedMaster, LoadedSlave};
 
 static HOME_LOCK: Mutex<()> = Mutex::new(());
@@ -60,10 +61,9 @@ fn valid_master_parses_and_acl_lookup_hits_the_row() {
     let row = loaded.acl_for_public_key(&AA_BYTES).expect("acl row");
     assert_eq!(row.id(), "dev-alice");
     assert_eq!(row.public_keys(), &[AA_BYTES]);
-    assert_eq!(
-        row.allowed_prefixes(),
-        &["/src".to_string(), "/docs".to_string()]
-    );
+    assert_eq!(row.allowed_prefixes(), &[p("/src"), p("/docs")]);
+    assert!(row.allows_central(&p("/src/project1")));
+    assert!(!row.allows_central(&p("/src2")));
 }
 
 #[test]
@@ -121,9 +121,8 @@ fn debounce_199_and_501_fail() {
 
 #[test]
 fn debounce_200_and_500_pass() {
-    let low = valid_master().replace("watcher_debounce_ms = 200", "watcher_debounce_ms = 200");
     let high = valid_master().replace("watcher_debounce_ms = 200", "watcher_debounce_ms = 500");
-    LoadedMaster::parse(&low).unwrap();
+    LoadedMaster::parse(&valid_master()).unwrap();
     LoadedMaster::parse(&high).unwrap();
 }
 
@@ -204,10 +203,7 @@ allowed_prefixes = ["/src", "/src2"]
     ));
     let loaded = LoadedMaster::parse(&toml).unwrap();
     let row = loaded.acl_for_public_key(&AA_BYTES).unwrap();
-    assert_eq!(
-        row.allowed_prefixes(),
-        &["/src".to_string(), "/src2".to_string()]
-    );
+    assert_eq!(row.allowed_prefixes(), &[p("/src"), p("/src2")]);
 }
 
 #[test]
@@ -421,17 +417,15 @@ fn tilde_host_paths_expand_from_home() {
     let previous_home = std::env::var_os("HOME");
     unsafe { std::env::set_var("HOME", home.path()) };
 
-    let toml = format!(
-        r#"
+    let toml = r#"
 central_root = "~"
 listen_addr = "127.0.0.1:8443"
 master_key_path = "~/master.key"
 db_path = "/var/lib/arborsync/index.redb"
 log_level = "info"
 watcher_debounce_ms = 200
-"#
-    );
-    let loaded = LoadedMaster::parse(&toml).unwrap();
+"#;
+    let loaded = LoadedMaster::parse(toml).unwrap();
     assert_eq!(loaded.central_root(), home.path());
     assert_eq!(loaded.master_key_path(), home.path().join("master.key"));
     match previous_home {

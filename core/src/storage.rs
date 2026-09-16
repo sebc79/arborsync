@@ -1,11 +1,10 @@
-//! Storage trait (`spec.md` §13). redb is the only on-disk backend.
-
 use std::path::Path;
 
 use redb::{Database, ReadableTable, TableDefinition};
 
+use crate::hash::{DirNode, FileNode};
 use crate::meta::FileMetadata;
-use crate::path::is_interested;
+use crate::path::CanonicalPath;
 use crate::protocol::{decode_bincode, encode_bincode};
 
 /// Master uses the empty string. Slaves pass the checkout’s stable id.
@@ -38,20 +37,31 @@ pub trait Storage: Send + Sync + 'static {
     where
         Self: Sized;
 
-    fn get_meta(&self, ck: &CheckoutId, path: &str) -> Result<Option<FileMetadata>, Self::Error>;
-    fn get_dir_node(&self, ck: &CheckoutId, path: &str) -> Result<Option<[u8; 32]>, Self::Error>;
-    fn get_last_synced(&self, ck: &CheckoutId, path: &str)
-    -> Result<Option<[u8; 32]>, Self::Error>;
+    fn get_meta(
+        &self,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+    ) -> Result<Option<FileMetadata>, Self::Error>;
+    fn get_dir_node(
+        &self,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+    ) -> Result<Option<DirNode>, Self::Error>;
+    fn get_last_synced(
+        &self,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+    ) -> Result<Option<FileNode>, Self::Error>;
     fn range_meta(
         &self,
         ck: &CheckoutId,
-        prefix: &str,
-    ) -> Result<Vec<(String, FileMetadata)>, Self::Error>;
+        prefix: &CanonicalPath,
+    ) -> Result<Vec<(CanonicalPath, FileMetadata)>, Self::Error>;
     fn range_dir_nodes(
         &self,
         ck: &CheckoutId,
-        prefix: &str,
-    ) -> Result<Vec<(String, [u8; 32])>, Self::Error>;
+        prefix: &CanonicalPath,
+    ) -> Result<Vec<(CanonicalPath, DirNode)>, Self::Error>;
 
     fn begin_write(&self) -> Result<Self::WriteBatch<'_>, Self::Error>;
     fn delete_checkout(&self, ck: &CheckoutId) -> Result<(), Self::Error>;
@@ -63,26 +73,55 @@ pub trait WriteBatch {
     fn put_meta(
         &mut self,
         ck: &CheckoutId,
-        path: &str,
+        path: &CanonicalPath,
         meta: &FileMetadata,
     ) -> Result<(), Self::Error>;
-    fn del_meta(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Self::Error>;
-    fn del_meta_prefix(&mut self, ck: &CheckoutId, prefix: &str) -> Result<(), Self::Error>;
+    fn del_meta(&mut self, ck: &CheckoutId, path: &CanonicalPath) -> Result<(), Self::Error>;
+    fn del_meta_prefix(
+        &mut self,
+        ck: &CheckoutId,
+        prefix: &CanonicalPath,
+    ) -> Result<(), Self::Error>;
     fn put_dir_node(
         &mut self,
         ck: &CheckoutId,
-        path: &str,
-        node: [u8; 32],
+        path: &CanonicalPath,
+        node: DirNode,
     ) -> Result<(), Self::Error>;
-    fn del_dir_node(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Self::Error>;
-    fn del_dir_prefix(&mut self, ck: &CheckoutId, prefix: &str) -> Result<(), Self::Error>;
+    fn del_dir_node(&mut self, ck: &CheckoutId, path: &CanonicalPath) -> Result<(), Self::Error>;
+    fn del_dir_prefix(
+        &mut self,
+        ck: &CheckoutId,
+        prefix: &CanonicalPath,
+    ) -> Result<(), Self::Error>;
     fn put_last_synced(
         &mut self,
         ck: &CheckoutId,
-        path: &str,
-        file_node: [u8; 32],
+        path: &CanonicalPath,
+        file_node: FileNode,
     ) -> Result<(), Self::Error>;
-    fn del_last_synced(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Self::Error>;
+    fn del_last_synced(&mut self, ck: &CheckoutId, path: &CanonicalPath)
+    -> Result<(), Self::Error>;
+    fn del_last_synced_prefix(
+        &mut self,
+        ck: &CheckoutId,
+        prefix: &CanonicalPath,
+    ) -> Result<(), Self::Error>;
+
+    /// Drop everything at or below `prefix` from all three tables.
+    fn purge_prefix(&mut self, ck: &CheckoutId, prefix: &CanonicalPath) -> Result<(), Self::Error> {
+        self.del_meta_prefix(ck, prefix)?;
+        self.del_dir_prefix(ck, prefix)?;
+        self.del_last_synced_prefix(ck, prefix)
+    }
+
+    /// Drop one path from all three tables.
+    fn del_entry(&mut self, ck: &CheckoutId, path: &CanonicalPath) -> Result<(), Self::Error> {
+        self.del_meta(ck, path)?;
+        self.del_dir_node(ck, path)?;
+        self.del_last_synced(ck, path)
+    }
+
     fn commit(self) -> Result<(), Self::Error>;
 }
 
@@ -162,27 +201,35 @@ impl Storage for RedbStorage {
         Ok(Self { db })
     }
 
-    fn get_meta(&self, ck: &CheckoutId, path: &str) -> Result<Option<FileMetadata>, Self::Error> {
+    fn get_meta(
+        &self,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+    ) -> Result<Option<FileMetadata>, Self::Error> {
         get_bincode(&self.db, META, ck, path)
     }
 
-    fn get_dir_node(&self, ck: &CheckoutId, path: &str) -> Result<Option<[u8; 32]>, Self::Error> {
-        get_hash(&self.db, DIR_NODES, ck, path)
+    fn get_dir_node(
+        &self,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+    ) -> Result<Option<DirNode>, Self::Error> {
+        get_hash(&self.db, DIR_NODES, ck, path, decode_dir_node)
     }
 
     fn get_last_synced(
         &self,
         ck: &CheckoutId,
-        path: &str,
-    ) -> Result<Option<[u8; 32]>, Self::Error> {
-        get_hash(&self.db, LAST_SYNCED, ck, path)
+        path: &CanonicalPath,
+    ) -> Result<Option<FileNode>, Self::Error> {
+        get_hash(&self.db, LAST_SYNCED, ck, path, decode_file_node)
     }
 
     fn range_meta(
         &self,
         ck: &CheckoutId,
-        prefix: &str,
-    ) -> Result<Vec<(String, FileMetadata)>, Self::Error> {
+        prefix: &CanonicalPath,
+    ) -> Result<Vec<(CanonicalPath, FileMetadata)>, Self::Error> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(META)?;
         let mut out = Vec::new();
@@ -197,13 +244,13 @@ impl Storage for RedbStorage {
     fn range_dir_nodes(
         &self,
         ck: &CheckoutId,
-        prefix: &str,
-    ) -> Result<Vec<(String, [u8; 32])>, Self::Error> {
+        prefix: &CanonicalPath,
+    ) -> Result<Vec<(CanonicalPath, DirNode)>, Self::Error> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(DIR_NODES)?;
         let mut out = Vec::new();
         for_each_in_prefix(&table, ck, prefix, |path, value| {
-            out.push((path, hash32(value)?));
+            out.push((path, decode_dir_node(value)?));
             Ok(())
         })?;
         Ok(out)
@@ -235,7 +282,7 @@ impl WriteBatch for RedbWriteBatch {
     fn put_meta(
         &mut self,
         ck: &CheckoutId,
-        path: &str,
+        path: &CanonicalPath,
         meta: &FileMetadata,
     ) -> Result<(), Self::Error> {
         let key = storage_key(ck, path);
@@ -245,51 +292,62 @@ impl WriteBatch for RedbWriteBatch {
         Ok(())
     }
 
-    fn del_meta(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Self::Error> {
-        let key = storage_key(ck, path);
-        let mut table = self.txn.open_table(META)?;
-        table.remove(key.as_slice())?;
-        Ok(())
+    fn del_meta(&mut self, ck: &CheckoutId, path: &CanonicalPath) -> Result<(), Self::Error> {
+        remove_key(&self.txn, META, ck, path)
     }
 
-    fn del_meta_prefix(&mut self, ck: &CheckoutId, prefix: &str) -> Result<(), Self::Error> {
+    fn del_meta_prefix(
+        &mut self,
+        ck: &CheckoutId,
+        prefix: &CanonicalPath,
+    ) -> Result<(), Self::Error> {
         delete_interest_prefix(&self.txn, META, ck, prefix)
     }
 
     fn put_dir_node(
         &mut self,
         ck: &CheckoutId,
-        path: &str,
-        node: [u8; 32],
+        path: &CanonicalPath,
+        node: DirNode,
     ) -> Result<(), Self::Error> {
-        put_hash(&self.txn, DIR_NODES, ck, path, node)
+        put_hash(&self.txn, DIR_NODES, ck, path, node.as_bytes())
     }
 
-    fn del_dir_node(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Self::Error> {
-        let key = storage_key(ck, path);
-        let mut table = self.txn.open_table(DIR_NODES)?;
-        table.remove(key.as_slice())?;
-        Ok(())
+    fn del_dir_node(&mut self, ck: &CheckoutId, path: &CanonicalPath) -> Result<(), Self::Error> {
+        remove_key(&self.txn, DIR_NODES, ck, path)
     }
 
-    fn del_dir_prefix(&mut self, ck: &CheckoutId, prefix: &str) -> Result<(), Self::Error> {
+    fn del_dir_prefix(
+        &mut self,
+        ck: &CheckoutId,
+        prefix: &CanonicalPath,
+    ) -> Result<(), Self::Error> {
         delete_interest_prefix(&self.txn, DIR_NODES, ck, prefix)
     }
 
     fn put_last_synced(
         &mut self,
         ck: &CheckoutId,
-        path: &str,
-        file_node: [u8; 32],
+        path: &CanonicalPath,
+        file_node: FileNode,
     ) -> Result<(), Self::Error> {
-        put_hash(&self.txn, LAST_SYNCED, ck, path, file_node)
+        put_hash(&self.txn, LAST_SYNCED, ck, path, file_node.as_bytes())
     }
 
-    fn del_last_synced(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Self::Error> {
-        let key = storage_key(ck, path);
-        let mut table = self.txn.open_table(LAST_SYNCED)?;
-        table.remove(key.as_slice())?;
-        Ok(())
+    fn del_last_synced(
+        &mut self,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+    ) -> Result<(), Self::Error> {
+        remove_key(&self.txn, LAST_SYNCED, ck, path)
+    }
+
+    fn del_last_synced_prefix(
+        &mut self,
+        ck: &CheckoutId,
+        prefix: &CanonicalPath,
+    ) -> Result<(), Self::Error> {
+        delete_interest_prefix(&self.txn, LAST_SYNCED, ck, prefix)
     }
 
     fn commit(self) -> Result<(), Self::Error> {
@@ -298,7 +356,8 @@ impl WriteBatch for RedbWriteBatch {
     }
 }
 
-fn storage_key(ck: &CheckoutId, path: &str) -> Vec<u8> {
+fn storage_key(ck: &CheckoutId, path: &CanonicalPath) -> Vec<u8> {
+    let path = path.as_str();
     let mut key = Vec::with_capacity(ck.0.len() + 1 + path.len());
     key.extend_from_slice(ck.0.as_bytes());
     key.push(0);
@@ -318,23 +377,32 @@ fn checkout_end(ck: &CheckoutId) -> Vec<u8> {
     key
 }
 
-fn path_from_key(ck: &CheckoutId, key: &[u8]) -> Option<String> {
+fn path_from_key(ck: &CheckoutId, key: &[u8]) -> Option<CanonicalPath> {
     let prefix_len = ck.0.len() + 1;
     if key.len() < prefix_len || !key.starts_with(ck.0.as_bytes()) || key[ck.0.len()] != 0 {
         return None;
     }
-    String::from_utf8(key[prefix_len..].to_vec()).ok()
+    let path = std::str::from_utf8(&key[prefix_len..]).ok()?;
+    CanonicalPath::parse(path).ok()
 }
 
-fn hash32(bytes: &[u8]) -> Result<[u8; 32], RedbStoreError> {
-    bytes.try_into().map_err(|_| RedbStoreError::BadHash)
+fn decode_dir_node(bytes: &[u8]) -> Result<DirNode, RedbStoreError> {
+    Ok(DirNode::from_bytes(
+        bytes.try_into().map_err(|_| RedbStoreError::BadHash)?,
+    ))
+}
+
+fn decode_file_node(bytes: &[u8]) -> Result<FileNode, RedbStoreError> {
+    Ok(FileNode::from_bytes(
+        bytes.try_into().map_err(|_| RedbStoreError::BadHash)?,
+    ))
 }
 
 fn get_bincode(
     db: &Database,
     table_def: TableDefinition<&[u8], &[u8]>,
     ck: &CheckoutId,
-    path: &str,
+    path: &CanonicalPath,
 ) -> Result<Option<FileMetadata>, RedbStoreError> {
     let txn = db.begin_read()?;
     let table = txn.open_table(table_def)?;
@@ -347,17 +415,18 @@ fn get_bincode(
     }
 }
 
-fn get_hash(
+fn get_hash<T>(
     db: &Database,
     table_def: TableDefinition<&[u8], &[u8]>,
     ck: &CheckoutId,
-    path: &str,
-) -> Result<Option<[u8; 32]>, RedbStoreError> {
+    path: &CanonicalPath,
+    decode: fn(&[u8]) -> Result<T, RedbStoreError>,
+) -> Result<Option<T>, RedbStoreError> {
     let txn = db.begin_read()?;
     let table = txn.open_table(table_def)?;
     let key = storage_key(ck, path);
     match table.get(key.as_slice())? {
-        Some(guard) => Ok(Some(hash32(guard.value())?)),
+        Some(guard) => Ok(Some(decode(guard.value())?)),
         None => Ok(None),
     }
 }
@@ -366,8 +435,8 @@ fn put_hash(
     txn: &redb::WriteTransaction,
     table_def: TableDefinition<&[u8], &[u8]>,
     ck: &CheckoutId,
-    path: &str,
-    hash: [u8; 32],
+    path: &CanonicalPath,
+    hash: &[u8; 32],
 ) -> Result<(), RedbStoreError> {
     let key = storage_key(ck, path);
     let mut table = txn.open_table(table_def)?;
@@ -375,11 +444,23 @@ fn put_hash(
     Ok(())
 }
 
+fn remove_key(
+    txn: &redb::WriteTransaction,
+    table_def: TableDefinition<&[u8], &[u8]>,
+    ck: &CheckoutId,
+    path: &CanonicalPath,
+) -> Result<(), RedbStoreError> {
+    let key = storage_key(ck, path);
+    let mut table = txn.open_table(table_def)?;
+    table.remove(key.as_slice())?;
+    Ok(())
+}
+
 fn for_each_in_prefix<T>(
     table: &T,
     ck: &CheckoutId,
-    prefix: &str,
-    mut visit: impl FnMut(String, &[u8]) -> Result<(), RedbStoreError>,
+    prefix: &CanonicalPath,
+    mut visit: impl FnMut(CanonicalPath, &[u8]) -> Result<(), RedbStoreError>,
 ) -> Result<(), RedbStoreError>
 where
     T: ReadableTable<&'static [u8], &'static [u8]>,
@@ -391,7 +472,7 @@ where
         let Some(path) = path_from_key(ck, key.value()) else {
             continue;
         };
-        if !is_interested(prefix, &path) {
+        if !prefix.covers(&path) {
             continue;
         }
         visit(path, value.value())?;
@@ -403,7 +484,7 @@ fn delete_interest_prefix(
     txn: &redb::WriteTransaction,
     table_def: TableDefinition<&[u8], &[u8]>,
     ck: &CheckoutId,
-    prefix: &str,
+    prefix: &CanonicalPath,
 ) -> Result<(), RedbStoreError> {
     let keys = {
         let table = txn.open_table(table_def)?;

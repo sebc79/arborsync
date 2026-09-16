@@ -1,8 +1,9 @@
-//! Wire types and control-stream framing (`spec.md` §11).
-
 use serde::{Deserialize, Serialize};
 
-use crate::meta::{EntryKind, FileMetadata};
+use crate::hash::{ContentHash, FileNode, SubtreeRoot};
+use crate::merkle::DirChild;
+use crate::meta::FileMetadata;
+use crate::path::CanonicalPath;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 /// First Noise payload / preamble. Hyphae has no ALPN.
@@ -31,22 +32,20 @@ pub struct Envelope {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CheckoutRef {
     pub id: String,
-    pub central: String,
+    pub central: CanonicalPath,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CheckoutAck {
     pub id: String,
-    pub central: String,
-    pub master_root: [u8; 32],
+    pub central: CanonicalPath,
+    pub master_root: SubtreeRoot,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct DirEntry {
-    pub name: String,
-    pub kind: EntryKind,
-    pub node_hash: [u8; 32],
-}
+/// One entry of a `DirListResponse`. The wire form is
+/// `{ name, kind, node_hash }`; the in-memory form is the variant that fixes
+/// which brand of node hash the entry carries.
+pub type DirEntry = DirChild;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -75,9 +74,9 @@ impl<'de> Deserialize<'de> for BulkEncoding {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct BulkHeader {
-    pub path: String,
+    pub path: CanonicalPath,
     pub checkout_id: String,
-    pub want_hash: [u8; 32],
+    pub want_hash: ContentHash,
     pub encoding: BulkEncoding,
     pub size: u64,
 }
@@ -93,60 +92,60 @@ pub enum ProtocolMessage {
     },
     SubscribeReject {
         reason: String,
-        denied_centrals: Vec<String>,
+        denied_centrals: Vec<CanonicalPath>,
     },
     RootReport {
         checkout_id: String,
-        path: String,
-        root: [u8; 32],
+        path: CanonicalPath,
+        root: SubtreeRoot,
     },
     RootAck {
         checkout_id: String,
-        path: String,
+        path: CanonicalPath,
         matched: bool,
-        master_root: [u8; 32],
+        master_root: SubtreeRoot,
     },
     DirListRequest {
         checkout_id: String,
-        path: String,
+        path: CanonicalPath,
     },
     DirListResponse {
         checkout_id: String,
-        path: String,
+        path: CanonicalPath,
         entries: Vec<DirEntry>,
     },
     FileAnnounce {
         checkout_id: String,
-        path: String,
+        path: CanonicalPath,
         new: FileMetadata,
-        basis: Option<[u8; 32]>,
+        basis: Option<FileNode>,
     },
     Delete {
         checkout_id: String,
-        path: String,
-        basis: [u8; 32],
+        path: CanonicalPath,
+        basis: FileNode,
     },
     Rename {
         checkout_id: String,
-        from: String,
-        to: String,
-        from_basis: [u8; 32],
+        from: CanonicalPath,
+        to: CanonicalPath,
+        from_basis: FileNode,
         to_new: FileMetadata,
     },
     CasAccept {
         checkout_id: String,
-        path: String,
-        file_node: Option<[u8; 32]>,
+        path: CanonicalPath,
+        file_node: Option<FileNode>,
     },
     CasReject {
         checkout_id: String,
-        path: String,
+        path: CanonicalPath,
         current: Option<FileMetadata>,
     },
     SignatureRequest {
         checkout_id: String,
-        path: String,
-        want_hash: [u8; 32],
+        path: CanonicalPath,
+        want_hash: ContentHash,
         signature: Vec<u8>,
     },
     Error {

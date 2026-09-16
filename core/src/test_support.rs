@@ -1,8 +1,3 @@
-//! Test doubles and temp-dir fixtures for TDD.
-//!
-//! Enabled in unit tests and via the `test-support` feature so integration
-//! tests can build isolated master/slave trees without a live QUIC stack.
-
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -16,10 +11,21 @@ use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::config::{CheckoutConfig, MasterConfig, SlaveAcl, SlaveConfig};
+use crate::hash::{DirNode, FileNode};
 use crate::meta::FileMetadata;
-use crate::path::{RESERVED_CONFLICTS, RESERVED_TMP, is_interested};
+use crate::path::{CanonicalPath, EntryName, RESERVED_CONFLICTS, RESERVED_TMP};
 use crate::protocol::ProtocolMessage;
 use crate::storage::{CheckoutId, Storage, WriteBatch};
+
+/// Canonical path from a test literal. Panics on a non-canonical spelling,
+/// which in a test is a typo, not an input to handle.
+pub fn p(path: &str) -> CanonicalPath {
+    CanonicalPath::parse(path).expect("canonical test path")
+}
+
+pub fn name(value: &str) -> EntryName {
+    EntryName::parse(value).expect("valid test entry name")
+}
 
 #[derive(Debug, Error)]
 pub enum MemoryError {
@@ -31,9 +37,9 @@ pub enum MemoryError {
 
 #[derive(Clone, Default)]
 struct MemoryInner {
-    meta: HashMap<(String, String), FileMetadata>,
-    dir_nodes: HashMap<(String, String), [u8; 32]>,
-    last_synced: HashMap<(String, String), [u8; 32]>,
+    meta: HashMap<(String, CanonicalPath), FileMetadata>,
+    dir_nodes: HashMap<(String, CanonicalPath), DirNode>,
+    last_synced: HashMap<(String, CanonicalPath), FileNode>,
 }
 
 /// In-memory [`Storage`] for unit tests. `open` ignores the path.
@@ -67,44 +73,52 @@ impl Storage for MemoryStorage {
         Ok(Self::new())
     }
 
-    fn get_meta(&self, ck: &CheckoutId, path: &str) -> Result<Option<FileMetadata>, Self::Error> {
+    fn get_meta(
+        &self,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+    ) -> Result<Option<FileMetadata>, Self::Error> {
         Ok(self
             .lock()?
             .meta
-            .get(&(ck.0.clone(), path.to_string()))
+            .get(&(ck.0.clone(), path.clone()))
             .cloned())
     }
 
-    fn get_dir_node(&self, ck: &CheckoutId, path: &str) -> Result<Option<[u8; 32]>, Self::Error> {
+    fn get_dir_node(
+        &self,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+    ) -> Result<Option<DirNode>, Self::Error> {
         Ok(self
             .lock()?
             .dir_nodes
-            .get(&(ck.0.clone(), path.to_string()))
+            .get(&(ck.0.clone(), path.clone()))
             .copied())
     }
 
     fn get_last_synced(
         &self,
         ck: &CheckoutId,
-        path: &str,
-    ) -> Result<Option<[u8; 32]>, Self::Error> {
+        path: &CanonicalPath,
+    ) -> Result<Option<FileNode>, Self::Error> {
         Ok(self
             .lock()?
             .last_synced
-            .get(&(ck.0.clone(), path.to_string()))
+            .get(&(ck.0.clone(), path.clone()))
             .copied())
     }
 
     fn range_meta(
         &self,
         ck: &CheckoutId,
-        prefix: &str,
-    ) -> Result<Vec<(String, FileMetadata)>, Self::Error> {
+        prefix: &CanonicalPath,
+    ) -> Result<Vec<(CanonicalPath, FileMetadata)>, Self::Error> {
         let inner = self.lock()?;
         let mut out: Vec<_> = inner
             .meta
             .iter()
-            .filter(|((id, path), _)| id == &ck.0 && is_interested(prefix, path))
+            .filter(|((id, path), _)| id == &ck.0 && prefix.covers(path))
             .map(|((_, path), meta)| (path.clone(), meta.clone()))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -114,13 +128,13 @@ impl Storage for MemoryStorage {
     fn range_dir_nodes(
         &self,
         ck: &CheckoutId,
-        prefix: &str,
-    ) -> Result<Vec<(String, [u8; 32])>, Self::Error> {
+        prefix: &CanonicalPath,
+    ) -> Result<Vec<(CanonicalPath, DirNode)>, Self::Error> {
         let inner = self.lock()?;
         let mut out: Vec<_> = inner
             .dir_nodes
             .iter()
-            .filter(|((id, path), _)| id == &ck.0 && is_interested(prefix, path))
+            .filter(|((id, path), _)| id == &ck.0 && prefix.covers(path))
             .map(|((_, path), node)| (path.clone(), *node))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -155,69 +169,88 @@ impl WriteBatch for MemoryWriteBatch<'_> {
     fn put_meta(
         &mut self,
         ck: &CheckoutId,
-        path: &str,
+        path: &CanonicalPath,
         meta: &FileMetadata,
     ) -> Result<(), Self::Error> {
         self.inner
             .meta
-            .insert((ck.0.clone(), path.to_string()), meta.clone());
+            .insert((ck.0.clone(), path.clone()), meta.clone());
         Ok(())
     }
 
-    fn del_meta(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Self::Error> {
-        self.inner.meta.remove(&(ck.0.clone(), path.to_string()));
+    fn del_meta(&mut self, ck: &CheckoutId, path: &CanonicalPath) -> Result<(), Self::Error> {
+        self.inner.meta.remove(&(ck.0.clone(), path.clone()));
         Ok(())
     }
 
-    fn del_meta_prefix(&mut self, ck: &CheckoutId, prefix: &str) -> Result<(), Self::Error> {
+    fn del_meta_prefix(
+        &mut self,
+        ck: &CheckoutId,
+        prefix: &CanonicalPath,
+    ) -> Result<(), Self::Error> {
         self.inner
             .meta
-            .retain(|(id, path), _| !(id == &ck.0 && is_interested(prefix, path)));
+            .retain(|(id, path), _| !(id == &ck.0 && prefix.covers(path)));
         Ok(())
     }
 
     fn put_dir_node(
         &mut self,
         ck: &CheckoutId,
-        path: &str,
-        node: [u8; 32],
+        path: &CanonicalPath,
+        node: DirNode,
     ) -> Result<(), Self::Error> {
         self.inner
             .dir_nodes
-            .insert((ck.0.clone(), path.to_string()), node);
+            .insert((ck.0.clone(), path.clone()), node);
         Ok(())
     }
 
-    fn del_dir_node(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Self::Error> {
-        self.inner
-            .dir_nodes
-            .remove(&(ck.0.clone(), path.to_string()));
+    fn del_dir_node(&mut self, ck: &CheckoutId, path: &CanonicalPath) -> Result<(), Self::Error> {
+        self.inner.dir_nodes.remove(&(ck.0.clone(), path.clone()));
         Ok(())
     }
 
-    fn del_dir_prefix(&mut self, ck: &CheckoutId, prefix: &str) -> Result<(), Self::Error> {
+    fn del_dir_prefix(
+        &mut self,
+        ck: &CheckoutId,
+        prefix: &CanonicalPath,
+    ) -> Result<(), Self::Error> {
         self.inner
             .dir_nodes
-            .retain(|(id, path), _| !(id == &ck.0 && is_interested(prefix, path)));
+            .retain(|(id, path), _| !(id == &ck.0 && prefix.covers(path)));
         Ok(())
     }
 
     fn put_last_synced(
         &mut self,
         ck: &CheckoutId,
-        path: &str,
-        file_node: [u8; 32],
+        path: &CanonicalPath,
+        file_node: FileNode,
     ) -> Result<(), Self::Error> {
         self.inner
             .last_synced
-            .insert((ck.0.clone(), path.to_string()), file_node);
+            .insert((ck.0.clone(), path.clone()), file_node);
         Ok(())
     }
 
-    fn del_last_synced(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Self::Error> {
+    fn del_last_synced(
+        &mut self,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+    ) -> Result<(), Self::Error> {
+        self.inner.last_synced.remove(&(ck.0.clone(), path.clone()));
+        Ok(())
+    }
+
+    fn del_last_synced_prefix(
+        &mut self,
+        ck: &CheckoutId,
+        prefix: &CanonicalPath,
+    ) -> Result<(), Self::Error> {
         self.inner
             .last_synced
-            .remove(&(ck.0.clone(), path.to_string()));
+            .retain(|(id, path), _| !(id == &ck.0 && prefix.covers(path)));
         Ok(())
     }
 
@@ -227,7 +260,6 @@ impl WriteBatch for MemoryWriteBatch<'_> {
     }
 }
 
-/// One end of an in-memory control-stream pair (`spec.md` §12 Transport).
 pub struct MemoryEndpoint {
     tx: Sender<ProtocolMessage>,
     rx: Mutex<Receiver<ProtocolMessage>>,
@@ -251,7 +283,6 @@ impl MemoryEndpoint {
     }
 }
 
-/// Bidirectional in-memory control link (master ↔ slave).
 pub fn memory_link() -> (MemoryEndpoint, MemoryEndpoint) {
     let (a_tx, a_rx) = mpsc::channel();
     let (b_tx, b_rx) = mpsc::channel();
@@ -267,7 +298,6 @@ pub fn memory_link() -> (MemoryEndpoint, MemoryEndpoint) {
     )
 }
 
-/// Isolated directory tree for writing host files.
 pub struct TempTree {
     pub dir: TempDir,
 }
@@ -296,7 +326,6 @@ impl TempTree {
     }
 }
 
-/// Fluent writer for files, dirs, and symlinks under a host root.
 pub struct TreeBuilder {
     root: PathBuf,
 }
@@ -358,7 +387,7 @@ pub fn set_mtime_ns(path: &Path, mtime_ns: i64) {
     filetime::set_file_mtime(path, FileTime::from_unix_time(seconds, nanos)).expect("mtime");
 }
 
-/// Isolated master + slave checkout layout for later integration tests.
+/// Isolated master + slave checkout layout.
 ///
 /// ```text
 /// {tmp}/
@@ -410,7 +439,6 @@ impl SyncSandbox {
         self.slave_root(slave_id).join("cache.redb")
     }
 
-    /// Create a checkout local path and the reserved sidecar directories.
     pub fn add_checkout(&self, slave_id: &str, checkout_id: &str) -> PathBuf {
         let local = self
             .slave_root(slave_id)
@@ -487,19 +515,17 @@ pub struct OverlapLayout {
     pub bak: PathBuf,
 }
 
-/// Independent encoding of `spec.md` §5 FileNode, for test oracles.
-pub fn expected_file_node(meta: &FileMetadata) -> [u8; 32] {
+pub fn expected_file_node(meta: &FileMetadata) -> FileNode {
     let mut buf = Vec::with_capacity(1 + 32 + 8 + 8 + 4);
     buf.push(u8::from(meta.kind));
-    buf.extend_from_slice(&meta.content_hash);
+    buf.extend_from_slice(meta.content_hash.as_bytes());
     buf.extend_from_slice(&meta.size.to_be_bytes());
     buf.extend_from_slice(&meta.mtime_ns.to_be_bytes());
     buf.extend_from_slice(&meta.mode.to_be_bytes());
-    *blake3::hash(&buf).as_bytes()
+    FileNode::from_bytes(*blake3::hash(&buf).as_bytes())
 }
 
-/// Independent encoding of `spec.md` §5 DirNode.
-pub fn expected_dir_node(mut entries: Vec<(u8, String, [u8; 32])>) -> [u8; 32] {
+pub fn expected_dir_node(mut entries: Vec<(u8, String, [u8; 32])>) -> DirNode {
     entries.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
     let mut buf = Vec::new();
     for (kind, name, hash) in entries {
@@ -509,5 +535,5 @@ pub fn expected_dir_node(mut entries: Vec<(u8, String, [u8; 32])>) -> [u8; 32] {
         buf.extend_from_slice(name_bytes);
         buf.extend_from_slice(&hash);
     }
-    *blake3::hash(&buf).as_bytes()
+    DirNode::from_bytes(*blake3::hash(&buf).as_bytes())
 }
