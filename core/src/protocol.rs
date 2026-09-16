@@ -158,15 +158,53 @@ pub enum ProtocolMessage {
     },
 }
 
+fn bincode_config() -> impl bincode::config::Config {
+    bincode::config::standard()
+}
+
+pub(crate) fn encode_bincode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    bincode::serde::encode_to_vec(value, bincode_config()).map_err(|e| e.to_string())
+}
+
+pub(crate) fn decode_bincode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    let (value, _) =
+        bincode::serde::decode_from_slice(bytes, bincode_config()).map_err(|e| e.to_string())?;
+    Ok(value)
+}
+
 /// `u32be length || bincode(Envelope)`.
 pub fn encode_control(msg: &ProtocolMessage) -> Result<Vec<u8>, FrameError> {
-    let _ = msg;
-    todo!("spec §11: u32be length || bincode(Envelope {{ version: 1, msg }})")
+    let env = Envelope {
+        version: PROTOCOL_VERSION,
+        msg: msg.clone(),
+    };
+    let payload = encode_bincode(&env).map_err(FrameError::Bincode)?;
+    if payload.len() > MAX_CONTROL_FRAME {
+        return Err(FrameError::TooLarge);
+    }
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
 }
 
 /// Decode one control frame. Returns the message and the number of bytes
 /// consumed from `buf` (4 + length).
 pub fn decode_control(buf: &[u8]) -> Result<(ProtocolMessage, usize), FrameError> {
-    let _ = buf;
-    todo!("spec §11: frame codec")
+    if buf.len() < 4 {
+        return Err(FrameError::Truncated);
+    }
+    let len = u32::from_be_bytes(buf[0..4].try_into().expect("4 bytes")) as usize;
+    if len > MAX_CONTROL_FRAME {
+        return Err(FrameError::TooLarge);
+    }
+    let total = 4 + len;
+    if buf.len() < total {
+        return Err(FrameError::Truncated);
+    }
+    let env: Envelope = decode_bincode(&buf[4..total]).map_err(FrameError::Bincode)?;
+    if env.version != PROTOCOL_VERSION {
+        return Err(FrameError::UnsupportedVersion(env.version));
+    }
+    Ok((env.msg, total))
 }

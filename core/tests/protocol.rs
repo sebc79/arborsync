@@ -2,7 +2,7 @@
 
 use arborsync_core::meta::FileMetadata;
 use arborsync_core::protocol::{
-    Envelope, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE, PROTOCOL_VERSION, ProtocolMessage,
+    Envelope, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE, PROTOCOL_VERSION, ProtocolMessage,
     decode_control, encode_control,
 };
 
@@ -58,4 +58,29 @@ fn envelope_version_constant_is_one() {
         },
     };
     assert_eq!(env.version, 1);
+}
+
+#[test]
+fn decode_reports_consumed_and_leaves_trailing_bytes() {
+    let msg = ProtocolMessage::Disconnect { reason: "x".into() };
+    let mut buf = encode_control(&msg).unwrap();
+    buf.extend_from_slice(&[1, 2, 3]);
+    let (decoded, consumed) = decode_control(&buf).unwrap();
+    assert_eq!(decoded, msg);
+    assert_eq!(consumed, buf.len() - 3);
+}
+
+#[test]
+fn decode_rejects_unsupported_envelope_version() {
+    let env = Envelope {
+        version: 2,
+        msg: ProtocolMessage::Disconnect { reason: "x".into() },
+    };
+    let payload = bincode::serde::encode_to_vec(&env, bincode::config::standard()).unwrap();
+    let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&payload);
+    assert_eq!(
+        decode_control(&frame).unwrap_err(),
+        FrameError::UnsupportedVersion(2)
+    );
 }
