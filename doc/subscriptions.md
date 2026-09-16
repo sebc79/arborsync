@@ -4,11 +4,21 @@ Normative source: `spec.md` §2–§4 and §11.
 
 ## Mapping
 
+Restricted slave (`dev-alice`, ACL `/src` + `/docs`):
+
 ```toml
 checkouts = [
-    { id = "p1",  central = "/src/project1", local = "/opt/app1/src" },
-    { id = "p2",  central = "/src/project2", local = "/opt/app2/src" },
-    { id = "bak", central = "/",             local = "/backup/central" },
+    { id = "src",  central = "/src",  local = "/opt/projects/src" },
+    { id = "docs", central = "/docs", local = "/opt/projects/docs" },
+]
+```
+
+Same-slave central overlap (`backup-1`, ACL `/`):
+
+```toml
+checkouts = [
+    { id = "src", central = "/src", local = "/opt/src" },
+    { id = "bak", central = "/",    local = "/backup/central" },
 ]
 ```
 
@@ -62,22 +72,12 @@ Master keeps an in-memory trie of `(slave_id, checkout_id, central)` for connect
 
 ## Examples
 
-Development slave (ACL `allowed_prefixes = ["/src", "/docs"]`):
+`dev-alice` (ACL `allowed_prefixes = ["/src", "/docs"]`) may map any path under those prefixes. `{ id = "root", central = "/", local = "/home/dev/all" }` is rejected.
+
+`backup-1` (ACL `/`) may map `/` and any subset at once; see the overlap snippet above. A full-replica-only variant is just:
 
 ```toml
 checkouts = [
-    { id = "backend",  central = "/src/backend",  local = "/home/dev/backend" },
-    { id = "frontend", central = "/src/frontend", local = "/home/dev/frontend" },
-    { id = "docs",     central = "/docs",         local = "/home/dev/docs" },
-]
-```
-
-`{ id = "root", central = "/", local = "/home/dev/all" }` is rejected by that ACL.
-
-Backup slave (ACL `/`):
-
-```toml
-checkouts = [
-    { id = "all", central = "/", local = "/backup/central" },
+    { id = "bak", central = "/", local = "/backup/central" },
 ]
 ```

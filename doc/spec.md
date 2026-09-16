@@ -82,18 +82,29 @@ Config is TOML only.
 
 **Data-flow example**
 
-1. Slave `dev-alice` has checkout `src` (`/src/project1` → `/opt/app1/src`) and checkout `bak` (`/` → `/backup/central`).
-2. Slave `backup` has checkout `all` (`/` → `/backup/central`).
-3. `/opt/app1/src/foo.rs` changes on alice/`src`. Alice updates that checkout’s index and sends `FileAnnounce { checkout_id = "src", ... }`.
-4. Master CAS-applies onto `central_root` + global index, `CasAccept`s alice/`src`, then announces to every other interested checkout. Alice/`bak` and `backup`/`all` both apply.
+1. Slave `dev-alice` (ACL `/src`, `/docs`) has checkout `src` (`/src` → `/opt/projects/src`).
+2. Slave `backup-1` (ACL `/`) has checkout `src` (`/src` → `/opt/src`) and checkout `bak` (`/` → `/backup/central`) — same-slave central overlap.
+3. `/opt/projects/src/foo.rs` changes on alice/`src`. Alice updates that checkout’s index and sends `FileAnnounce { checkout_id = "src", ... }`.
+4. Master CAS-applies onto `central_root` + global index, `CasAccept`s alice/`src`, then announces to every other interested checkout. `backup-1`/`src` and `backup-1`/`bak` both apply. alice/`src` does not.
 
 ---
 
 ### 3. Checkout identity and overlap
 
+Restricted slave (`dev-alice`, ACL `/src` + `/docs`):
+
 ```toml
 checkouts = [
-    { id = "src", central = "/src", local = "/opt/projects/src" },
+    { id = "src",  central = "/src",  local = "/opt/projects/src" },
+    { id = "docs", central = "/docs", local = "/opt/projects/docs" },
+]
+```
+
+Same-slave central overlap requires `allowed_prefixes = ["/"]` (e.g. `backup-1`):
+
+```toml
+checkouts = [
+    { id = "src", central = "/src", local = "/opt/src" },
     { id = "bak", central = "/",    local = "/backup/central" },
 ]
 ```
@@ -405,23 +416,29 @@ pub trait Storage: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
     fn open(path: &std::path::Path) -> Result<Self, Self::Error> where Self: Sized;
 
+    fn get_meta(&self, ck: &CheckoutId, path: &str) -> Result<Option<FileMetadata>, Self::Error>;
+    fn get_dir_node(&self, ck: &CheckoutId, path: &str) -> Result<Option<[u8; 32]>, Self::Error>;
+    fn get_last_synced(&self, ck: &CheckoutId, path: &str) -> Result<Option<[u8; 32]>, Self::Error>;
+    fn range_meta(&self, ck: &CheckoutId, prefix: &str)
+        -> Result<Vec<(String, FileMetadata)>, Self::Error>;
+    fn range_dir_nodes(&self, ck: &CheckoutId, prefix: &str)
+        -> Result<Vec<(String, [u8; 32])>, Self::Error>;
+
     fn begin_write(&self) -> Result<WriteBatch<'_>, Self::Error>;
+    fn delete_checkout(&self, ck: &CheckoutId) -> Result<(), Self::Error>;
 }
 
 pub trait WriteBatch {
     fn put_meta(&mut self, ck: &CheckoutId, path: &str, meta: &FileMetadata) -> Result<(), Error>;
     fn del_meta(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Error>;
+    fn del_meta_prefix(&mut self, ck: &CheckoutId, prefix: &str) -> Result<(), Error>;
     fn put_dir_node(&mut self, ck: &CheckoutId, path: &str, node: [u8; 32]) -> Result<(), Error>;
     fn del_dir_node(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Error>;
+    fn del_dir_prefix(&mut self, ck: &CheckoutId, prefix: &str) -> Result<(), Error>;
     fn put_last_synced(&mut self, ck: &CheckoutId, path: &str, file_node: [u8; 32]) -> Result<(), Error>;
     fn del_last_synced(&mut self, ck: &CheckoutId, path: &str) -> Result<(), Error>;
     fn commit(self) -> Result<(), Error>;
 }
-
-// Reads (consistent snapshot) live on Storage:
-// get_meta, get_dir_node, get_last_synced,
-// range_meta(prefix), range_dir_nodes(prefix),
-// delete_checkout_prefix(ck) — used when a checkout is removed
 ```
 
 A metadata change and its ancestor `DirNode` updates and `last_synced` write commit in **one** batch. The earlier sketch with `get`/`put` outside `transaction()` is not the API.
@@ -471,10 +488,12 @@ watcher_debounce_ms = 200
 rescan_interval_seconds = 60
 
 checkouts = [
-    { id = "src", central = "/src", local = "/opt/projects/src" },
-    { id = "bak", central = "/",    local = "/backup/central" },
+    { id = "src",  central = "/src",  local = "/opt/projects/src" },
+    { id = "docs", central = "/docs", local = "/opt/projects/docs" },
 ]
 ```
+
+A `/` checkout on `dev-alice` is `SubscribeReject`ed. Full-replica / overlap checkouts belong on a slave whose ACL includes `/` (see `backup-1` in §3).
 
 Both sides enforce the same `max_checkouts_per_slave`. Config files are `0600` (they hold key *paths*, and slaves hold master pins). Private key files are `0600`.
 

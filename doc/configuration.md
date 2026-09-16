@@ -67,10 +67,12 @@ reconnect_initial_ms = 1000
 reconnect_max_ms = 60000
 
 checkouts = [
-    { id = "src", central = "/src", local = "/opt/projects/src" },
-    { id = "bak", central = "/",    local = "/backup/central" },
+    { id = "src",  central = "/src",  local = "/opt/projects/src" },
+    { id = "docs", central = "/docs", local = "/opt/projects/docs" },
 ]
 ```
+
+A `/` checkout on `dev-alice` is rejected (her ACL is `/src` and `/docs`). Full-replica and same-slave overlap checkouts go on `backup-1`.
 
 Required: `slave_id`, `master_addr`, `slave_key_path`, `master_public_keys`, `checkouts` (may be empty: the process idles until the config watch adds some).
 
@@ -123,7 +125,7 @@ public_keys = ["hex:…"]
 allowed_prefixes = ["/"]
 ```
 
-Development slave:
+Development slave (`dev-alice`; ACL `/src` + `/docs`):
 
 ```toml
 slave_id = "dev-alice"
@@ -138,7 +140,21 @@ checkouts = [
 log_level = "debug"
 ```
 
-That slave’s ACL on the master must include `/src` and `/docs`. A checkout of `/` would be rejected.
+Same ids and centrals as the main `dev-alice` snippet; locals differ because this host is a laptop. A checkout of `/` is rejected.
+
+Backup / overlap slave (`backup-1`; ACL `/`):
+
+```toml
+slave_id = "backup-1"
+master_addr = "master.example.com:8443"
+slave_key_path = "/etc/arborsync/backup.key"
+master_public_keys = ["hex:…"]
+db_path = "/var/lib/arborsync/cache.redb"
+checkouts = [
+    { id = "src", central = "/src", local = "/opt/src" },
+    { id = "bak", central = "/",    local = "/backup/central" },
+]
+```
 
 ## Struck from earlier drafts
 
