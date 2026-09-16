@@ -541,6 +541,8 @@ anyhow = "1"
 1. `core`: `FileMetadata`, path-Merkle encode/hash, `Storage` + redb, frame codec, canonical-path helpers, reserved-name filter, local-overlap check.
 2. `keygen` + config parse/validate (ACL, pins, checkouts).
 3. Master: watch `central_root`, index, QUIC XX accept, ACL, Subscribe, CAS apply to disk, fan-out.
+   - Decode `Envelope.version` before `ProtocolMessage`. `decode_control` currently decodes the whole envelope in one step, so bincode rejects an unknown v2 variant index before the version check runs, and the caller sees `FrameError::Bincode` instead of `FrameError::UnsupportedVersion`.
+   - Stop sharing one unversioned `bincode_config` between control frames and on-disk `FileMetadata`. Give each surface its own config, or add a schema version table, so a wire change cannot silently reinterpret stored rows.
 4. Slave: connect, pin check, Subscribe, per-checkout watch, announce, apply, sidecar.
 5. Bulk `copia` streams; whole-file fallback.
 6. Reconcile walk + rescan + reconnect.

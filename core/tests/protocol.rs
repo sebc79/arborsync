@@ -1,10 +1,11 @@
-//! Spec §11: control-stream framing.
-
+use arborsync_core::hash::{ContentHash, DirNode, FileNode};
 use arborsync_core::meta::FileMetadata;
+use arborsync_core::path::{CanonicalPath, EntryName};
 use arborsync_core::protocol::{
-    Envelope, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE, PROTOCOL_VERSION, ProtocolMessage,
-    decode_control, encode_control,
+    DirEntry, Envelope, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE, PROTOCOL_VERSION,
+    ProtocolMessage, decode_control, encode_control,
 };
+use arborsync_core::test_support::{name, p};
 
 #[test]
 fn preamble_is_ascii_arborsync_v1() {
@@ -39,13 +40,60 @@ fn decode_rejects_truncated_and_oversized_frames() {
 fn file_announce_round_trips_through_the_frame() {
     let msg = ProtocolMessage::FileAnnounce {
         checkout_id: "src".into(),
-        path: "/src/foo.rs".into(),
-        new: FileMetadata::file(3, 0, 0o100644, [9; 32]),
+        path: p("/src/foo.rs"),
+        new: FileMetadata::file(3, 0, 0o100644, ContentHash::from_bytes([9; 32])),
         basis: None,
     };
     let frame = encode_control(&msg).unwrap();
     let (decoded, _) = decode_control(&frame).unwrap();
     assert_eq!(decoded, msg);
+}
+
+#[test]
+fn dir_list_response_round_trips_each_child_brand() {
+    let msg = ProtocolMessage::DirListResponse {
+        checkout_id: "src".into(),
+        path: p("/src"),
+        entries: vec![
+            DirEntry::File {
+                name: name("foo.rs"),
+                node: FileNode::from_bytes([1; 32]),
+            },
+            DirEntry::Directory {
+                name: name("nested"),
+                node: DirNode::from_bytes([2; 32]),
+            },
+            DirEntry::Symlink {
+                name: name("link"),
+                node: FileNode::from_bytes([3; 32]),
+            },
+        ],
+    };
+    let frame = encode_control(&msg).unwrap();
+    let (decoded, _) = decode_control(&frame).unwrap();
+    assert_eq!(decoded, msg);
+}
+
+#[test]
+fn wire_paths_and_names_are_parsed_not_trusted() {
+    let bytes = bincode::serde::encode_to_vec("/src", bincode::config::standard()).unwrap();
+    let (path, _): (CanonicalPath, usize) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+    assert_eq!(path, p("/src"));
+
+    for bad in ["//src", "/src/", "src", "/src/../etc"] {
+        let bytes = bincode::serde::encode_to_vec(bad, bincode::config::standard()).unwrap();
+        let decoded: Result<(CanonicalPath, usize), _> =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard());
+        assert!(decoded.is_err(), "{bad}");
+    }
+
+    for bad in ["a/b", "", ".."] {
+        let bytes = bincode::serde::encode_to_vec(bad, bincode::config::standard()).unwrap();
+        let decoded: Result<(EntryName, usize), _> =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard());
+        assert!(decoded.is_err(), "{bad}");
+    }
 }
 
 #[test]

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::keys::parse_hex_key;
-use crate::path::{PathError, is_interested, local_paths_overlap, normalize_canonical};
+use crate::path::{CanonicalPath, PathError, local_paths_overlap};
 use crate::storage::CheckoutId;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,7 +182,7 @@ pub struct LoadedMaster {
 pub struct LoadedAcl {
     id: String,
     public_keys: Vec<[u8; 32]>,
-    allowed_prefixes: Vec<String>,
+    allowed_prefixes: Vec<CanonicalPath>,
 }
 
 #[derive(Debug)]
@@ -202,7 +202,7 @@ pub struct LoadedSlave {
 #[derive(Debug)]
 pub struct LoadedCheckout {
     id: CheckoutId,
-    central: String,
+    central: CanonicalPath,
     local: PathBuf,
 }
 
@@ -289,14 +289,14 @@ impl LoadedAcl {
         &self.public_keys
     }
 
-    pub fn allowed_prefixes(&self) -> &[String] {
+    pub fn allowed_prefixes(&self) -> &[CanonicalPath] {
         &self.allowed_prefixes
     }
 
-    pub fn allows_central(&self, central: &str) -> bool {
+    pub fn allows_central(&self, central: &CanonicalPath) -> bool {
         self.allowed_prefixes
             .iter()
-            .any(|prefix| is_interested(prefix, central))
+            .any(|prefix| prefix.covers(central))
     }
 }
 
@@ -383,7 +383,7 @@ impl LoadedCheckout {
         &self.id
     }
 
-    pub fn central(&self) -> &str {
+    pub fn central(&self) -> &CanonicalPath {
         &self.central
     }
 
@@ -621,17 +621,19 @@ fn parse_pin(field: &str, value: &str) -> Result<[u8; 32], ConfigError> {
     })
 }
 
-fn check_prefix(field: &str, value: &str) -> Result<String, ConfigError> {
-    let normalized = normalize_canonical(value).map_err(|source| ConfigError::BadPrefix {
-        field: field.into(),
-        source,
-    })?;
-    if normalized != value {
-        return Err(ConfigError::NonNormalizedPrefix {
+fn check_prefix(field: &str, value: &str) -> Result<CanonicalPath, ConfigError> {
+    match CanonicalPath::parse(value) {
+        Ok(prefix) => Ok(prefix),
+        Err(PathError::NonCanonical { value, normalized }) => {
+            Err(ConfigError::NonNormalizedPrefix {
+                field: field.into(),
+                value,
+                normalized,
+            })
+        }
+        Err(source) => Err(ConfigError::BadPrefix {
             field: field.into(),
-            value: value.into(),
-            normalized,
-        });
+            source,
+        }),
     }
-    Ok(normalized)
 }

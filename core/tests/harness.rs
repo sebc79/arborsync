@@ -1,13 +1,16 @@
-//! Harness self-tests: these must stay green while spec slices are red.
-
 use std::time::Duration;
 
 use arborsync_core::config::{CheckoutConfig, SlaveAcl};
+use arborsync_core::hash::{ContentHash, DirNode, FileNode};
 use arborsync_core::meta::FileMetadata;
 use arborsync_core::path::{RESERVED_CONFLICTS, RESERVED_TMP, is_reserved_root_entry};
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::storage::{CheckoutId, Storage, WriteBatch};
-use arborsync_core::test_support::{MemoryStorage, SyncSandbox, TempTree, memory_link};
+use arborsync_core::test_support::{MemoryStorage, SyncSandbox, TempTree, memory_link, p};
+
+fn meta(content_byte: u8) -> FileMetadata {
+    FileMetadata::file(1, 0, 0o100644, ContentHash::from_bytes([content_byte; 32]))
+}
 
 #[test]
 fn temp_tree_writes_files_dirs_and_symlinks() {
@@ -79,54 +82,82 @@ fn memory_storage_commit_is_atomic_and_ranges_respect_interest() {
 
     let mut batch = store.begin_write().unwrap();
     batch
-        .put_meta(
-            &master,
-            "/src/foo.rs",
-            &FileMetadata::file(1, 0, 0o100644, [1; 32]),
-        )
+        .put_meta(&master, &p("/src/foo.rs"), &meta(1))
         .unwrap();
     batch
-        .put_meta(
-            &master,
-            "/src2/bar.rs",
-            &FileMetadata::file(1, 0, 0o100644, [2; 32]),
-        )
+        .put_meta(&master, &p("/src2/bar.rs"), &meta(2))
         .unwrap();
-    batch
-        .put_meta(
-            &src,
-            "/src/foo.rs",
-            &FileMetadata::file(1, 0, 0o100644, [3; 32]),
-        )
-        .unwrap();
+    batch.put_meta(&src, &p("/src/foo.rs"), &meta(3)).unwrap();
     drop(batch);
-    assert!(store.get_meta(&master, "/src/foo.rs").unwrap().is_none());
+    assert!(
+        store
+            .get_meta(&master, &p("/src/foo.rs"))
+            .unwrap()
+            .is_none()
+    );
 
     let mut batch = store.begin_write().unwrap();
     batch
-        .put_meta(
-            &master,
-            "/src/foo.rs",
-            &FileMetadata::file(1, 0, 0o100644, [1; 32]),
-        )
+        .put_meta(&master, &p("/src/foo.rs"), &meta(1))
         .unwrap();
     batch
-        .put_meta(
-            &master,
-            "/src2/bar.rs",
-            &FileMetadata::file(1, 0, 0o100644, [2; 32]),
-        )
+        .put_meta(&master, &p("/src2/bar.rs"), &meta(2))
         .unwrap();
-    batch.put_dir_node(&master, "/src", [9; 32]).unwrap();
+    batch
+        .put_dir_node(&master, &p("/src"), DirNode::from_bytes([9; 32]))
+        .unwrap();
     batch.commit().unwrap();
 
-    let under_src = store.range_meta(&master, "/src").unwrap();
+    let under_src = store.range_meta(&master, &p("/src")).unwrap();
     assert_eq!(under_src.len(), 1);
-    assert_eq!(under_src[0].0, "/src/foo.rs");
-    assert!(store.get_meta(&src, "/src/foo.rs").unwrap().is_none());
+    assert_eq!(under_src[0].0, p("/src/foo.rs"));
+    assert!(store.get_meta(&src, &p("/src/foo.rs")).unwrap().is_none());
 
     store.delete_checkout(&master).unwrap();
-    assert!(store.range_meta(&master, "/").unwrap().is_empty());
+    assert!(store.range_meta(&master, &p("/")).unwrap().is_empty());
+}
+
+#[test]
+fn memory_storage_purge_prefix_spares_the_sorting_sibling() {
+    let store = MemoryStorage::new();
+    let master = CheckoutId::master();
+
+    let mut batch = store.begin_write().unwrap();
+    batch
+        .put_meta(&master, &p("/src/foo.rs"), &meta(1))
+        .unwrap();
+    batch
+        .put_dir_node(&master, &p("/src"), DirNode::from_bytes([9; 32]))
+        .unwrap();
+    batch
+        .put_last_synced(&master, &p("/src/foo.rs"), FileNode::from_bytes([8; 32]))
+        .unwrap();
+    batch
+        .put_last_synced(&master, &p("/src2/bar.rs"), FileNode::from_bytes([6; 32]))
+        .unwrap();
+    batch.commit().unwrap();
+
+    let mut batch = store.begin_write().unwrap();
+    batch.purge_prefix(&master, &p("/src")).unwrap();
+    batch.commit().unwrap();
+
+    assert!(
+        store
+            .get_meta(&master, &p("/src/foo.rs"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.get_dir_node(&master, &p("/src")).unwrap().is_none());
+    assert!(
+        store
+            .get_last_synced(&master, &p("/src/foo.rs"))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.get_last_synced(&master, &p("/src2/bar.rs")).unwrap(),
+        Some(FileNode::from_bytes([6; 32]))
+    );
 }
 
 #[test]

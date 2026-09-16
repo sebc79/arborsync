@@ -1,9 +1,8 @@
-//! File metadata and entry kinds (`spec.md` §6).
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// `File = 1`, `Dir = 2`, `Symlink = 3`.
+use crate::hash::ContentHash;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum EntryKind {
@@ -51,7 +50,7 @@ pub enum MetaError {
 }
 
 /// Index row for a path. Directories still have a row (`kind = Dir`,
-/// `size = 0`, `content_hash = [0; 32]`); the Merkle identity of a
+/// `size = 0`, `content_hash = ContentHash::ZERO`); the Merkle identity of a
 /// directory is `DirNode`, stored separately (`spec.md` §6).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct FileMetadata {
@@ -59,11 +58,11 @@ pub struct FileMetadata {
     pub size: u64,
     pub mtime_ns: i64,
     pub mode: u32,
-    pub content_hash: [u8; 32],
+    pub content_hash: ContentHash,
 }
 
 impl FileMetadata {
-    pub fn file(size: u64, mtime_ns: i64, mode: u32, content_hash: [u8; 32]) -> Self {
+    pub fn file(size: u64, mtime_ns: i64, mode: u32, content_hash: ContentHash) -> Self {
         Self {
             kind: EntryKind::File,
             size,
@@ -79,11 +78,11 @@ impl FileMetadata {
             size: 0,
             mtime_ns,
             mode,
-            content_hash: [0; 32],
+            content_hash: ContentHash::ZERO,
         }
     }
 
-    pub fn symlink(target_len: u64, mtime_ns: i64, mode: u32, content_hash: [u8; 32]) -> Self {
+    pub fn symlink(target_len: u64, mtime_ns: i64, mode: u32, content_hash: ContentHash) -> Self {
         Self {
             kind: EntryKind::Symlink,
             size: target_len,

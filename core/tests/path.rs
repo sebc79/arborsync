@@ -1,34 +1,34 @@
-//! Spec §1–§3, §6: interest, reserved names, canonical paths, overlap.
-
 use std::path::Path;
 
+use arborsync_core::hash::ContentHash;
 use arborsync_core::path::{
-    PathError, RESERVED_CONFLICTS, RESERVED_TMP, conflict_sidecar_path, host_to_canonical,
-    is_interested, is_reserved_root_entry, join_central, local_paths_overlap, normalize_canonical,
+    CanonicalPath, EntryName, PathError, RESERVED_CONFLICTS, RESERVED_TMP, conflict_sidecar_path,
+    host_to_canonical, is_interested, is_reserved_root_entry, join_central, local_paths_overlap,
 };
+use arborsync_core::test_support::p;
 
 #[test]
 fn root_central_matches_every_canonical_path() {
-    assert!(is_interested("/", "/"));
-    assert!(is_interested("/", "/src"));
-    assert!(is_interested("/", "/src/foo.rs"));
+    assert!(is_interested(&p("/"), &p("/")));
+    assert!(is_interested(&p("/"), &p("/src")));
+    assert!(is_interested(&p("/"), &p("/src/foo.rs")));
 }
 
 #[test]
 fn prefix_matches_self_and_descendants_not_siblings() {
-    assert!(is_interested("/src", "/src"));
-    assert!(is_interested("/src", "/src/foo.rs"));
-    assert!(is_interested("/src", "/src/project1/file.txt"));
-    assert!(!is_interested("/src", "/src2"));
-    assert!(!is_interested("/src", "/docs"));
-    assert!(!is_interested("/src", "/"));
+    assert!(is_interested(&p("/src"), &p("/src")));
+    assert!(is_interested(&p("/src"), &p("/src/foo.rs")));
+    assert!(is_interested(&p("/src"), &p("/src/project1/file.txt")));
+    assert!(!is_interested(&p("/src"), &p("/src2")));
+    assert!(!is_interested(&p("/src"), &p("/docs")));
+    assert!(!is_interested(&p("/src"), &p("/")));
 }
 
 #[test]
 fn child_mapping_does_not_receive_parent_files() {
     assert!(!is_interested(
-        "/src/project1/subdir",
-        "/src/project1/file.txt"
+        &p("/src/project1/subdir"),
+        &p("/src/project1/file.txt")
     ));
 }
 
@@ -45,38 +45,78 @@ fn reserved_names_only_the_two_sidecar_dirs() {
 fn host_path_under_central_root_strips_the_root() {
     let canonical =
         host_to_canonical(Path::new("/central"), Path::new("/central/src/foo.rs")).unwrap();
-    assert_eq!(canonical, "/src/foo.rs");
+    assert_eq!(canonical.as_str(), "/src/foo.rs");
 }
 
 #[test]
 fn host_path_equal_to_root_is_hierarchy_root() {
     let canonical = host_to_canonical(Path::new("/central"), Path::new("/central")).unwrap();
-    assert_eq!(canonical, "/");
+    assert_eq!(canonical.as_str(), "/");
 }
 
 #[test]
 fn slave_join_central_builds_logical_path() {
-    assert_eq!(join_central("/src", "foo.rs").unwrap(), "/src/foo.rs");
-    assert_eq!(join_central("/", "src/foo.rs").unwrap(), "/src/foo.rs");
-    assert_eq!(join_central("/src", "").unwrap(), "/src");
+    assert_eq!(
+        join_central(&p("/src"), "foo.rs").unwrap().as_str(),
+        "/src/foo.rs"
+    );
+    assert_eq!(
+        join_central(&p("/"), "src/foo.rs").unwrap().as_str(),
+        "/src/foo.rs"
+    );
+    assert_eq!(join_central(&p("/src"), "").unwrap().as_str(), "/src");
 }
 
 #[test]
-fn normalize_rejects_dot_and_relative() {
+fn parse_rejects_dot_and_relative() {
     assert!(matches!(
-        normalize_canonical("src/foo"),
+        CanonicalPath::parse("src/foo"),
         Err(PathError::NotAbsolute(_))
     ));
     assert!(matches!(
-        normalize_canonical("/src/../etc"),
+        CanonicalPath::parse("/src/../etc"),
         Err(PathError::DotComponent(_))
     ));
     assert!(matches!(
-        normalize_canonical("/src/./foo"),
+        CanonicalPath::parse("/src/./foo"),
         Err(PathError::DotComponent(_))
     ));
-    assert_eq!(normalize_canonical("/src/foo").unwrap(), "/src/foo");
-    assert_eq!(normalize_canonical("/").unwrap(), "/");
+    assert_eq!(
+        CanonicalPath::parse("/src/foo").unwrap().as_str(),
+        "/src/foo"
+    );
+    assert_eq!(CanonicalPath::parse("/").unwrap().as_str(), "/");
+}
+
+#[test]
+fn parse_rejects_a_non_canonical_spelling_instead_of_rewriting_it() {
+    assert_eq!(
+        CanonicalPath::parse("//src").unwrap_err(),
+        PathError::NonCanonical {
+            value: "//src".into(),
+            normalized: "/src".into(),
+        }
+    );
+    assert_eq!(
+        CanonicalPath::parse("/src/").unwrap_err(),
+        PathError::NonCanonical {
+            value: "/src/".into(),
+            normalized: "/src".into(),
+        }
+    );
+}
+
+#[test]
+fn entry_name_is_one_component() {
+    assert_eq!(EntryName::parse("foo.rs").unwrap().as_str(), "foo.rs");
+    assert_eq!(EntryName::parse("ζed").unwrap().as_str(), "ζed");
+    for bad in ["", ".", "..", "a/b", "/"] {
+        assert_eq!(
+            EntryName::parse(bad).unwrap_err(),
+            PathError::BadEntryName(bad.into()),
+            "{bad}"
+        );
+    }
 }
 
 #[test]
@@ -109,8 +149,8 @@ fn local_overlap_is_parent_or_equal_not_string_prefix() {
 
 #[test]
 fn sidecar_uses_reserved_dir_and_hash_prefix() {
-    let hash = [0xab; 32];
-    let path = conflict_sidecar_path(Path::new("/opt/src"), "/src/foo.rs", &hash);
+    let hash = ContentHash::from_bytes([0xab; 32]);
+    let path = conflict_sidecar_path(Path::new("/opt/src"), &p("/src/foo.rs"), &hash);
     let text = path.to_string_lossy();
     assert!(text.contains("/.arborsync-conflicts/"));
     assert!(text.contains("src/foo.rs--abababababababab"));

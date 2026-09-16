@@ -40,6 +40,13 @@ One message per bulk stream. Close the stream after the body. Control stream sta
 
 Keep-alive: QUIC idle timeout + quinn’s native ping. No `Heartbeat` message.
 
+## When implementing the control reader
+
+Both items below land with QUIC. Neither is done in `core` today.
+
+- Decode `Envelope.version` before `ProtocolMessage`. `decode_control` decodes the whole envelope in one step, so bincode rejects an unknown v2 variant index before the version check runs, and the caller sees `FrameError::Bincode` instead of `FrameError::UnsupportedVersion`. Read the version first, then decode the body.
+- Do not share one unversioned `bincode_config` between control frames and on-disk `FileMetadata`. The wire format and the stored format have separate lifetimes, so give each its own config, or add a schema version table.
+
 ## Message catalog
 
 Exact types: `spec.md` §11.
