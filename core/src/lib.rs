@@ -7,6 +7,7 @@ mod index;
 pub mod config;
 pub mod hash;
 pub mod keys;
+pub mod master;
 pub mod merkle;
 pub mod meta;
 pub mod path;
