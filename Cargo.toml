@@ -1,0 +1,54 @@
+[workspace]
+members = ["core"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+arborsync-core = { path = "core" }
+anyhow = "1"
+bincode = { version = "2", features = ["serde"] }
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+copia = "0.3"
+env_logger = "0.11"
+filetime = "0.2"
+log = "0.4"
+notify = "8"
+notify-debouncer-mini = "0.5"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+quinn-hyphae = "0.1.0-beta.0"
+redb = "2"
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+
+[package]
+name = "arborsync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Selective subtree file synchronization daemon"
+
+[[bin]]
+name = "arborsync"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+arborsync-core.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+log.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+arborsync-core.workspace = true
