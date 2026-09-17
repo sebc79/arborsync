@@ -107,106 +107,6 @@ pub async fn connect(endpoint: &Endpoint, addr: SocketAddr) -> Result<Connection
         .map_err(|err| TransportError::Connect(err.to_string()))
 }
 
-pub fn peer_static_key(conn: &Connection) -> Result<[u8; 32], TransportError> {
-    let identity = conn
-        .peer_identity()
-        .ok_or(TransportError::MissingIdentity)?
-        .downcast::<HyphaePeerIdentity>()
-        .map_err(|_| TransportError::MissingIdentity)?;
-    let raw = identity
-        .remote_public
-        .ok_or(TransportError::MissingIdentity)?;
-    <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| TransportError::BadPeerKey)
-}
-
-pub async fn open_control(conn: &Connection) -> Result<(SendStream, RecvStream), TransportError> {
-    conn.open_bi()
-        .await
-        .map_err(|err| TransportError::Stream(err.to_string()))
-}
-
-pub async fn accept_control(conn: &Connection) -> Result<(SendStream, RecvStream), TransportError> {
-    conn.accept_bi()
-        .await
-        .map_err(|err| TransportError::Stream(err.to_string()))
-}
-
-pub async fn write_control(
-    send: &mut SendStream,
-    msg: &ProtocolMessage,
-) -> Result<(), TransportError> {
-    let frame = protocol::encode_control(msg)?;
-    send.write_all(&frame)
-        .await
-        .map_err(|err| TransportError::Stream(err.to_string()))
-}
-
-pub async fn read_control(recv: &mut RecvStream) -> Result<ProtocolMessage, TransportError> {
-    let mut header = [0u8; 4];
-    recv.read_exact(&mut header)
-        .await
-        .map_err(|err| TransportError::Stream(err.to_string()))?;
-    let len = u32::from_be_bytes(header) as usize;
-    if len > MAX_CONTROL_FRAME {
-        return Err(TransportError::Frame(FrameError::TooLarge));
-    }
-    let mut payload = vec![0u8; len];
-    recv.read_exact(&mut payload)
-        .await
-        .map_err(|err| TransportError::Stream(err.to_string()))?;
-    let mut frame = Vec::with_capacity(4 + len);
-    frame.extend_from_slice(&header);
-    frame.extend_from_slice(&payload);
-    Ok(protocol::decode_control(&frame)?.0)
-}
-
-pub async fn write_bulk(conn: &Connection, xfer: &BulkTransfer) -> Result<(), TransportError> {
-    let frame = protocol::encode_bulk(&xfer.header, &xfer.body)?;
-    let mut send = conn
-        .open_uni()
-        .await
-        .map_err(|err| TransportError::Stream(err.to_string()))?;
-    send.write_all(&frame)
-        .await
-        .map_err(|err| TransportError::Stream(err.to_string()))?;
-    send.finish()
-        .map_err(|err| TransportError::Stream(err.to_string()))?;
-    Ok(())
-}
-
-pub async fn read_bulk(recv: &mut RecvStream) -> Result<(BulkHeader, Vec<u8>), TransportError> {
-    let mut len_bytes = [0u8; 4];
-    recv.read_exact(&mut len_bytes)
-        .await
-        .map_err(|err| TransportError::Stream(err.to_string()))?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    if len > MAX_CONTROL_FRAME {
-        return Err(TransportError::Frame(FrameError::TooLarge));
-    }
-    let mut payload = vec![0u8; len];
-    recv.read_exact(&mut payload)
-        .await
-        .map_err(|err| TransportError::Stream(err.to_string()))?;
-    let (header, _): (BulkHeader, usize) =
-        bincode::serde::decode_from_slice(&payload, bincode::config::standard())
-            .map_err(|err| TransportError::Frame(FrameError::Bincode(err.to_string())))?;
-    let mut body = vec![0u8; header.size as usize];
-    if !body.is_empty() {
-        recv.read_exact(&mut body)
-            .await
-            .map_err(|err| TransportError::Stream(err.to_string()))?;
-    }
-    Ok((header, body))
-}
-
-pub async fn accept_bulk(conn: &Connection) -> Result<(BulkHeader, Vec<u8>), TransportError> {
-    let mut recv = conn
-        .accept_uni()
-        .await
-        .map_err(|err| TransportError::Stream(err.to_string()))?;
-    read_bulk(&mut recv).await
-}
-
 pub trait Transport: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
     type ControlSend: Send;
@@ -428,56 +328,112 @@ impl Transport for MemoryTransport {
     }
 }
 
+async fn read_bulk(recv: &mut RecvStream) -> Result<(BulkHeader, Vec<u8>), TransportError> {
+    let mut len_bytes = [0u8; 4];
+    recv.read_exact(&mut len_bytes)
+        .await
+        .map_err(|err| TransportError::Stream(err.to_string()))?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    if len > MAX_CONTROL_FRAME {
+        return Err(TransportError::Frame(FrameError::TooLarge));
+    }
+    let mut payload = vec![0u8; len];
+    recv.read_exact(&mut payload)
+        .await
+        .map_err(|err| TransportError::Stream(err.to_string()))?;
+    let (header, _): (BulkHeader, usize) =
+        bincode::serde::decode_from_slice(&payload, bincode::config::standard())
+            .map_err(|err| TransportError::Frame(FrameError::Bincode(err.to_string())))?;
+    let mut body = vec![0u8; header.size as usize];
+    if !body.is_empty() {
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|err| TransportError::Stream(err.to_string()))?;
+    }
+    Ok((header, body))
+}
+
 impl Transport for Connection {
     type Error = TransportError;
     type ControlSend = SendStream;
     type ControlRecv = RecvStream;
 
     fn peer_static_key(&self) -> Result<[u8; 32], Self::Error> {
-        crate::transport::peer_static_key(self)
+        let identity = self
+            .peer_identity()
+            .ok_or(TransportError::MissingIdentity)?
+            .downcast::<HyphaePeerIdentity>()
+            .map_err(|_| TransportError::MissingIdentity)?;
+        let raw = identity
+            .remote_public
+            .ok_or(TransportError::MissingIdentity)?;
+        <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| TransportError::BadPeerKey)
     }
 
     fn close(&self) {
         Connection::close(self, 0u32.into(), b"");
     }
 
-    fn open_control(
-        &self,
-    ) -> impl Future<Output = Result<(Self::ControlSend, Self::ControlRecv), Self::Error>> + Send
-    {
-        crate::transport::open_control(self)
+    async fn open_control(&self) -> Result<(Self::ControlSend, Self::ControlRecv), Self::Error> {
+        self.open_bi()
+            .await
+            .map_err(|err| TransportError::Stream(err.to_string()))
     }
 
-    fn accept_control(
-        &self,
-    ) -> impl Future<Output = Result<(Self::ControlSend, Self::ControlRecv), Self::Error>> + Send
-    {
-        crate::transport::accept_control(self)
+    async fn accept_control(&self) -> Result<(Self::ControlSend, Self::ControlRecv), Self::Error> {
+        self.accept_bi()
+            .await
+            .map_err(|err| TransportError::Stream(err.to_string()))
     }
 
-    fn write_control(
+    async fn write_control(
         send: &mut Self::ControlSend,
         msg: &ProtocolMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        crate::transport::write_control(send, msg)
+    ) -> Result<(), Self::Error> {
+        let frame = protocol::encode_control(msg)?;
+        send.write_all(&frame)
+            .await
+            .map_err(|err| TransportError::Stream(err.to_string()))
     }
 
-    fn read_control(
-        recv: &mut Self::ControlRecv,
-    ) -> impl Future<Output = Result<ProtocolMessage, Self::Error>> + Send {
-        crate::transport::read_control(recv)
+    async fn read_control(recv: &mut Self::ControlRecv) -> Result<ProtocolMessage, Self::Error> {
+        let mut header = [0u8; 4];
+        recv.read_exact(&mut header)
+            .await
+            .map_err(|err| TransportError::Stream(err.to_string()))?;
+        let len = u32::from_be_bytes(header) as usize;
+        if len > MAX_CONTROL_FRAME {
+            return Err(TransportError::Frame(FrameError::TooLarge));
+        }
+        let mut payload = vec![0u8; len];
+        recv.read_exact(&mut payload)
+            .await
+            .map_err(|err| TransportError::Stream(err.to_string()))?;
+        let mut frame = Vec::with_capacity(4 + len);
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&payload);
+        Ok(protocol::decode_control(&frame)?.0)
     }
 
-    fn write_bulk(
-        &self,
-        xfer: &BulkTransfer,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        crate::transport::write_bulk(self, xfer)
+    async fn write_bulk(&self, xfer: &BulkTransfer) -> Result<(), Self::Error> {
+        let frame = protocol::encode_bulk(&xfer.header, &xfer.body)?;
+        let mut send = self
+            .open_uni()
+            .await
+            .map_err(|err| TransportError::Stream(err.to_string()))?;
+        send.write_all(&frame)
+            .await
+            .map_err(|err| TransportError::Stream(err.to_string()))?;
+        send.finish()
+            .map_err(|err| TransportError::Stream(err.to_string()))?;
+        Ok(())
     }
 
-    fn accept_bulk(
-        &self,
-    ) -> impl Future<Output = Result<(BulkHeader, Vec<u8>), Self::Error>> + Send {
-        crate::transport::accept_bulk(self)
+    async fn accept_bulk(&self) -> Result<(BulkHeader, Vec<u8>), Self::Error> {
+        let mut recv = self
+            .accept_uni()
+            .await
+            .map_err(|err| TransportError::Stream(err.to_string()))?;
+        read_bulk(&mut recv).await
     }
 }
