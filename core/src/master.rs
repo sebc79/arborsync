@@ -188,6 +188,12 @@ impl Inflight {
         }
         false
     }
+
+    fn is_armed(&mut self, path: &CanonicalPath) -> bool {
+        let now = Instant::now();
+        self.entries.retain(|_, entry| entry.until > now);
+        self.entries.contains_key(path)
+    }
 }
 
 struct LiveSlave {
@@ -1357,6 +1363,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
 
     fn note_removed(&mut self, path: &CanonicalPath) -> Result<(), MasterError> {
         if is_reserved(path) {
+            return Ok(());
+        }
+        if self.inflight.is_armed(path) {
             return Ok(());
         }
         let Some(previous) = self.meta(path)? else {

@@ -77,7 +77,7 @@ The slave updates that checkout's index and, when `FileNode` is not `last_synced
 
 `commit_leaf` writes the leaf, every ancestor `DirNode`, and `last_synced` in one redb batch. The master then fans out to connected interested checkouts.
 
-`inflight` remembers the content hash just applied so the local watcher does not re-announce the write. The map expires after twice the debounce. The code arms it before the live `rename`, `mkdir`, or meta apply, including dirs (`ContentHash::ZERO`) and meta-only apply.
+`inflight` remembers the content hash just applied so the local watcher does not re-announce the write. The map expires after twice the debounce. The code arms it before the live `rename`, `mkdir`, or meta apply, including dirs (`ContentHash::ZERO`) and meta-only apply. A type-change vacate can look like `Remove`; that event is dropped while the path is armed.
 
 ## CAS and the sidecar
 

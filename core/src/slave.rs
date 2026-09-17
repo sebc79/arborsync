@@ -191,6 +191,12 @@ impl Inflight {
         }
         false
     }
+
+    fn is_armed(&mut self, path: &CanonicalPath) -> bool {
+        let now = Instant::now();
+        self.entries.retain(|_, entry| entry.until > now);
+        self.entries.contains_key(path)
+    }
 }
 
 struct Checkout {
@@ -1448,6 +1454,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     ) -> Result<Vec<ProtocolMessage>, SlaveError> {
         let central = self.checkout(checkout_id)?.central.clone();
         if is_reserved(&central, path) {
+            return Ok(Vec::new());
+        }
+        if self.checkout_mut(checkout_id)?.inflight.is_armed(path) {
             return Ok(Vec::new());
         }
         let Some(previous) = self.meta(checkout_id, path)? else {

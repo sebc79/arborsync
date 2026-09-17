@@ -272,6 +272,14 @@ fn handle_type_change_file_to_dir_accepts_and_fans_out() {
         other => panic!("expected FileAnnounce, got {other:?}"),
     }
     assert!(master.poll(ALICE).is_empty());
+
+    master
+        .note_local(LocalEvent::Removed(p("/src/hello.txt")))
+        .unwrap();
+    assert!(host.is_dir());
+    assert_eq!(master.meta(&p("/src/hello.txt")).unwrap().unwrap(), new);
+    assert!(master.poll(BACKUP).is_empty());
+    assert!(master.poll(ALICE).is_empty());
 }
 
 #[test]

@@ -249,6 +249,16 @@ fn incoming_type_change_file_to_dir_replaces_the_live_file() {
         &previous.content_hash,
     )
     .exists());
+
+    let out = slave
+        .note_local("src", LocalEvent::Removed(p("/src/hello.txt")))
+        .unwrap();
+    assert!(out.is_empty());
+    assert!(host.is_dir());
+    assert_eq!(
+        slave.last_synced("src", &p("/src/hello.txt")).unwrap(),
+        Some(file_node(&new))
+    );
 }
 
 #[test]
