@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use filetime::FileTime;
 
 use crate::hash::ContentHash;
-use crate::meta::{hash_bytes, EntryKind, FileMetadata};
-use crate::path::{canonical_to_host, CanonicalPath, RESERVED_TMP};
+use crate::meta::{EntryKind, FileMetadata, hash_bytes};
+use crate::path::{CanonicalPath, RESERVED_TMP, canonical_to_host};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -256,6 +256,18 @@ pub fn sidecar_if_content_differs(
         fs::create_dir_all(parent).map_err(at(parent))?;
     }
     fs::write(sidecar, bytes).map_err(at(sidecar))
+}
+
+/// Live file bytes or symlink target. `None` if the path is gone.
+pub fn read_live_bytes(host: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(host) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+        Ok(md) if md.file_type().is_symlink() => {
+            Ok(Some(fs::read_link(host)?.as_os_str().as_bytes().to_vec()))
+        }
+        Ok(_) => Ok(Some(fs::read(host)?)),
+    }
 }
 
 pub fn wipe_tmp(central_root: &Path) -> Result<(), ApplyError> {

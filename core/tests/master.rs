@@ -1,9 +1,10 @@
 use arborsync_core::LoadedMaster;
+use arborsync_core::LocalEvent;
 use arborsync_core::config::{ReloadError, SlaveAcl};
 use arborsync_core::hash::{ContentHash, FileNode};
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{
-    CasDecision, LocalEvent, Master, MemoryContent, Reply, WholeFileLater, decide_cas,
+    CasDecision, Master, MemoryContent, Reply, WholeFileLater, decide_cas,
 };
 use arborsync_core::merkle::{self, DirChild, file_node};
 use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};

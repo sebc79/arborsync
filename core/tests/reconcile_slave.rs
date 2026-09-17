@@ -1,7 +1,7 @@
 use arborsync_core::LoadedSlave;
+use arborsync_core::LocalEvent;
 use arborsync_core::config::CheckoutConfig;
 use arborsync_core::keys::format_hex_key;
-use arborsync_core::master::LocalEvent;
 use arborsync_core::merkle::{DirChild, empty_dir_node, file_node};
 use arborsync_core::meta::{FileMetadata, hash_bytes};
 use arborsync_core::path::{RESERVED_TMP, conflict_sidecar_path};

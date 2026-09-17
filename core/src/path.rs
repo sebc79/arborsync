@@ -85,7 +85,7 @@ impl CanonicalPath {
 
     /// True iff `other` is this path or below it: `/src` covers `/src` and
     /// `/src/foo.rs`, but not the sibling `/src2` (`spec.md` §2). `/` covers
-    /// everything.
+    /// everything. This is the interest rule.
     pub fn covers(&self, other: &CanonicalPath) -> bool {
         if self.0 == "/" {
             return true;
@@ -94,6 +94,17 @@ impl CanonicalPath {
             Some(rest) => rest.is_empty() || rest.starts_with('/'),
             None => false,
         }
+    }
+
+    /// True when the first component is a reserved sidecar name
+    /// (`spec.md` §6). `/.arborsync-tmp/x` is reserved. `/src/.arborsync-tmp`
+    /// is not. A checkout walk strips `central` first.
+    pub fn has_reserved_root_name(&self) -> bool {
+        self.as_str()
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .is_some_and(is_reserved_root_entry)
     }
 }
 
@@ -138,12 +149,6 @@ impl<'de> Deserialize<'de> for EntryName {
         let value = String::deserialize(deserializer)?;
         Self::parse(&value).map_err(serde::de::Error::custom)
     }
-}
-
-/// A checkout is interested in canonical path `P` iff `central` covers it
-/// (`spec.md` §2). The spec's name for [`CanonicalPath::covers`].
-pub fn is_interested(central: &CanonicalPath, path: &CanonicalPath) -> bool {
-    central.covers(path)
 }
 
 /// Reserved names are skipped only at the tree root being walked

@@ -3,34 +3,40 @@ use std::path::Path;
 use arborsync_core::hash::ContentHash;
 use arborsync_core::path::{
     CanonicalPath, EntryName, PathError, RESERVED_CONFLICTS, RESERVED_TMP, canonical_to_host,
-    conflict_sidecar_path, host_to_canonical, is_interested, is_reserved_root_entry, join_central,
+    conflict_sidecar_path, host_to_canonical, is_reserved_root_entry, join_central,
     local_paths_overlap, local_to_canonical, strip_central,
 };
 use arborsync_core::test_support::p;
 
 #[test]
 fn root_central_matches_every_canonical_path() {
-    assert!(is_interested(&p("/"), &p("/")));
-    assert!(is_interested(&p("/"), &p("/src")));
-    assert!(is_interested(&p("/"), &p("/src/foo.rs")));
+    assert!(p("/").covers(&p("/")));
+    assert!(p("/").covers(&p("/src")));
+    assert!(p("/").covers(&p("/src/foo.rs")));
 }
 
 #[test]
 fn prefix_matches_self_and_descendants_not_siblings() {
-    assert!(is_interested(&p("/src"), &p("/src")));
-    assert!(is_interested(&p("/src"), &p("/src/foo.rs")));
-    assert!(is_interested(&p("/src"), &p("/src/project1/file.txt")));
-    assert!(!is_interested(&p("/src"), &p("/src2")));
-    assert!(!is_interested(&p("/src"), &p("/docs")));
-    assert!(!is_interested(&p("/src"), &p("/")));
+    assert!(p("/src").covers(&p("/src")));
+    assert!(p("/src").covers(&p("/src/foo.rs")));
+    assert!(p("/src").covers(&p("/src/project1/file.txt")));
+    assert!(!p("/src").covers(&p("/src2")));
+    assert!(!p("/src").covers(&p("/docs")));
+    assert!(!p("/src").covers(&p("/")));
 }
 
 #[test]
 fn child_mapping_does_not_receive_parent_files() {
-    assert!(!is_interested(
-        &p("/src/project1/subdir"),
-        &p("/src/project1/file.txt")
-    ));
+    assert!(!p("/src/project1/subdir").covers(&p("/src/project1/file.txt")));
+}
+
+#[test]
+fn reserved_root_name_is_the_first_component() {
+    assert!(p("/.arborsync-tmp").has_reserved_root_name());
+    assert!(p("/.arborsync-tmp/scratch").has_reserved_root_name());
+    assert!(p("/.arborsync-conflicts/lost").has_reserved_root_name());
+    assert!(!p("/src").has_reserved_root_name());
+    assert!(!p("/src/.arborsync-tmp").has_reserved_root_name());
 }
 
 #[test]

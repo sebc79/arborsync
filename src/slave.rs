@@ -6,9 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use arborsync_core::LocalEvent;
 use arborsync_core::keys::read_static_key;
 use arborsync_core::path::local_to_canonical;
-use arborsync_core::slave::{LocalEvent, Reply, Slave, SlaveError, WholeFileLater};
+use arborsync_core::slave::{Reply, Slave, SlaveError, WholeFileLater};
 use arborsync_core::storage::Storage;
 use arborsync_core::transport::{
     accept_bulk, client_endpoint, connect, open_control, peer_static_key, read_control, write_bulk,
@@ -373,17 +374,7 @@ fn watch_checkout(
         }
         match rx.recv_timeout(rescan_every) {
             Ok(Ok(events)) => {
-                let mut need_rescan = false;
-                let mut mapped = Vec::new();
-                for event in events {
-                    if event.need_rescan() {
-                        need_rescan = true;
-                        continue;
-                    }
-                    if let Some(watch) = crate::watch::from_notify(&event) {
-                        mapped.push(watch);
-                    }
-                }
+                let (need_rescan, mapped) = crate::watch::classify(events);
                 if need_rescan {
                     tx.send(Work::Rescan {
                         checkout: checkout.into(),

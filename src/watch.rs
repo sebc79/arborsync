@@ -2,6 +2,24 @@ use arborsync_core::watch::{WatchEvent, WatchKind};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind};
 
+pub fn classify(
+    events: impl IntoIterator<Item = impl std::ops::Deref<Target = Event>>,
+) -> (bool, Vec<WatchEvent>) {
+    let mut need_rescan = false;
+    let mut mapped = Vec::new();
+    for event in events {
+        let event = &*event;
+        if event.need_rescan() {
+            need_rescan = true;
+            continue;
+        }
+        if let Some(watch) = from_notify(event) {
+            mapped.push(watch);
+        }
+    }
+    (need_rescan, mapped)
+}
+
 pub fn from_notify(event: &Event) -> Option<WatchEvent> {
     if event.need_rescan() {
         return None;
@@ -44,7 +62,7 @@ mod tests {
     use notify::{Event, EventKind, RecursiveMode};
     use notify_debouncer_full::new_debouncer;
 
-    use super::from_notify;
+    use super::{classify, from_notify};
     use arborsync_core::config::{CheckoutConfig, SlaveConfig};
     use arborsync_core::master::MemoryContent;
     use arborsync_core::meta::hash_bytes;
@@ -195,15 +213,7 @@ mod tests {
         while Instant::now() < deadline {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(Ok(events)) => {
-                    let mut mapped = Vec::new();
-                    for event in events {
-                        if event.need_rescan() {
-                            continue;
-                        }
-                        if let Some(watch) = from_notify(&event) {
-                            mapped.push(watch);
-                        }
-                    }
+                    let (_need_rescan, mapped) = classify(events);
                     let locals = to_local_events(mapped, |host| {
                         local_to_canonical(&checkout, &central, host).ok()
                     });

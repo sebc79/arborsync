@@ -1,7 +1,17 @@
 use std::path::{Path, PathBuf};
 
-use crate::master::LocalEvent;
 use crate::path::CanonicalPath;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalEvent {
+    Changed(CanonicalPath),
+    Metadata(CanonicalPath),
+    Removed(CanonicalPath),
+    Renamed {
+        from: CanonicalPath,
+        to: CanonicalPath,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatchKind {
