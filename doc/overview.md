@@ -90,7 +90,7 @@ The master is the replica of record. The winner is whatever CAS commits there.
 
 The sidecar path is `{local}/.arborsync-conflicts/{canonical}--{first 16 hex chars of the losing content hash}`. Announce apply and `CasReject` skip the sidecar when only metadata changed. Incoming `Delete` still sidecars on a `FileNode` miss.
 
-As built, `decide_cas` rejects every live directory, including delete. A slave cannot rmdir or chmod a directory that already exists on the master. Master-local directory edits go through `commit` and skip that guard. Type change (file to dir, or the reverse) is specified as delete plus create in one master transaction. The code rejects the kind change instead.
+Type change (file to dir, or the reverse) is specified as delete plus create in one master transaction. The code rejects the kind change instead.
 
 Master `publish` also writes a sidecar when a successful slave update replaces different content. That copies a winner's predecessor, not a CAS loser. Slave apply follows the table above.
 
@@ -153,7 +153,6 @@ The library and both daemons implement the core loop in `spec.md` §16 items 1 t
 The ones that change behavior if you run the daemons today:
 
 - `Rename` is defined and unused. Same-window rename is delete plus create.
-- A slave cannot CAS a live directory.
 - Type change is not one master transaction.
 - Local overlap after symlink resolve is rejected at `Slave::open` (and at load when both locals exist).
 - Master `publish` sidecars a successful content replace.

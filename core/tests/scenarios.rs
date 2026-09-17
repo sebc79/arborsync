@@ -4,7 +4,7 @@ use arborsync_core::config::{CheckoutConfig, SlaveAcl};
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{Master, MemoryContent, Reply as MasterReply};
 use arborsync_core::merkle::{empty_dir_node, file_node};
-use arborsync_core::meta::{FileMetadata, collect_from_path, hash_bytes};
+use arborsync_core::meta::{EntryKind, FileMetadata, collect_from_path, hash_bytes};
 use arborsync_core::path::{RESERVED_CONFLICTS, RESERVED_TMP, conflict_sidecar_path};
 use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
 use arborsync_core::slave::{LocalEvent, Reply as SlaveReply, Slave};
@@ -719,4 +719,99 @@ fn slave_rescan_then_reconcile_announces_a_file_the_watcher_never_saw() {
         }
         other => panic!("expected create FileAnnounce, got {other:?}"),
     }
+}
+
+#[test]
+fn slave_can_cas_a_new_directory_and_later_delete_it() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    master_msg(
+        master
+            .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+            .unwrap(),
+    );
+
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).mkdir("nested");
+    let announce = slave
+        .note_local("src", LocalEvent::Changed(p("/src/nested")))
+        .unwrap();
+    let ProtocolMessage::FileAnnounce {
+        checkout_id,
+        path,
+        new,
+        basis,
+    } = announce.into_iter().next().expect("one announce")
+    else {
+        panic!("expected FileAnnounce");
+    };
+    assert_eq!(path, p("/src/nested"));
+    assert_eq!(new.kind, EntryKind::Dir);
+    assert_eq!(basis, None);
+
+    match master_msg(
+        master
+            .handle(
+                ALICE,
+                ProtocolMessage::FileAnnounce {
+                    checkout_id: checkout_id.clone(),
+                    path: path.clone(),
+                    new: new.clone(),
+                    basis,
+                },
+            )
+            .unwrap(),
+    ) {
+        ProtocolMessage::CasAccept {
+            file_node: node, ..
+        } => assert_eq!(node, Some(file_node(&new))),
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    slave_msgs(
+        slave
+            .handle(ProtocolMessage::CasAccept {
+                checkout_id: checkout_id.clone(),
+                path: path.clone(),
+                file_node: Some(file_node(&new)),
+            })
+            .unwrap(),
+    );
+    assert_eq!(
+        slave.last_synced("src", &path).unwrap(),
+        Some(file_node(&new))
+    );
+
+    std::fs::remove_dir(local.join("nested")).unwrap();
+    let removed = slave
+        .note_local("src", LocalEvent::Removed(p("/src/nested")))
+        .unwrap();
+    let ProtocolMessage::Delete {
+        checkout_id,
+        path,
+        basis,
+    } = removed.into_iter().next().expect("one delete")
+    else {
+        panic!("expected Delete");
+    };
+    assert_eq!(basis, file_node(&new));
+
+    match master_msg(
+        master
+            .handle(
+                ALICE,
+                ProtocolMessage::Delete {
+                    checkout_id,
+                    path: path.clone(),
+                    basis,
+                },
+            )
+            .unwrap(),
+    ) {
+        ProtocolMessage::CasAccept {
+            file_node: node, ..
+        } => assert_eq!(node, None),
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    assert!(!sandbox.central_root().join("src/nested").exists());
 }

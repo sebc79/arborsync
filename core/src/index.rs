@@ -37,7 +37,7 @@ pub fn commit_leaf<S: Storage>(
             batch.put_meta(ck, path, meta)?;
             batch.put_dir_node(ck, path, node)?;
             if last_synced == LastSynced::AdoptLeaf {
-                batch.del_last_synced(ck, path)?;
+                batch.put_last_synced(ck, path, file_node(meta))?;
             }
         }
         Some(meta) => {
@@ -180,5 +180,26 @@ mod tests {
         assert_eq!(store.get_meta(&ck, &path).unwrap().unwrap(), edited);
         assert_eq!(store.get_last_synced(&ck, &path).unwrap(), Some(committed));
         assert_eq!(store.get_meta(&CheckoutId::master(), &path).unwrap(), None);
+    }
+
+    #[test]
+    fn adopt_leaf_stores_file_node_for_a_directory() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::new("src");
+        let path = p("/src/nested");
+        let dir = FileMetadata::directory(0, 0o040755);
+        commit_leaf(&store, &ck, &path, Some(&dir), LastSynced::AdoptLeaf).unwrap();
+        assert_eq!(
+            store.get_last_synced(&ck, &path).unwrap(),
+            Some(file_node(&dir))
+        );
+
+        let edited = FileMetadata::directory(1, 0o040700);
+        commit_leaf(&store, &ck, &path, Some(&edited), LastSynced::Keep).unwrap();
+        assert_eq!(store.get_meta(&ck, &path).unwrap().unwrap(), edited);
+        assert_eq!(
+            store.get_last_synced(&ck, &path).unwrap(),
+            Some(file_node(&dir))
+        );
     }
 }

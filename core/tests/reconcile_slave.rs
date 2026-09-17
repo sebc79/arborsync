@@ -318,6 +318,51 @@ fn dir_list_slave_only_with_last_synced_equal_local_deletes() {
 }
 
 #[test]
+fn dir_list_slave_only_dir_with_last_synced_equal_local_deletes() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let dir = FileMetadata::directory(MTIME, 0o040755);
+    send(
+        slave
+            .handle(ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/nested"),
+                new: dir.clone(),
+                basis: None,
+            })
+            .unwrap(),
+    );
+    assert_eq!(
+        slave.last_synced("src", &p("/src/nested")).unwrap(),
+        Some(file_node(&dir))
+    );
+
+    match &send(
+        slave
+            .handle(ProtocolMessage::DirListResponse {
+                checkout_id: "src".into(),
+                path: p("/src"),
+                entries: vec![],
+            })
+            .unwrap(),
+    )[..]
+    {
+        [
+            ProtocolMessage::Delete {
+                checkout_id,
+                path,
+                basis,
+            },
+        ] => {
+            assert_eq!(checkout_id, "src");
+            assert_eq!(path, &p("/src/nested"));
+            assert_eq!(*basis, file_node(&dir));
+        }
+        other => panic!("expected Delete, got {other:?}"),
+    }
+}
+
+#[test]
 fn second_subscribe_ack_emits_root_report_again() {
     let sandbox = SyncSandbox::new();
     let mut slave = alice_slave(&sandbox, MemoryContent::new());

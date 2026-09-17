@@ -88,6 +88,15 @@ fn decide_child_slave_only_local_equals_last_synced_is_announce_delete() {
 }
 
 #[test]
+fn decide_child_slave_only_dir_local_equals_last_synced_is_announce_delete() {
+    let local = directory("nested", false);
+    assert_eq!(
+        decide_child(Some(&local), None, Some(node(1)), Some(node(1))),
+        WalkAction::AnnounceDelete
+    );
+}
+
+#[test]
 fn decide_child_slave_only_local_differs_from_last_synced_is_announce_cas() {
     let local = file("hello.txt", 1);
     assert_eq!(
