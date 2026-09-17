@@ -34,13 +34,26 @@ pub fn from_notify(event: &Event) -> Option<WatchEvent> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode};
-    use notify::{Event, EventKind};
+    use notify::{Event, EventKind, RecursiveMode};
+    use notify_debouncer_full::new_debouncer;
 
     use super::from_notify;
-    use arborsync_core::watch::WatchKind;
+    use arborsync_core::config::{CheckoutConfig, SlaveConfig};
+    use arborsync_core::master::MemoryContent;
+    use arborsync_core::meta::hash_bytes;
+    use arborsync_core::path::{CanonicalPath, local_to_canonical};
+    use arborsync_core::protocol::ProtocolMessage;
+    use arborsync_core::slave::Slave;
+    use arborsync_core::test_support::{MemoryStorage, SyncSandbox};
+    use arborsync_core::watch::{WatchKind, to_local_events};
+    use arborsync_core::{LoadedSlave, format_hex_key};
 
     fn event(kind: EventKind, paths: &[&str]) -> Event {
         let mut event = Event::new(kind);
@@ -130,5 +143,95 @@ mod tests {
             .is_none()
         );
         assert!(from_notify(&event(EventKind::Other, &["/a"])).is_none());
+    }
+
+    #[test]
+    fn notify_thread_announces_file_written_after_arm() {
+        let sandbox = SyncSandbox::new();
+        let local = sandbox.add_checkout("dev-alice", "src");
+        let root = sandbox.slave_root("dev-alice");
+        fs::create_dir_all(&root).expect("slave root");
+        let cfg = SlaveConfig {
+            slave_id: "dev-alice".into(),
+            master_addr: "127.0.0.1:8443".into(),
+            slave_key_path: root.join("slave.key").to_string_lossy().into_owned(),
+            master_public_keys: vec![format_hex_key(&[0x11; 32])],
+            db_path: sandbox.slave_db("dev-alice").to_string_lossy().into_owned(),
+            log_level: "debug".into(),
+            max_checkouts_per_slave: 100,
+            watcher_debounce_ms: 200,
+            rescan_interval_seconds: 3600,
+            checkouts: vec![CheckoutConfig {
+                id: "src".into(),
+                central: "/src".into(),
+                local: local.to_string_lossy().into_owned(),
+            }],
+        };
+        let cfg_path = root.join("slave.toml");
+        fs::write(&cfg_path, cfg.to_toml().expect("toml")).expect("write slave.toml");
+        fs::set_permissions(&cfg_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod slave.toml");
+
+        let loaded = LoadedSlave::load(&cfg_path).expect("load slave.toml");
+        let mut slave =
+            Slave::open(loaded, MemoryStorage::new(), MemoryContent::new()).expect("open slave");
+        let checkout = slave
+            .checkout_local("src")
+            .expect("src checkout")
+            .to_path_buf();
+        let central = CanonicalPath::parse("/src").expect("central");
+
+        let (tx, rx) = mpsc::channel();
+        let mut debouncer = new_debouncer(Duration::from_millis(200), None, tx).expect("debouncer");
+        debouncer
+            .watch(&checkout, RecursiveMode::Recursive)
+            .expect("watch armed");
+
+        let live = checkout.join("hello.txt");
+        fs::write(&live, b"notify-hello").expect("write after arm");
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut announced = None;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Ok(events)) => {
+                    let mut mapped = Vec::new();
+                    for event in events {
+                        if event.need_rescan() {
+                            continue;
+                        }
+                        if let Some(watch) = from_notify(&event) {
+                            mapped.push(watch);
+                        }
+                    }
+                    let locals = to_local_events(mapped, |host| {
+                        local_to_canonical(&checkout, &central, host).ok()
+                    });
+                    for event in locals {
+                        for msg in slave
+                            .note_local("src", event)
+                            .expect("note_local after notify")
+                        {
+                            if let ProtocolMessage::FileAnnounce { path, new, .. } = msg {
+                                if path.as_str() == "/src/hello.txt" {
+                                    announced = Some(new.content_hash);
+                                }
+                            }
+                        }
+                    }
+                    if announced.is_some() {
+                        break;
+                    }
+                }
+                Ok(Err(errs)) => panic!("watch errors after writing hello.txt: {errs:?}"),
+                Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            announced,
+            Some(hash_bytes(b"notify-hello")),
+            "notify + note_local should FileAnnounce /src/hello.txt"
+        );
     }
 }
