@@ -134,6 +134,8 @@ fn reload_master_from_disk(
         }
     };
     let mut guard = master.lock().expect("master");
+    let old_debounce = guard.watcher_debounce_ms();
+    let old_rescan = guard.rescan_interval_seconds();
     match guard.reload(next) {
         Ok(plan) => {
             limiter
@@ -141,8 +143,8 @@ fn reload_master_from_disk(
                 .expect("limiter")
                 .set_max(plan.max_connection_attempts_per_minute);
             apply_file_log_level(&plan.log_level);
-            if plan.watcher_debounce_ms != guard.watcher_debounce_ms()
-                || plan.rescan_interval_seconds != guard.rescan_interval_seconds()
+            if plan.watcher_debounce_ms != old_debounce
+                || plan.rescan_interval_seconds != old_rescan
             {
                 watch_gen.fetch_add(1, Ordering::Relaxed);
             }

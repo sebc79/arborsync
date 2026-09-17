@@ -253,15 +253,25 @@ async fn session(
                 };
                 match work {
                     Work::Local { checkout, event } => {
-                        let outs = slave.lock().expect("slave").note_local(&checkout, event)?;
-                        for out in outs {
-                            write_control(&mut send, &out).await?;
+                        match slave.lock().expect("slave").note_local(&checkout, event) {
+                            Ok(outs) => {
+                                for out in outs {
+                                    write_control(&mut send, &out).await?;
+                                }
+                            }
+                            Err(SlaveError::UnknownCheckout(_)) => {}
+                            Err(err) => return Err(err.into()),
                         }
                     }
                     Work::Rescan { checkout } => {
-                        let outs = slave.lock().expect("slave").rescan(&checkout)?;
-                        for out in outs {
-                            write_control(&mut send, &out).await?;
+                        match slave.lock().expect("slave").rescan(&checkout) {
+                            Ok(outs) => {
+                                for out in outs {
+                                    write_control(&mut send, &out).await?;
+                                }
+                            }
+                            Err(SlaveError::UnknownCheckout(_)) => {}
+                            Err(err) => return Err(err.into()),
                         }
                     }
                 }

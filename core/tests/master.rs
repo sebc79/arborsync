@@ -565,6 +565,7 @@ fn reload_removes_acl_and_forgets_the_live_session() {
     .unwrap();
     let plan = master.reload(next).unwrap();
     assert!(plan.drop_peers.contains(&ALICE));
+    assert_eq!(plan.drop_slave_ids, vec!["dev-alice".to_string()]);
     assert_eq!(master.authorize_peer(&ALICE), None);
 
     match master
