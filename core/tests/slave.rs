@@ -923,6 +923,38 @@ fn unpaired_remove_and_change_still_delete_plus_announce() {
 }
 
 #[test]
+fn write_event_reuses_hash_when_only_mode_changes() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("hello.txt", b"typed");
+    let created = slave
+        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap();
+    let ProtocolMessage::FileAnnounce { new, .. } = &created[0] else {
+        panic!("expected FileAnnounce, got {created:?}");
+    };
+    let hash = new.content_hash;
+    let mtime = new.mtime_ns;
+    std::fs::set_permissions(
+        local.join("hello.txt"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    sandbox.tree(&local).set_mtime_ns("hello.txt", mtime);
+    match &slave
+        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap()[..]
+    {
+        [ProtocolMessage::FileAnnounce { new, .. }] => {
+            assert_eq!(new.content_hash, hash);
+            assert_ne!(new.mode & 0o777, 0o644);
+        }
+        other => panic!("expected chmod FileAnnounce, got {other:?}"),
+    }
+}
+
+#[test]
 fn metadata_chmod_announces_new_mode_and_keeps_the_content_hash() {
     let sandbox = SyncSandbox::new();
     let mut slave = alice_slave(&sandbox, MemoryContent::new());

@@ -1,7 +1,8 @@
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-use arborsync_core::meta::{collect_for_rescan, collect_from_path};
+use arborsync_core::hash::ContentHash;
+use arborsync_core::meta::{EntryKind, collect_for_rescan, collect_from_path};
 use arborsync_core::test_support::TempTree;
 
 #[test]
@@ -39,4 +40,33 @@ fn collect_for_rescan_reuses_hash_when_only_mode_changes() {
     assert_eq!(second.size, first.size);
     assert_eq!(second.mtime_ns, first.mtime_ns);
     assert_ne!(second.mode, first.mode);
+}
+
+#[test]
+fn collect_for_rescan_reuses_hash_when_bytes_change_but_size_and_mtime_match() {
+    let tree = TempTree::new();
+    let path = tree.builder().file("note.txt", b"same");
+    let first = collect_from_path(&path).unwrap().unwrap();
+    std::fs::write(&path, b"diff").unwrap();
+    tree.builder().set_mtime_ns("note.txt", first.mtime_ns);
+    let second = collect_for_rescan(&path, Some(&first)).unwrap().unwrap();
+    assert_eq!(second.content_hash, first.content_hash);
+    assert_ne!(
+        second.content_hash,
+        collect_from_path(&path).unwrap().unwrap().content_hash
+    );
+}
+
+#[test]
+fn collect_for_rescan_hashes_when_kind_changes_at_the_same_size_and_mtime() {
+    let tree = TempTree::new();
+    let path = tree.builder().file("empty", b"");
+    let first = collect_from_path(&path).unwrap().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    tree.builder().set_mtime_ns("empty", first.mtime_ns);
+    let second = collect_for_rescan(&path, Some(&first)).unwrap().unwrap();
+    assert_eq!(second.kind, EntryKind::Dir);
+    assert_eq!(second.content_hash, ContentHash::ZERO);
+    assert_ne!(second.content_hash, first.content_hash);
 }

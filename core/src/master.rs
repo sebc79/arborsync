@@ -1224,7 +1224,10 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             return Ok(());
         }
         let host = canonical_to_host(&self.central_root, &path);
-        let Some(found) = meta::collect_from_path(&host).map_err(MasterError::io(&host))? else {
+        let previous = self.meta(&path)?;
+        let Some(found) =
+            meta::collect_for_rescan(&host, previous.as_ref()).map_err(MasterError::io(&host))?
+        else {
             return self.note_removed(&path);
         };
         self.note_present(path, found)
@@ -1265,14 +1268,16 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             return Ok(());
         }
         let host_to = canonical_to_host(&self.central_root, &to);
-        let Some(found) = meta::collect_from_path(&host_to).map_err(MasterError::io(&host_to))?
+        let from_previous = self.meta(&from)?;
+        let Some(found) = meta::collect_for_rescan(&host_to, from_previous.as_ref())
+            .map_err(MasterError::io(&host_to))?
         else {
             return self.note_removed(&from);
         };
         if self.inflight.consume_if_echo(&to, &found.content_hash) {
             return Ok(());
         }
-        let Some(from_previous) = self.meta(&from)? else {
+        let Some(from_previous) = from_previous else {
             return self.note_present(to, found);
         };
         let current_to = self.meta(&to)?;
