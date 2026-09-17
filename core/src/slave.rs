@@ -80,6 +80,14 @@ pub enum DeleteAction {
     SidecarThenRemove,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenameAction {
+    Apply,
+    NoopRefresh,
+    SidecarThenApply,
+    CreateAtTo,
+}
+
 pub fn decide_incoming(
     local: Option<&FileMetadata>,
     basis: Option<FileNode>,
@@ -117,6 +125,31 @@ pub fn decide_master_won_delete(
         return DeleteAction::Remove;
     }
     DeleteAction::SidecarThenRemove
+}
+
+pub fn decide_rename(
+    from_local: Option<&FileMetadata>,
+    to_local: Option<&FileMetadata>,
+    from_basis: FileNode,
+    last_synced_from: Option<FileNode>,
+    to_new: &FileMetadata,
+) -> RenameAction {
+    match from_local {
+        None if to_local.is_some_and(|local| file_node(local) == file_node(to_new)) => {
+            RenameAction::NoopRefresh
+        }
+        None => RenameAction::CreateAtTo,
+        Some(from) => {
+            let live = file_node(from);
+            if live == from_basis || last_synced_from == Some(live) {
+                RenameAction::Apply
+            } else if from.kind == EntryKind::Dir {
+                RenameAction::Apply
+            } else {
+                RenameAction::SidecarThenApply
+            }
+        }
+    }
 }
 
 struct InflightEntry {
@@ -178,6 +211,7 @@ pub struct Slave<S: Storage, C: ContentHook> {
     checkouts: HashMap<String, Checkout>,
     pending: HashMap<(String, CanonicalPath), PendingApply>,
     pending_pulls: HashSet<(String, CanonicalPath)>,
+    pending_renames: HashMap<(String, CanonicalPath), CanonicalPath>,
     denied_centrals: HashSet<CanonicalPath>,
 }
 
@@ -208,6 +242,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             checkouts,
             pending: HashMap::new(),
             pending_pulls: HashSet::new(),
+            pending_renames: HashMap::new(),
             denied_centrals: HashSet::new(),
         })
     }
@@ -282,6 +317,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             }
             self.pending.retain(|(checkout, _), _| checkout != id);
             self.pending_pulls.retain(|(checkout, _)| checkout != id);
+            self.pending_renames
+                .retain(|(checkout, _), _| checkout != id);
         }
 
         for id in &plan.added {
@@ -347,6 +384,13 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 path,
                 basis,
             } => self.on_delete(checkout_id, path, basis),
+            ProtocolMessage::Rename {
+                checkout_id,
+                from,
+                to,
+                from_basis,
+                to_new,
+            } => self.on_rename(checkout_id, from, to, from_basis, to_new),
             ProtocolMessage::CasAccept {
                 checkout_id,
                 path,
@@ -422,7 +466,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     ) -> Result<Vec<ProtocolMessage>, SlaveError> {
         match event {
             LocalEvent::Changed(path) => self.note_changed(checkout_id, path),
+            LocalEvent::Metadata(path) => self.note_metadata(checkout_id, path),
             LocalEvent::Removed(path) => self.note_removed(checkout_id, &path),
+            LocalEvent::Renamed { from, to } => self.note_renamed(checkout_id, from, to),
         }
     }
 
@@ -536,13 +582,100 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         }
     }
 
+    fn on_rename(
+        &mut self,
+        checkout_id: String,
+        from: CanonicalPath,
+        to: CanonicalPath,
+        from_basis: FileNode,
+        to_new: FileMetadata,
+    ) -> Result<Reply, SlaveError> {
+        let from_local = self.meta(&checkout_id, &from)?;
+        let to_local = self.meta(&checkout_id, &to)?;
+        let last_synced_from = self.last_synced(&checkout_id, &from)?;
+        match decide_rename(
+            from_local.as_ref(),
+            to_local.as_ref(),
+            from_basis,
+            last_synced_from,
+            &to_new,
+        ) {
+            RenameAction::NoopRefresh => {
+                self.write_last_synced(&checkout_id, &from, None)?;
+                self.write_last_synced(&checkout_id, &to, Some(file_node(&to_new)))?;
+                Ok(Reply::Send(Vec::new()))
+            }
+            RenameAction::CreateAtTo => {
+                self.write_last_synced(&checkout_id, &from, None)?;
+                self.apply_new(&checkout_id, to, to_new)
+            }
+            RenameAction::SidecarThenApply => {
+                self.sidecar_local(
+                    &checkout_id,
+                    &from,
+                    from_local.as_ref(),
+                    to_new.content_hash,
+                )?;
+                self.apply_rename(&checkout_id, from, to, to_new)?;
+                Ok(Reply::Send(Vec::new()))
+            }
+            RenameAction::Apply => {
+                self.apply_rename(&checkout_id, from, to, to_new)?;
+                Ok(Reply::Send(Vec::new()))
+            }
+        }
+    }
+
+    fn apply_rename(
+        &mut self,
+        checkout_id: &str,
+        from: CanonicalPath,
+        to: CanonicalPath,
+        to_new: FileMetadata,
+    ) -> Result<(), SlaveError> {
+        let (local, from_rel, to_rel) = {
+            let checkout = self.checkout(checkout_id)?;
+            (
+                checkout.local.clone(),
+                strip_central(&checkout.central, &from)?,
+                strip_central(&checkout.central, &to)?,
+            )
+        };
+        let hash = match to_new.kind {
+            EntryKind::Dir => ContentHash::ZERO,
+            EntryKind::File | EntryKind::Symlink => to_new.content_hash,
+        };
+        self.checkout_mut(checkout_id)?
+            .inflight
+            .arm(to.clone(), hash);
+        apply::rename_live(&local, &from_rel, &to_rel, &to_new)?;
+        let ck = self.checkout(checkout_id)?.id.clone();
+        index::commit_leaf(&self.store, &ck, &from, None, index::LastSynced::AdoptLeaf)
+            .map_err(SlaveError::index)?;
+        self.index_ancestors(checkout_id, &to)?;
+        index::commit_leaf(
+            &self.store,
+            &ck,
+            &to,
+            Some(&to_new),
+            index::LastSynced::AdoptLeaf,
+        )
+        .map_err(SlaveError::index)?;
+        if to_new.kind == EntryKind::Dir {
+            self.reindex_descendants(checkout_id, &to, index::LastSynced::AdoptLeaf)?;
+        }
+        Ok(())
+    }
+
     fn on_cas_accept(
         &mut self,
         checkout_id: &str,
         path: &CanonicalPath,
         node: Option<FileNode>,
     ) -> Result<(), SlaveError> {
-        self.write_last_synced(checkout_id, path, node)
+        self.write_last_synced(checkout_id, path, node)?;
+        self.clear_pending_rename(checkout_id, path);
+        Ok(())
     }
 
     fn on_cas_reject(
@@ -551,6 +684,27 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         path: CanonicalPath,
         current: Option<FileMetadata>,
     ) -> Result<Reply, SlaveError> {
+        if let Some((from, to)) = self.take_pending_rename(&checkout_id, &path) {
+            if self.undo_rename_disk(&checkout_id, &from, &to).is_err() {
+                let local_to = self.meta(&checkout_id, &to)?;
+                let incoming = current
+                    .as_ref()
+                    .map(|winner| winner.content_hash)
+                    .unwrap_or(ContentHash::ZERO);
+                self.sidecar_local(&checkout_id, &to, local_to.as_ref(), incoming)?;
+                return match current {
+                    None => {
+                        self.remove_path(
+                            &checkout_id,
+                            &from,
+                            self.meta(&checkout_id, &from)?.as_ref(),
+                        )?;
+                        Ok(Reply::Send(Vec::new()))
+                    }
+                    Some(winner) => self.apply_new(&checkout_id, from, winner),
+                };
+            }
+        }
         let local = self.meta(&checkout_id, &path)?;
         if let (Some(local), Some(winner)) = (&local, &current) {
             self.sidecar_local(&checkout_id, &path, Some(local), winner.content_hash)?;
@@ -1071,6 +1225,215 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             new: found,
             basis: last_synced,
         }])
+    }
+
+    fn note_metadata(
+        &mut self,
+        checkout_id: &str,
+        path: CanonicalPath,
+    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        let central = self.checkout(checkout_id)?.central.clone();
+        if is_reserved(&central, &path) {
+            return Ok(Vec::new());
+        }
+        let (local, relative) = {
+            let checkout = self.checkout(checkout_id)?;
+            (
+                checkout.local.clone(),
+                strip_central(&checkout.central, &path)?,
+            )
+        };
+        let host = canonical_to_host(&local, &relative);
+        let previous = self.meta(checkout_id, &path)?;
+        let Some(found) =
+            meta::collect_for_rescan(&host, previous.as_ref()).map_err(SlaveError::io(&host))?
+        else {
+            return self.note_removed(checkout_id, &path);
+        };
+        if self
+            .checkout_mut(checkout_id)?
+            .inflight
+            .consume_if_echo(&path, &found.content_hash)
+        {
+            return Ok(Vec::new());
+        }
+        let last_synced = self.last_synced(checkout_id, &path)?;
+        if last_synced == Some(file_node(&found)) {
+            return Ok(Vec::new());
+        }
+        if previous.as_ref() == Some(&found) {
+            return Ok(Vec::new());
+        }
+        let ck = self.checkout(checkout_id)?.id.clone();
+        self.index_ancestors(checkout_id, &path)?;
+        index::commit_leaf(
+            &self.store,
+            &ck,
+            &path,
+            Some(&found),
+            index::LastSynced::Keep,
+        )
+        .map_err(SlaveError::index)?;
+        Ok(vec![ProtocolMessage::FileAnnounce {
+            checkout_id: checkout_id.into(),
+            path,
+            new: found,
+            basis: last_synced,
+        }])
+    }
+
+    fn note_renamed(
+        &mut self,
+        checkout_id: &str,
+        from: CanonicalPath,
+        to: CanonicalPath,
+    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        let central = self.checkout(checkout_id)?.central.clone();
+        let from_reserved = is_reserved(&central, &from);
+        let to_reserved = is_reserved(&central, &to);
+        if from_reserved && to_reserved {
+            return Ok(Vec::new());
+        }
+        if from_reserved {
+            return self.note_changed(checkout_id, to);
+        }
+        if to_reserved {
+            return self.note_removed(checkout_id, &from);
+        }
+
+        let from_meta = self.meta(checkout_id, &from)?;
+        let from_basis = match &from_meta {
+            Some(meta) => self
+                .last_synced(checkout_id, &from)?
+                .unwrap_or_else(|| file_node(meta)),
+            None => {
+                let (local, relative) = {
+                    let checkout = self.checkout(checkout_id)?;
+                    (
+                        checkout.local.clone(),
+                        strip_central(&checkout.central, &to)?,
+                    )
+                };
+                let host = canonical_to_host(&local, &relative);
+                if meta::collect_from_path(&host)
+                    .map_err(SlaveError::io(&host))?
+                    .is_some()
+                {
+                    return self.note_changed(checkout_id, to);
+                }
+                return Ok(Vec::new());
+            }
+        };
+
+        let (local, relative) = {
+            let checkout = self.checkout(checkout_id)?;
+            (
+                checkout.local.clone(),
+                strip_central(&checkout.central, &to)?,
+            )
+        };
+        let host = canonical_to_host(&local, &relative);
+        let Some(found) = meta::collect_from_path(&host).map_err(SlaveError::io(&host))? else {
+            return self.note_removed(checkout_id, &from);
+        };
+
+        let ck = self.checkout(checkout_id)?.id.clone();
+        index::commit_leaf(&self.store, &ck, &from, None, index::LastSynced::Keep)
+            .map_err(SlaveError::index)?;
+        self.index_ancestors(checkout_id, &to)?;
+        index::commit_leaf(&self.store, &ck, &to, Some(&found), index::LastSynced::Keep)
+            .map_err(SlaveError::index)?;
+        if found.kind == EntryKind::Dir {
+            self.reindex_descendants(checkout_id, &to, index::LastSynced::Keep)?;
+        }
+        self.pending_renames
+            .insert((checkout_id.into(), from.clone()), to.clone());
+        Ok(vec![ProtocolMessage::Rename {
+            checkout_id: checkout_id.into(),
+            from,
+            to,
+            from_basis,
+            to_new: found,
+        }])
+    }
+
+    fn reindex_descendants(
+        &mut self,
+        checkout_id: &str,
+        dir: &CanonicalPath,
+        last_synced: index::LastSynced,
+    ) -> Result<(), SlaveError> {
+        let disk = self.walk_checkout(checkout_id)?;
+        let ck = self.checkout(checkout_id)?.id.clone();
+        for (path, found) in disk {
+            if &path == dir || !dir.covers(&path) {
+                continue;
+            }
+            index::commit_leaf(&self.store, &ck, &path, Some(&found), last_synced)
+                .map_err(SlaveError::index)?;
+        }
+        Ok(())
+    }
+
+    fn clear_pending_rename(&mut self, checkout_id: &str, path: &CanonicalPath) {
+        if self
+            .pending_renames
+            .remove(&(checkout_id.to_string(), path.clone()))
+            .is_some()
+        {
+            return;
+        }
+        self.pending_renames
+            .retain(|(ck, from), to| !(ck == checkout_id && (from == path || to == path)));
+    }
+
+    fn take_pending_rename(
+        &mut self,
+        checkout_id: &str,
+        path: &CanonicalPath,
+    ) -> Option<(CanonicalPath, CanonicalPath)> {
+        if let Some(to) = self
+            .pending_renames
+            .remove(&(checkout_id.to_string(), path.clone()))
+        {
+            return Some((path.clone(), to));
+        }
+        let key = self.pending_renames.iter().find_map(|(k, to)| {
+            if k.0 == checkout_id && to == path {
+                Some(k.clone())
+            } else {
+                None
+            }
+        })?;
+        let to = self.pending_renames.remove(&key)?;
+        Some((key.1, to))
+    }
+
+    fn undo_rename_disk(
+        &self,
+        checkout_id: &str,
+        from: &CanonicalPath,
+        to: &CanonicalPath,
+    ) -> Result<(), SlaveError> {
+        let from_host = self.host_for(checkout_id, from)?;
+        let to_host = self.host_for(checkout_id, to)?;
+        let to_exists = match fs::symlink_metadata(&to_host) {
+            Ok(_) => true,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+            Err(err) => return Err(SlaveError::io(&to_host)(err)),
+        };
+        let from_gone = match fs::symlink_metadata(&from_host) {
+            Ok(_) => false,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => true,
+            Err(err) => return Err(SlaveError::io(&from_host)(err)),
+        };
+        if to_exists && from_gone {
+            if let Some(parent) = from_host.parent() {
+                fs::create_dir_all(parent).map_err(SlaveError::io(parent))?;
+            }
+            fs::rename(&to_host, &from_host).map_err(SlaveError::io(&from_host))?;
+        }
+        Ok(())
     }
 
     fn note_removed(

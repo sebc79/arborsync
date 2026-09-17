@@ -555,16 +555,16 @@ fn echo_of_an_applied_dir_or_meta_only_does_not_reannounce() {
     );
 
     let local = slave.checkout_local("src").unwrap().to_path_buf();
-    std::fs::set_permissions(
-        local.join("nested"),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
+    std::fs::set_permissions(local.join("nested"), std::fs::Permissions::from_mode(0o700)).unwrap();
     match &slave
         .note_local("src", LocalEvent::Changed(p("/src/nested")))
         .unwrap()[..]
     {
-        [ProtocolMessage::FileAnnounce { path, new, basis, .. }] => {
+        [
+            ProtocolMessage::FileAnnounce {
+                path, new, basis, ..
+            },
+        ] => {
             assert_eq!(path, &p("/src/nested"));
             assert_eq!(*basis, Some(file_node(&dir)));
             assert_ne!(file_node(new), file_node(&dir));
@@ -599,6 +599,243 @@ fn echo_of_an_applied_dir_or_meta_only_does_not_reannounce() {
     assert!(
         slave
             .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn local_file_rename_announces_rename_and_cas_accepts_advance_last_synced() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("old.txt", b"moved");
+    let created = slave
+        .note_local("src", LocalEvent::Changed(p("/src/old.txt")))
+        .unwrap();
+    let ProtocolMessage::FileAnnounce { new, .. } = &created[0] else {
+        panic!("expected FileAnnounce, got {created:?}");
+    };
+    let node = file_node(new);
+    slave
+        .handle(ProtocolMessage::CasAccept {
+            checkout_id: "src".into(),
+            path: p("/src/old.txt"),
+            file_node: Some(node),
+        })
+        .unwrap();
+    assert_eq!(
+        slave.last_synced("src", &p("/src/old.txt")).unwrap(),
+        Some(node)
+    );
+
+    std::fs::rename(local.join("old.txt"), local.join("new.txt")).unwrap();
+    let out = slave
+        .note_local(
+            "src",
+            LocalEvent::Renamed {
+                from: p("/src/old.txt"),
+                to: p("/src/new.txt"),
+            },
+        )
+        .unwrap();
+    match &out[..] {
+        [
+            ProtocolMessage::Rename {
+                checkout_id,
+                from,
+                to,
+                from_basis,
+                to_new,
+            },
+        ] => {
+            assert_eq!(checkout_id, "src");
+            assert_eq!(from, &p("/src/old.txt"));
+            assert_eq!(to, &p("/src/new.txt"));
+            assert_eq!(*from_basis, node);
+            assert_eq!(to_new.content_hash, hash_bytes(b"moved"));
+        }
+        other => panic!("expected Rename, got {other:?}"),
+    }
+    assert_eq!(
+        slave.last_synced("src", &p("/src/old.txt")).unwrap(),
+        Some(node)
+    );
+    assert_eq!(slave.last_synced("src", &p("/src/new.txt")).unwrap(), None);
+
+    let to_node = file_node(&slave.meta("src", &p("/src/new.txt")).unwrap().unwrap());
+    slave
+        .handle(ProtocolMessage::CasAccept {
+            checkout_id: "src".into(),
+            path: p("/src/new.txt"),
+            file_node: Some(to_node),
+        })
+        .unwrap();
+    slave
+        .handle(ProtocolMessage::CasAccept {
+            checkout_id: "src".into(),
+            path: p("/src/old.txt"),
+            file_node: None,
+        })
+        .unwrap();
+    assert_eq!(slave.last_synced("src", &p("/src/old.txt")).unwrap(), None);
+    assert_eq!(
+        slave.last_synced("src", &p("/src/new.txt")).unwrap(),
+        Some(to_node)
+    );
+}
+
+#[test]
+fn incoming_rename_moves_the_file_and_sets_last_synced_on_both_paths() {
+    let sandbox = SyncSandbox::new();
+    let body = b"hello";
+    let hash = hash_bytes(body);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, body.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let new = FileMetadata::file(body.len() as u64, MTIME, 0o100644, hash);
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/old.txt"),
+            new: new.clone(),
+            basis: None,
+        })
+        .unwrap();
+
+    match slave
+        .handle(ProtocolMessage::Rename {
+            checkout_id: "src".into(),
+            from: p("/src/old.txt"),
+            to: p("/src/new.txt"),
+            from_basis: file_node(&new),
+            to_new: new.clone(),
+        })
+        .unwrap()
+    {
+        Reply::Send(msgs) => assert!(msgs.is_empty()),
+        other => panic!("expected empty send, got {other:?}"),
+    }
+
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    assert_eq!(std::fs::read(local.join("new.txt")).unwrap(), body);
+    assert!(!local.join("old.txt").exists());
+    assert_eq!(slave.last_synced("src", &p("/src/old.txt")).unwrap(), None);
+    assert_eq!(
+        slave.last_synced("src", &p("/src/new.txt")).unwrap(),
+        Some(file_node(&new))
+    );
+}
+
+#[test]
+fn unpaired_remove_and_change_still_delete_plus_announce() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("old.txt", b"moved");
+    slave
+        .note_local("src", LocalEvent::Changed(p("/src/old.txt")))
+        .unwrap();
+    std::fs::rename(local.join("old.txt"), local.join("new.txt")).unwrap();
+
+    let removed = slave
+        .note_local("src", LocalEvent::Removed(p("/src/old.txt")))
+        .unwrap();
+    match &removed[..] {
+        [ProtocolMessage::Delete { path, .. }] => assert_eq!(path, &p("/src/old.txt")),
+        other => panic!("expected Delete, got {other:?}"),
+    }
+    let created = slave
+        .note_local("src", LocalEvent::Changed(p("/src/new.txt")))
+        .unwrap();
+    match &created[..] {
+        [ProtocolMessage::FileAnnounce { path, new, .. }] => {
+            assert_eq!(path, &p("/src/new.txt"));
+            assert_eq!(new.content_hash, hash_bytes(b"moved"));
+        }
+        other => panic!("expected FileAnnounce, got {other:?}"),
+    }
+}
+
+#[test]
+fn metadata_chmod_announces_new_mode_and_keeps_the_content_hash() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("hello.txt", b"typed");
+    let created = slave
+        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap();
+    let ProtocolMessage::FileAnnounce { new, .. } = &created[0] else {
+        panic!("expected FileAnnounce, got {created:?}");
+    };
+    let hash = new.content_hash;
+    std::fs::set_permissions(
+        local.join("hello.txt"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    match &slave
+        .note_local("src", LocalEvent::Metadata(p("/src/hello.txt")))
+        .unwrap()[..]
+    {
+        [ProtocolMessage::FileAnnounce { new, .. }] => {
+            assert_eq!(new.content_hash, hash);
+            assert_ne!(new.mode & 0o777, 0o644);
+        }
+        other => panic!("expected chmod FileAnnounce, got {other:?}"),
+    }
+}
+
+#[test]
+fn echo_of_an_applied_rename_does_not_reannounce() {
+    let sandbox = SyncSandbox::new();
+    let body = b"hello";
+    let hash = hash_bytes(body);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, body.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let new = FileMetadata::file(body.len() as u64, MTIME, 0o100644, hash);
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/old.txt"),
+            new: new.clone(),
+            basis: None,
+        })
+        .unwrap();
+    slave
+        .handle(ProtocolMessage::Rename {
+            checkout_id: "src".into(),
+            from: p("/src/old.txt"),
+            to: p("/src/new.txt"),
+            from_basis: file_node(&new),
+            to_new: new,
+        })
+        .unwrap();
+    assert!(
+        slave
+            .note_local("src", LocalEvent::Changed(p("/src/new.txt")))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn reserved_tmp_rename_produces_no_message() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file(".arborsync-tmp/x", b"tmp");
+    assert!(
+        slave
+            .note_local(
+                "src",
+                LocalEvent::Renamed {
+                    from: p("/src/.arborsync-tmp/x"),
+                    to: p("/src/.arborsync-tmp/y"),
+                },
+            )
             .unwrap()
             .is_empty()
     );
