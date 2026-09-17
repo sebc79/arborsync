@@ -227,7 +227,6 @@ pub fn encode_bulk(header: &BulkHeader, body: &[u8]) -> Result<Vec<u8>, FrameErr
     Ok(frame)
 }
 
-/// Decode one bulk stream. Returns the header, the raw body, and bytes consumed.
 pub fn decode_bulk(buf: &[u8]) -> Result<(BulkHeader, &[u8], usize), FrameError> {
     if buf.len() < 4 {
         return Err(FrameError::Truncated);
