@@ -56,7 +56,7 @@ fn two_slave_master(
 }
 
 #[test]
-fn cas_accepts_only_a_create_on_absence_or_a_same_kind_match_on_basis() {
+fn cas_accepts_a_create_on_absence_or_a_matching_basis() {
     let live = file(1);
     let rival = file(2);
     let live_dir = dir();
@@ -127,6 +127,27 @@ fn cas_accepts_only_a_create_on_absence_or_a_same_kind_match_on_basis() {
             "file replaced by a directory",
             Some(&live),
             Some(file_node(&live)),
+            Some(EntryKind::Dir),
+            CasDecision::Accept,
+        ),
+        (
+            "directory replaced by a file",
+            Some(&live_dir),
+            Some(file_node(&live_dir)),
+            Some(EntryKind::File),
+            CasDecision::Accept,
+        ),
+        (
+            "file replaced by a symlink",
+            Some(&live),
+            Some(file_node(&live)),
+            Some(EntryKind::Symlink),
+            CasDecision::Accept,
+        ),
+        (
+            "kind change on a stale basis",
+            Some(&live),
+            Some(file_node(&rival)),
             Some(EntryKind::Dir),
             CasDecision::Reject {
                 current: Some(live.clone()),
