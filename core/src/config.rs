@@ -162,7 +162,35 @@ pub enum ConfigError {
     BadHostPath { field: String, value: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum ReloadError {
+    #[error("restart required to change {fields:?}")]
+    RestartRequired { fields: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasterReload {
+    pub log_level: String,
+    pub watcher_debounce_ms: u64,
+    pub rescan_interval_seconds: u64,
+    pub max_checkouts_per_slave: u32,
+    pub max_connections: u32,
+    pub max_connection_attempts_per_minute: u32,
+    pub drop_slave_ids: Vec<String>,
+    pub drop_peers: Vec<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlaveReload {
+    pub log_level: String,
+    pub watcher_debounce_ms: u64,
+    pub rescan_interval_seconds: u64,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub resubscribe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedMaster {
     slaves: Vec<LoadedAcl>,
     by_key: HashMap<[u8; 32], usize>,
@@ -178,14 +206,14 @@ pub struct LoadedMaster {
     max_connection_attempts_per_minute: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedAcl {
     id: String,
     public_keys: Vec<[u8; 32]>,
     allowed_prefixes: Vec<CanonicalPath>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedSlave {
     slave_id: String,
     master_addr: String,
@@ -199,7 +227,7 @@ pub struct LoadedSlave {
     max_checkouts_per_slave: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedCheckout {
     id: CheckoutId,
     central: CanonicalPath,
@@ -237,6 +265,10 @@ impl LoadedMaster {
 
     pub fn acl_for_public_key(&self, pin: &[u8; 32]) -> Option<&LoadedAcl> {
         self.by_key.get(pin).map(|&i| &self.slaves[i])
+    }
+
+    pub fn acl_for_id(&self, id: &str) -> Option<&LoadedAcl> {
+        self.slaves.iter().find(|acl| acl.id == id)
     }
 
     pub fn listen_addr(&self) -> SocketAddr {
@@ -277,6 +309,50 @@ impl LoadedMaster {
 
     pub fn max_connection_attempts_per_minute(&self) -> u32 {
         self.max_connection_attempts_per_minute
+    }
+
+    pub fn plan_reload(&self, next: &Self) -> Result<MasterReload, ReloadError> {
+        let mut fields = Vec::new();
+        if self.listen_addr != next.listen_addr {
+            fields.push("listen_addr".into());
+        }
+        if self.db_path != next.db_path {
+            fields.push("db_path".into());
+        }
+        if self.central_root != next.central_root {
+            fields.push("central_root".into());
+        }
+        if self.master_key_path != next.master_key_path {
+            fields.push("master_key_path".into());
+        }
+        fields.sort();
+        if !fields.is_empty() {
+            return Err(ReloadError::RestartRequired { fields });
+        }
+
+        let next_by_id: HashMap<&str, &LoadedAcl> = next
+            .slaves
+            .iter()
+            .map(|acl| (acl.id.as_str(), acl))
+            .collect();
+        let mut drop_slave_ids: Vec<String> = self
+            .slaves
+            .iter()
+            .filter(|acl| !next_by_id.contains_key(acl.id.as_str()))
+            .map(|acl| acl.id.clone())
+            .collect();
+        drop_slave_ids.sort();
+
+        Ok(MasterReload {
+            log_level: next.log_level.clone(),
+            watcher_debounce_ms: next.watcher_debounce_ms,
+            rescan_interval_seconds: next.rescan_interval_seconds,
+            max_checkouts_per_slave: next.max_checkouts_per_slave,
+            max_connections: next.max_connections,
+            max_connection_attempts_per_minute: next.max_connection_attempts_per_minute,
+            drop_slave_ids,
+            drop_peers: Vec::new(),
+        })
     }
 }
 
@@ -375,6 +451,65 @@ impl LoadedSlave {
 
     pub fn max_checkouts_per_slave(&self) -> u32 {
         self.max_checkouts_per_slave
+    }
+
+    pub fn plan_reload(&self, next: &Self) -> Result<SlaveReload, ReloadError> {
+        let mut fields = Vec::new();
+        if self.master_addr != next.master_addr {
+            fields.push("master_addr".into());
+        }
+        if self.db_path != next.db_path {
+            fields.push("db_path".into());
+        }
+        if self.slave_key_path != next.slave_key_path {
+            fields.push("slave_key_path".into());
+        }
+        if self.slave_id != next.slave_id {
+            fields.push("slave_id".into());
+        }
+        fields.sort();
+        if !fields.is_empty() {
+            return Err(ReloadError::RestartRequired { fields });
+        }
+
+        let same_identity = |a: &LoadedCheckout, b: &LoadedCheckout| {
+            a.id == b.id && a.central == b.central && a.local == b.local
+        };
+        let removed: Vec<String> = self
+            .checkouts
+            .iter()
+            .filter(|current| {
+                !next
+                    .checkouts
+                    .iter()
+                    .any(|upcoming| same_identity(current, upcoming))
+            })
+            .map(|current| current.id.as_str().to_string())
+            .collect();
+        let added: Vec<String> = next
+            .checkouts
+            .iter()
+            .filter(|upcoming| {
+                !self
+                    .checkouts
+                    .iter()
+                    .any(|current| same_identity(current, upcoming))
+            })
+            .map(|upcoming| upcoming.id.as_str().to_string())
+            .collect();
+        let mut removed = removed;
+        let mut added = added;
+        removed.sort();
+        added.sort();
+        let resubscribe = !added.is_empty() || !removed.is_empty();
+        Ok(SlaveReload {
+            log_level: next.log_level.clone(),
+            watcher_debounce_ms: next.watcher_debounce_ms,
+            rescan_interval_seconds: next.rescan_interval_seconds,
+            added,
+            removed,
+            resubscribe,
+        })
     }
 }
 
@@ -579,10 +714,21 @@ fn check_id(field: &str, value: &str) -> Result<(), ConfigError> {
     }
 }
 
+pub fn log_level_filter(level: &str) -> Option<log::LevelFilter> {
+    match level {
+        "error" => Some(log::LevelFilter::Error),
+        "warn" => Some(log::LevelFilter::Warn),
+        "info" => Some(log::LevelFilter::Info),
+        "debug" => Some(log::LevelFilter::Debug),
+        "trace" => Some(log::LevelFilter::Trace),
+        _ => None,
+    }
+}
+
 fn check_log_level(value: &str) -> Result<(), ConfigError> {
-    match value {
-        "error" | "warn" | "info" | "debug" | "trace" => Ok(()),
-        _ => Err(ConfigError::BadLogLevel {
+    match log_level_filter(value) {
+        Some(_) => Ok(()),
+        None => Err(ConfigError::BadLogLevel {
             value: value.into(),
         }),
     }

@@ -28,6 +28,16 @@ fn attempt_limiter_caps_one_ip_inside_the_window() {
     assert!(limiter.allow(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), t0));
 }
 
+#[test]
+fn attempt_limiter_set_max_applies_to_the_next_allow() {
+    let mut limiter = AttemptLimiter::new(2);
+    let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let t0 = Instant::now();
+    assert!(limiter.allow(ip, t0));
+    limiter.set_max(1);
+    assert!(!limiter.allow(ip, t0));
+}
+
 #[tokio::test]
 async fn xx_accept_exposes_the_peer_static_key() {
     let dir = tempfile::tempdir().unwrap();

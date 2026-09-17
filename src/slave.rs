@@ -1,5 +1,6 @@
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -7,21 +8,30 @@ use std::time::Duration;
 use anyhow::Context;
 use arborsync_core::keys::read_static_key;
 use arborsync_core::path::local_to_canonical;
-use arborsync_core::slave::{LocalEvent, Reply, Slave, WholeFileLater};
+use arborsync_core::slave::{LocalEvent, Reply, Slave, SlaveError, WholeFileLater};
 use arborsync_core::storage::Storage;
 use arborsync_core::transport::{
     accept_bulk, client_endpoint, connect, open_control, peer_static_key, read_control, write_bulk,
     write_control,
 };
-use arborsync_core::{CanonicalPath, LoadedSlave, RedbStorage};
+use arborsync_core::{CanonicalPath, LoadedSlave, RedbStorage, ReloadError, SlaveReload};
 use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::reload::{apply_file_log_level, spawn_config_watch};
 
 type SharedSlave = Arc<Mutex<Slave<RedbStorage, WholeFileLater>>>;
 
 enum Work {
     Local { checkout: String, event: LocalEvent },
     Rescan { checkout: String },
+}
+
+enum WatchStop {
+    Restart,
+    Removed,
 }
 
 pub fn run(config: Option<PathBuf>) -> anyhow::Result<()> {
@@ -32,6 +42,7 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
     let config_path = config.unwrap_or_else(default_config_path);
     let cfg = LoadedSlave::load(&config_path)
         .with_context(|| format!("load {}", config_path.display()))?;
+    apply_file_log_level(cfg.log_level());
 
     let secret = read_static_key(cfg.slave_key_path())
         .with_context(|| format!("read {}", cfg.slave_key_path().display()))?;
@@ -42,8 +53,6 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
     let store = RedbStorage::open(cfg.db_path())
         .with_context(|| format!("open cache {}", cfg.db_path().display()))?;
 
-    let debounce = Duration::from_millis(cfg.watcher_debounce_ms());
-    let rescan_every = Duration::from_secs(cfg.rescan_interval_seconds());
     let slave = Arc::new(Mutex::new(Slave::open(cfg, store, WholeFileLater)?));
     let watched = {
         let guard = slave.lock().expect("slave");
@@ -51,29 +60,135 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
         guard.watched_checkouts()
     };
 
+    let watch_gen = Arc::new(AtomicU64::new(0));
     let (work_tx, mut work_rx) = tokio::sync::mpsc::unbounded_channel();
-    for (id, local, central) in watched {
-        let tx = work_tx.clone();
-        std::thread::spawn(move || {
-            loop {
-                if let Err(err) = watch_checkout(&id, &local, &central, debounce, rescan_every, &tx)
-                {
-                    log::warn!("watch {id} stopped: {err}");
-                }
-            }
-        });
-    }
+    spawn_checkout_watchers(
+        watched.into_iter().map(|(id, _, _)| id),
+        &slave,
+        &work_tx,
+        &watch_gen,
+    );
+
+    let mut hangup = signal(SignalKind::hangup())?;
+    let (cfg_tx, mut cfg_rx) = tokio::sync::mpsc::unbounded_channel();
+    spawn_config_watch(config_path.clone(), cfg_tx);
 
     let mut backoff = Duration::from_secs(1);
     loop {
-        match session(&secret, &slave, &mut work_rx).await {
+        match session(
+            &secret,
+            &slave,
+            &mut work_rx,
+            &mut hangup,
+            &mut cfg_rx,
+            &config_path,
+            &work_tx,
+            &watch_gen,
+        )
+        .await
+        {
             Ok(()) => backoff = Duration::from_secs(1),
             Err(err) => {
                 log::warn!("{err:#}");
-                tokio::time::sleep(backoff).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = hangup.recv() => {
+                        reload_slave_from_disk(&config_path, &slave, &work_tx, &watch_gen);
+                    }
+                    Some(()) = cfg_rx.recv() => {
+                        reload_slave_from_disk(&config_path, &slave, &work_tx, &watch_gen);
+                    }
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(60));
             }
         }
+    }
+}
+
+fn reload_slave_from_disk(
+    path: &Path,
+    slave: &SharedSlave,
+    work_tx: &UnboundedSender<Work>,
+    watch_gen: &Arc<AtomicU64>,
+) -> Option<SlaveReload> {
+    let next = match LoadedSlave::load(path) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            log::warn!("reload {}: {err}", path.display());
+            return None;
+        }
+    };
+    let (old_debounce, old_rescan) = {
+        let guard = slave.lock().expect("slave");
+        (guard.watcher_debounce_ms(), guard.rescan_interval_seconds())
+    };
+    let mut guard = slave.lock().expect("slave");
+    match guard.reload(next) {
+        Ok(plan) => {
+            apply_file_log_level(&plan.log_level);
+            if plan.watcher_debounce_ms != old_debounce
+                || plan.rescan_interval_seconds != old_rescan
+            {
+                watch_gen.fetch_add(1, Ordering::Relaxed);
+            }
+            drop(guard);
+            spawn_checkout_watchers(plan.added.iter().cloned(), slave, work_tx, watch_gen);
+            Some(plan)
+        }
+        Err(SlaveError::Reload(ReloadError::RestartRequired { fields })) => {
+            log::warn!("reload requires restart: {}", fields.join(", "));
+            None
+        }
+        Err(err) => {
+            log::warn!("reload {}: {err}", path.display());
+            None
+        }
+    }
+}
+
+fn spawn_checkout_watchers(
+    ids: impl IntoIterator<Item = String>,
+    slave: &SharedSlave,
+    work_tx: &UnboundedSender<Work>,
+    watch_gen: &Arc<AtomicU64>,
+) {
+    let watched = slave.lock().expect("slave").watched_checkouts();
+    for id in ids {
+        let Some((_, local, central)) = watched.iter().find(|(cid, ..)| cid == &id) else {
+            continue;
+        };
+        let local = local.clone();
+        let central = central.clone();
+        let slave = slave.clone();
+        let work_tx = work_tx.clone();
+        let watch_gen = watch_gen.clone();
+        std::thread::spawn(move || {
+            loop {
+                let (debounce, rescan_every, start_gen) = {
+                    let guard = slave.lock().expect("slave");
+                    (
+                        Duration::from_millis(guard.watcher_debounce_ms()),
+                        Duration::from_secs(guard.rescan_interval_seconds()),
+                        watch_gen.load(Ordering::Relaxed),
+                    )
+                };
+                match watch_checkout(
+                    &id,
+                    &local,
+                    &central,
+                    debounce,
+                    rescan_every,
+                    &work_tx,
+                    &slave,
+                    &watch_gen,
+                    start_gen,
+                ) {
+                    Ok(WatchStop::Removed) => return,
+                    Ok(WatchStop::Restart) => {}
+                    Err(err) => log::warn!("watch {id} stopped: {err}"),
+                }
+            }
+        });
     }
 }
 
@@ -81,6 +196,11 @@ async fn session(
     secret: &[u8; 32],
     slave: &SharedSlave,
     work: &mut tokio::sync::mpsc::UnboundedReceiver<Work>,
+    hangup: &mut Signal,
+    config_rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    config_path: &Path,
+    work_tx: &UnboundedSender<Work>,
+    watch_gen: &Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     let (addr_text, subscribe) = {
         let guard = slave.lock().expect("slave");
@@ -133,21 +253,74 @@ async fn session(
                 };
                 match work {
                     Work::Local { checkout, event } => {
-                        let outs = slave.lock().expect("slave").note_local(&checkout, event)?;
-                        for out in outs {
-                            write_control(&mut send, &out).await?;
+                        match slave.lock().expect("slave").note_local(&checkout, event) {
+                            Ok(outs) => {
+                                for out in outs {
+                                    write_control(&mut send, &out).await?;
+                                }
+                            }
+                            Err(SlaveError::UnknownCheckout(_)) => {}
+                            Err(err) => return Err(err.into()),
                         }
                     }
                     Work::Rescan { checkout } => {
-                        let outs = slave.lock().expect("slave").rescan(&checkout)?;
-                        for out in outs {
-                            write_control(&mut send, &out).await?;
+                        match slave.lock().expect("slave").rescan(&checkout) {
+                            Ok(outs) => {
+                                for out in outs {
+                                    write_control(&mut send, &out).await?;
+                                }
+                            }
+                            Err(SlaveError::UnknownCheckout(_)) => {}
+                            Err(err) => return Err(err.into()),
                         }
                     }
                 }
             }
+            _ = hangup.recv() => {
+                apply_live_slave_reload(
+                    config_path,
+                    slave,
+                    work_tx,
+                    watch_gen,
+                    peer,
+                    &mut send,
+                )
+                .await?;
+            }
+            Some(()) = config_rx.recv() => {
+                apply_live_slave_reload(
+                    config_path,
+                    slave,
+                    work_tx,
+                    watch_gen,
+                    peer,
+                    &mut send,
+                )
+                .await?;
+            }
         }
     }
+}
+
+async fn apply_live_slave_reload(
+    config_path: &Path,
+    slave: &SharedSlave,
+    work_tx: &UnboundedSender<Work>,
+    watch_gen: &Arc<AtomicU64>,
+    peer: [u8; 32],
+    send: &mut quinn::SendStream,
+) -> anyhow::Result<()> {
+    let Some(plan) = reload_slave_from_disk(config_path, slave, work_tx, watch_gen) else {
+        return Ok(());
+    };
+    if let Err(Reply::Hangup { reason }) = slave.lock().expect("slave").pin_check(peer) {
+        anyhow::bail!("{reason}");
+    }
+    if plan.resubscribe {
+        let subscribe = slave.lock().expect("slave").subscribe();
+        write_control(send, &subscribe).await?;
+    }
+    Ok(())
 }
 
 async fn dispatch_slave(
@@ -176,8 +349,14 @@ fn watch_checkout(
     central: &CanonicalPath,
     debounce: Duration,
     rescan_every: Duration,
-    tx: &tokio::sync::mpsc::UnboundedSender<Work>,
-) -> anyhow::Result<()> {
+    tx: &UnboundedSender<Work>,
+    slave: &SharedSlave,
+    watch_gen: &AtomicU64,
+    start_gen: u64,
+) -> anyhow::Result<WatchStop> {
+    if !still_this_checkout(slave, checkout, local, central) {
+        return Ok(WatchStop::Removed);
+    }
     let (notify_tx, rx) = mpsc::channel::<DebounceEventResult>();
     let mut debouncer = new_debouncer(debounce, notify_tx)?;
     debouncer
@@ -186,6 +365,12 @@ fn watch_checkout(
         .with_context(|| format!("watch {}", local.display()))?;
 
     loop {
+        if !still_this_checkout(slave, checkout, local, central) {
+            return Ok(WatchStop::Removed);
+        }
+        if watch_gen.load(Ordering::Relaxed) != start_gen {
+            return Ok(WatchStop::Restart);
+        }
         match rx.recv_timeout(rescan_every) {
             Ok(Ok(events)) => {
                 for event in events {
@@ -205,9 +390,22 @@ fn watch_checkout(
                 })
                 .context("session dropped")?;
             }
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(RecvTimeoutError::Disconnected) => return Ok(WatchStop::Restart),
         }
     }
+}
+
+fn still_this_checkout(
+    slave: &SharedSlave,
+    checkout: &str,
+    local: &Path,
+    central: &CanonicalPath,
+) -> bool {
+    slave.lock().expect("slave").watched_checkouts().iter().any(
+        |(id, watched_local, watched_central)| {
+            id == checkout && watched_local == local && watched_central == central
+        },
+    )
 }
 
 fn note(
@@ -215,7 +413,7 @@ fn note(
     local: &Path,
     central: &CanonicalPath,
     host: &Path,
-    tx: &tokio::sync::mpsc::UnboundedSender<Work>,
+    tx: &UnboundedSender<Work>,
 ) -> anyhow::Result<()> {
     match local_to_canonical(local, central, host) {
         Ok(path) => tx

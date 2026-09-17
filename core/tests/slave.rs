@@ -1,5 +1,5 @@
 use arborsync_core::LoadedSlave;
-use arborsync_core::config::CheckoutConfig;
+use arborsync_core::config::{CheckoutConfig, ReloadError};
 use arborsync_core::hash::ContentHash;
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::merkle::file_node;
@@ -7,8 +7,8 @@ use arborsync_core::meta::{FileMetadata, hash_bytes};
 use arborsync_core::path::{RESERVED_CONFLICTS, conflict_sidecar_path};
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::slave::{
-    DeleteAction, LocalEvent, MemoryContent, ReplicaAction, Reply, Slave, decide_incoming,
-    decide_master_won_delete,
+    DeleteAction, LocalEvent, MemoryContent, ReplicaAction, Reply, Slave, SlaveError,
+    decide_incoming, decide_master_won_delete,
 };
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
 
@@ -252,4 +252,95 @@ fn echo_of_an_applied_announce_does_not_reannounce() {
         .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
         .unwrap();
     assert!(out.is_empty());
+}
+
+#[test]
+fn reload_adds_a_checkout_and_subscribe_lists_it() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let src = sandbox.add_checkout("dev-alice", "src");
+    let docs = sandbox.add_checkout("dev-alice", "docs");
+    let next = LoadedSlave::load(&sandbox.write_slave_config(
+        "dev-alice",
+        vec![
+            CheckoutConfig {
+                id: "src".into(),
+                central: "/src".into(),
+                local: src.to_string_lossy().into_owned(),
+            },
+            CheckoutConfig {
+                id: "docs".into(),
+                central: "/docs".into(),
+                local: docs.to_string_lossy().into_owned(),
+            },
+        ],
+        vec![format_hex_key(&MASTER)],
+    ))
+    .unwrap();
+
+    let plan = slave.reload(next).unwrap();
+    assert_eq!(plan.added, vec!["docs".to_string()]);
+    assert_eq!(plan.resubscribe, true);
+    let docs_local = docs.canonicalize().unwrap();
+    assert_eq!(slave.checkout_local("docs"), Some(docs_local.as_path()));
+
+    match slave.subscribe() {
+        ProtocolMessage::Subscribe { checkouts, .. } => {
+            let mut ids: Vec<_> = checkouts.iter().map(|c| c.id.as_str()).collect();
+            ids.sort();
+            assert_eq!(ids, ["docs", "src"]);
+        }
+        other => panic!("expected Subscribe, got {other:?}"),
+    }
+}
+
+#[test]
+fn reload_removes_a_checkout_and_drops_its_index() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("hello.txt", b"keep");
+    slave
+        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap();
+    assert!(slave.meta("src", &p("/src/hello.txt")).unwrap().is_some());
+
+    let next = LoadedSlave::load(&sandbox.write_slave_config(
+        "dev-alice",
+        vec![],
+        vec![format_hex_key(&MASTER)],
+    ))
+    .unwrap();
+    let plan = slave.reload(next).unwrap();
+    assert_eq!(plan.removed, vec!["src".to_string()]);
+    assert_eq!(slave.checkout_local("src"), None);
+    match slave.meta("src", &p("/src/hello.txt")) {
+        Err(SlaveError::UnknownCheckout(id)) => assert_eq!(id, "src"),
+        other => panic!("expected UnknownCheckout, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(local.join("hello.txt")).unwrap(), b"keep");
+}
+
+#[test]
+fn reload_rejects_slave_id_change_and_keeps_checkouts() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let src = slave.checkout_local("src").unwrap().to_path_buf();
+    let next = LoadedSlave::load(&sandbox.write_slave_config(
+        "dev-bob",
+        vec![CheckoutConfig {
+            id: "src".into(),
+            central: "/src".into(),
+            local: src.to_string_lossy().into_owned(),
+        }],
+        vec![format_hex_key(&MASTER)],
+    ))
+    .unwrap();
+    match slave.reload(next) {
+        Err(SlaveError::Reload(ReloadError::RestartRequired { fields })) => {
+            assert!(fields.contains(&"slave_id".to_string()));
+        }
+        other => panic!("expected RestartRequired, got {other:?}"),
+    }
+    assert_eq!(slave.checkout_local("src"), Some(src.as_path()));
 }

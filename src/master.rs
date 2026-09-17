@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use arborsync_core::ReloadError;
 use arborsync_core::keys::read_static_key;
 use arborsync_core::master::{LocalEvent, Master, Reply, WholeFileLater};
 use arborsync_core::path::host_to_canonical;
@@ -17,10 +19,18 @@ use arborsync_core::{LoadedMaster, RedbStorage};
 use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
 use quinn::Incoming;
+use tokio::signal::unix::{SignalKind, signal};
+
+use crate::reload::{apply_file_log_level, spawn_config_watch};
 
 const DEFAULT_CONFIG: &str = "/etc/arborsync/master.toml";
 
 type SharedMaster = Arc<Mutex<Master<RedbStorage, WholeFileLater>>>;
+
+struct SessionHandle {
+    replaced: tokio::sync::watch::Sender<bool>,
+    conn: quinn::Connection,
+}
 
 pub fn run(config: Option<PathBuf>) -> anyhow::Result<()> {
     tokio::runtime::Runtime::new()?.block_on(run_async(config))
@@ -30,6 +40,7 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
     let config_path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG));
     let cfg = LoadedMaster::load(&config_path)
         .with_context(|| format!("load {}", config_path.display()))?;
+    apply_file_log_level(cfg.log_level());
 
     let secret = read_static_key(cfg.master_key_path())
         .with_context(|| format!("read {}", cfg.master_key_path().display()))?;
@@ -40,8 +51,6 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
     let store = RedbStorage::open(cfg.db_path())
         .with_context(|| format!("open index {}", cfg.db_path().display()))?;
 
-    let debounce = Duration::from_millis(cfg.watcher_debounce_ms());
-    let rescan_every = Duration::from_secs(cfg.rescan_interval_seconds());
     let listen_addr = cfg.listen_addr();
     let max_attempts = cfg.max_connection_attempts_per_minute();
 
@@ -53,10 +62,22 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
         endpoint.local_addr()?
     );
 
+    let watch_gen = Arc::new(AtomicU64::new(0));
     let watched = master.clone();
+    let watched_gen = watch_gen.clone();
     std::thread::spawn(move || {
         loop {
-            if let Err(err) = watch_central(&watched, debounce, rescan_every) {
+            let (debounce, rescan_every, start_gen) = {
+                let guard = watched.lock().expect("master");
+                (
+                    Duration::from_millis(guard.watcher_debounce_ms()),
+                    Duration::from_secs(guard.rescan_interval_seconds()),
+                    watched_gen.load(Ordering::Relaxed),
+                )
+            };
+            if let Err(err) =
+                watch_central(&watched, debounce, rescan_every, &watched_gen, start_gen)
+            {
                 log::warn!("filesystem watcher stopped: {err}");
             }
             if let Err(err) = watched.lock().expect("master").rescan() {
@@ -67,29 +88,85 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
     });
 
     let limiter = Arc::new(Mutex::new(AttemptLimiter::new(max_attempts)));
-    let sessions = Arc::new(Mutex::new(HashMap::<
-        String,
-        tokio::sync::watch::Sender<bool>,
-    >::new()));
+    let sessions = Arc::new(Mutex::new(HashMap::<String, SessionHandle>::new()));
+    let mut hangup = signal(SignalKind::hangup())?;
+    let (cfg_tx, mut cfg_rx) = tokio::sync::mpsc::unbounded_channel();
+    spawn_config_watch(config_path.clone(), cfg_tx);
 
-    while let Some(incoming) = endpoint.accept().await {
-        let master = master.clone();
-        let limiter = limiter.clone();
-        let sessions = sessions.clone();
-        tokio::spawn(async move {
-            if let Err(err) = accept_session(incoming, master, limiter, sessions).await {
-                log::warn!("{err:#}");
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    break;
+                };
+                let master = master.clone();
+                let limiter = limiter.clone();
+                let sessions = sessions.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = accept_session(incoming, master, limiter, sessions).await {
+                        log::warn!("{err:#}");
+                    }
+                });
             }
-        });
+            _ = hangup.recv() => {
+                reload_master_from_disk(&config_path, &master, &limiter, &sessions, &watch_gen);
+            }
+            Some(()) = cfg_rx.recv() => {
+                reload_master_from_disk(&config_path, &master, &limiter, &sessions, &watch_gen);
+            }
+        }
     }
     Ok(())
+}
+
+fn reload_master_from_disk(
+    path: &Path,
+    master: &SharedMaster,
+    limiter: &Mutex<AttemptLimiter>,
+    sessions: &Mutex<HashMap<String, SessionHandle>>,
+    watch_gen: &AtomicU64,
+) {
+    let next = match LoadedMaster::load(path) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            log::warn!("reload {}: {err}", path.display());
+            return;
+        }
+    };
+    let mut guard = master.lock().expect("master");
+    let old_debounce = guard.watcher_debounce_ms();
+    let old_rescan = guard.rescan_interval_seconds();
+    match guard.reload(next) {
+        Ok(plan) => {
+            limiter
+                .lock()
+                .expect("limiter")
+                .set_max(plan.max_connection_attempts_per_minute);
+            apply_file_log_level(&plan.log_level);
+            if plan.watcher_debounce_ms != old_debounce
+                || plan.rescan_interval_seconds != old_rescan
+            {
+                watch_gen.fetch_add(1, Ordering::Relaxed);
+            }
+            drop(guard);
+            let mut live = sessions.lock().expect("sessions");
+            for id in &plan.drop_slave_ids {
+                if let Some(handle) = live.remove(id) {
+                    handle.conn.close(0u32.into(), b"acl reload");
+                }
+            }
+        }
+        Err(ReloadError::RestartRequired { fields }) => {
+            log::warn!("reload requires restart: {}", fields.join(", "));
+        }
+    }
 }
 
 async fn accept_session(
     incoming: Incoming,
     master: SharedMaster,
     limiter: Arc<Mutex<AttemptLimiter>>,
-    sessions: Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
+    sessions: Arc<Mutex<HashMap<String, SessionHandle>>>,
 ) -> anyhow::Result<()> {
     let conn = incoming.await.context("handshake")?;
     let peer = peer_static_key(&conn).context("peer static key")?;
@@ -118,8 +195,14 @@ async fn accept_session(
             conn.close(0u32.into(), b"max connections");
             return Ok(());
         }
-        if let Some(previous) = live.insert(slave_id.clone(), stop_tx) {
-            let _ = previous.send(true);
+        if let Some(previous) = live.insert(
+            slave_id.clone(),
+            SessionHandle {
+                replaced: stop_tx,
+                conn: conn.clone(),
+            },
+        ) {
+            let _ = previous.replaced.send(true);
         }
     }
 
@@ -200,6 +283,8 @@ fn watch_central(
     master: &SharedMaster,
     debounce: Duration,
     rescan_every: Duration,
+    watch_gen: &AtomicU64,
+    start_gen: u64,
 ) -> anyhow::Result<()> {
     let root = master.lock().expect("master").central_root().to_path_buf();
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
@@ -211,6 +296,9 @@ fn watch_central(
     master.lock().expect("master").rescan()?;
 
     loop {
+        if watch_gen.load(Ordering::Relaxed) != start_gen {
+            return Ok(());
+        }
         match rx.recv_timeout(rescan_every) {
             Ok(Ok(events)) => {
                 for event in events {

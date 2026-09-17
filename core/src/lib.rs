@@ -20,7 +20,10 @@ pub mod transport;
 
 pub mod test_support;
 
-pub use config::{ConfigError, LoadedAcl, LoadedCheckout, LoadedMaster, LoadedSlave};
+pub use config::{
+    ConfigError, LoadedAcl, LoadedCheckout, LoadedMaster, LoadedSlave, MasterReload, ReloadError,
+    SlaveReload, log_level_filter,
+};
 pub use hash::{ContentHash, DirNode, FileNode, SubtreeRoot};
 pub use keys::{
     KeyError, format_hex_key, parse_hex_key, public_from_secret, read_static_key, write_static_key,

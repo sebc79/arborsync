@@ -1,5 +1,5 @@
 use arborsync_core::LoadedMaster;
-use arborsync_core::config::SlaveAcl;
+use arborsync_core::config::{ReloadError, SlaveAcl};
 use arborsync_core::hash::{ContentHash, FileNode};
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{CasDecision, LocalEvent, Master, MemoryContent, Reply, decide_cas};
@@ -539,4 +539,121 @@ fn open_indexes_a_central_tree_that_predates_the_index() {
         master.meta(&p("/src")).unwrap().unwrap().kind,
         EntryKind::Dir
     );
+}
+
+fn root_report(id: &str, central: &str) -> ProtocolMessage {
+    ProtocolMessage::RootReport {
+        checkout_id: id.into(),
+        path: p(central),
+        root: merkle::empty_dir_node().into(),
+    }
+}
+
+#[test]
+fn reload_removes_acl_and_forgets_the_live_session() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let next = LoadedMaster::load(&sandbox.write_master_config(vec![slave_acl(
+        "backup-1",
+        BACKUP,
+        &["/"],
+    )]))
+    .unwrap();
+    let plan = master.reload(next).unwrap();
+    assert!(plan.drop_peers.contains(&ALICE));
+    assert_eq!(plan.drop_slave_ids, vec!["dev-alice".to_string()]);
+    assert_eq!(master.authorize_peer(&ALICE), None);
+
+    match master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap()
+    {
+        Reply::Hangup { reason } => assert_eq!(reason, "unknown static key"),
+        other => panic!("expected Hangup, got {other:?}"),
+    }
+}
+
+#[test]
+fn reload_tightens_prefix_and_drops_that_checkout() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(
+            BACKUP,
+            subscribe("backup-1", &[("src", "/src"), ("bak", "/")]),
+        )
+        .unwrap();
+
+    let next = LoadedMaster::load(&sandbox.write_master_config(vec![
+        slave_acl("dev-alice", ALICE, &["/src"]),
+        slave_acl("backup-1", BACKUP, &["/src"]),
+    ]))
+    .unwrap();
+    master.reload(next).unwrap();
+
+    match master.handle(BACKUP, root_report("bak", "/")).unwrap() {
+        Reply::Send(ProtocolMessage::Error { code, .. }) => assert_eq!(code, "not_subscribed"),
+        other => panic!("expected not_subscribed, got {other:?}"),
+    }
+    match master.handle(BACKUP, root_report("src", "/src")).unwrap() {
+        Reply::Send(ProtocolMessage::Error { code, .. }) => {
+            assert_ne!(code, "not_subscribed")
+        }
+        Reply::Send(ProtocolMessage::RootAck { checkout_id, .. }) => {
+            assert_eq!(checkout_id, "src")
+        }
+        other => panic!("expected RootAck or non-not_subscribed, got {other:?}"),
+    }
+}
+
+#[test]
+fn reload_keeps_old_cfg_when_listen_addr_changes() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let path = sandbox.write_master_config(vec![
+        slave_acl("dev-alice", ALICE, &["/src"]),
+        slave_acl("backup-1", BACKUP, &["/"]),
+    ]);
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("127.0.0.1:0", "127.0.0.1:9443");
+    let next = LoadedMaster::parse(&text).unwrap();
+    match master.reload(next) {
+        Err(ReloadError::RestartRequired { fields }) => {
+            assert!(fields.contains(&"listen_addr".to_string()));
+        }
+        other => panic!("expected RestartRequired, got {other:?}"),
+    }
+    assert_eq!(master.authorize_peer(&ALICE), Some("dev-alice"));
+}
+
+#[test]
+fn reload_accepts_an_extra_rotation_key() {
+    const ALICE_NEW: [u8; 32] = [0xA2; 32];
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let next = LoadedMaster::load(&sandbox.write_master_config(vec![
+        SlaveAcl {
+            id: "dev-alice".into(),
+            public_keys: vec![format_hex_key(&ALICE), format_hex_key(&ALICE_NEW)],
+            allowed_prefixes: vec!["/src".into()],
+        },
+        slave_acl("backup-1", BACKUP, &["/"]),
+    ]))
+    .unwrap();
+    master.reload(next).unwrap();
+    assert_eq!(master.authorize_peer(&ALICE), Some("dev-alice"));
+    assert_eq!(master.authorize_peer(&ALICE_NEW), Some("dev-alice"));
 }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::apply;
-use crate::config::LoadedSlave;
+use crate::config::{LoadedSlave, ReloadError, SlaveReload};
 use crate::hash::{ContentHash, FileNode};
 use crate::index;
 use crate::merkle::{DirChild, file_node};
@@ -46,6 +46,8 @@ pub enum SlaveError {
     Path(#[from] PathError),
     #[error("unknown checkout {0}")]
     UnknownCheckout(String),
+    #[error(transparent)]
+    Reload(#[from] ReloadError),
 }
 
 impl SlaveError {
@@ -131,6 +133,10 @@ impl Inflight {
             window: debounce * 2,
             entries: HashMap::new(),
         }
+    }
+
+    fn set_window(&mut self, debounce: Duration) {
+        self.window = debounce * 2;
     }
 
     fn arm(&mut self, path: CanonicalPath, hash: ContentHash) {
@@ -243,6 +249,62 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             .iter()
             .map(|(id, checkout)| (id.clone(), checkout.local.clone(), checkout.central.clone()))
             .collect()
+    }
+
+    pub fn watcher_debounce_ms(&self) -> u64 {
+        self.cfg.watcher_debounce_ms()
+    }
+
+    pub fn rescan_interval_seconds(&self) -> u64 {
+        self.cfg.rescan_interval_seconds()
+    }
+
+    pub fn log_level(&self) -> &str {
+        self.cfg.log_level()
+    }
+
+    pub fn reload(&mut self, next: LoadedSlave) -> Result<SlaveReload, SlaveError> {
+        let plan = self.cfg.plan_reload(&next)?;
+        let debounce = Duration::from_millis(next.watcher_debounce_ms());
+        let debounce_changed = next.watcher_debounce_ms() != self.cfg.watcher_debounce_ms();
+
+        for id in &plan.removed {
+            if let Some(checkout) = self.checkouts.remove(id) {
+                self.store
+                    .delete_checkout(&checkout.id)
+                    .map_err(SlaveError::index)?;
+            }
+            self.pending.retain(|(checkout, _), _| checkout != id);
+            self.pending_pulls.retain(|(checkout, _)| checkout != id);
+        }
+
+        for id in &plan.added {
+            let loaded = next
+                .checkout(id)
+                .ok_or_else(|| SlaveError::UnknownCheckout(id.clone()))?;
+            let configured = loaded.local().to_path_buf();
+            fs::create_dir_all(&configured).map_err(SlaveError::io(&configured))?;
+            let local = fs::canonicalize(&configured).map_err(SlaveError::io(&configured))?;
+            apply::wipe_tmp(&local)?;
+            self.checkouts.insert(
+                id.clone(),
+                Checkout {
+                    id: loaded.id().clone(),
+                    central: loaded.central().clone(),
+                    local,
+                    inflight: Inflight::new(debounce),
+                },
+            );
+        }
+
+        if debounce_changed {
+            for checkout in self.checkouts.values_mut() {
+                checkout.inflight.set_window(debounce);
+            }
+        }
+
+        self.cfg = next;
+        Ok(plan)
     }
 
     pub fn handle(&mut self, msg: ProtocolMessage) -> Result<Reply, SlaveError> {
