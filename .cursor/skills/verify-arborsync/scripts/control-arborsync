@@ -1,0 +1,405 @@
+#!/usr/bin/env bash
+# Isolated ArborSync pair for verification. Invocation is in SKILL.md.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+# Cursor sandboxes sometimes redirect CARGO_TARGET_DIR. Verification always
+# uses the repo target so doctor and the feature map share one binary.
+export CARGO_TARGET_DIR="${REPO}/target"
+BIN="${CARGO_TARGET_DIR}/debug/arborsync"
+CURRENT_FILE="/tmp/arborsync-verify-current"
+
+usage() {
+  cat <<'EOF'
+control-arborsync — isolated ArborSync master+slave for verification
+
+  control-arborsync build
+  control-arborsync keygen --out PATH
+  control-arborsync launch [--run-id ID]
+  control-arborsync doctor [--run-id ID]
+  control-arborsync paths [--run-id ID]
+  control-arborsync wait-file PATH EXPECTED [--timeout SECS]
+  control-arborsync capture FEATURE_ID [--run-id ID]
+  control-arborsync cleanup [--run-id ID]
+
+Never drive /etc/arborsync or a user's live config. Never kill by process name.
+EOF
+}
+
+die() {
+  echo "control-arborsync: $*" >&2
+  exit 1
+}
+
+resolve_run_id() {
+  if [[ -n "${1:-}" ]]; then
+    echo "$1"
+    return
+  fi
+  if [[ -n "${ARBORSYNC_VERIFY_RUN_ID:-}" ]]; then
+    echo "$ARBORSYNC_VERIFY_RUN_ID"
+    return
+  fi
+  if [[ -f "$CURRENT_FILE" ]]; then
+    cat "$CURRENT_FILE"
+    return
+  fi
+  die "no current run; pass --run-id or run launch first"
+}
+
+root_for() {
+  echo "/tmp/arborsync-verify-$1"
+}
+
+artifacts_for() {
+  echo "/tmp/arborsync-verify-artifacts/$1"
+}
+
+state_for() {
+  echo "$(root_for "$1")/state.env"
+}
+
+load_state() {
+  local id="$1"
+  local state
+  state="$(state_for "$id")"
+  [[ -f "$state" ]] || die "missing state $state"
+  # shellcheck disable=SC1090
+  source "$state"
+}
+
+cmd_build() {
+  (cd "$REPO" && cargo build -q)
+  [[ -x "$BIN" ]] || die "binary missing after build: $BIN"
+  echo "$BIN"
+}
+
+cmd_keygen() {
+  local out=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --out)
+        out="${2:-}"
+        shift 2
+        ;;
+      *)
+        die "keygen usage: keygen --out PATH"
+        ;;
+    esac
+  done
+  [[ -n "$out" ]] || die "keygen usage: keygen --out PATH"
+  mkdir -p "$(dirname "$out")"
+  "$BIN" keygen --out "$out"
+}
+
+write_file_600() {
+  local path="$1"
+  local body="$2"
+  mkdir -p "$(dirname "$path")"
+  printf '%s' "$body" >"$path"
+  chmod 600 "$path"
+}
+
+wait_needle() {
+  local pid="$1"
+  local log="$2"
+  local needle="$3"
+  local timeout="${4:-10}"
+  local start
+  start="$(date +%s)"
+  while true; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      die "pid $pid exited before '$needle' appeared in $log"$'\n'"$(cat "$log" 2>/dev/null || true)"
+    fi
+    if grep -F -q -- "$needle" "$log" 2>/dev/null; then
+      cat "$log"
+      return 0
+    fi
+    if (( $(date +%s) - start >= timeout )); then
+      die "timed out waiting for '$needle' in $log"$'\n'"$(cat "$log" 2>/dev/null || true)"
+    fi
+    sleep 0.05
+  done
+}
+
+listen_addr_from_log() {
+  local log="$1"
+  awk -F'listening on ' '/listening on / { print $2; exit }' "$log" | tr -d '[:space:]'
+}
+
+cmd_launch() {
+  local run_id="${1:-}"
+  if [[ -z "$run_id" ]]; then
+    run_id="$(date +%Y%m%dT%H%M%S)-$$"
+  fi
+  cmd_build >/dev/null
+
+  local root artifacts
+  root="$(root_for "$run_id")"
+  artifacts="$(artifacts_for "$run_id")"
+  rm -rf "$root"
+  mkdir -p "$root/master/central" \
+    "$root/slaves/dev-alice/checkouts/src" \
+    "$artifacts"
+
+  local master_key="$root/master/master.key"
+  local slave_key="$root/slaves/dev-alice/slave.key"
+  local master_pub slave_pub
+  master_pub="$("$BIN" keygen --out "$master_key" | tr -d '[:space:]')"
+  slave_pub="$("$BIN" keygen --out "$slave_key" | tr -d '[:space:]')"
+  [[ "$master_pub" == hex:* ]] || die "master keygen stdout was not hex:… ($master_pub)"
+  [[ "$slave_pub" == hex:* ]] || die "slave keygen stdout was not hex:… ($slave_pub)"
+
+  local master_cfg="$root/master/master.toml"
+  write_file_600 "$master_cfg" "central_root = \"$root/master/central\"
+listen_addr = \"127.0.0.1:0\"
+master_key_path = \"$master_key\"
+db_path = \"$root/master/index.redb\"
+log_level = \"info\"
+watcher_debounce_ms = 200
+rescan_interval_seconds = 3600
+max_checkouts_per_slave = 100
+max_connections = 100
+max_connection_attempts_per_minute = 60
+
+[[slaves]]
+id = \"dev-alice\"
+public_keys = [\"$slave_pub\"]
+allowed_prefixes = [\"/src\"]
+"
+
+  local master_log="$root/master.log"
+  : >"$master_log"
+  ARBORSYNC_LOG_LEVEL=info nohup "$BIN" master --config "$master_cfg" \
+    >"$root/master.stdout" 2>"$master_log" &
+  local master_pid=$!
+  disown "$master_pid" 2>/dev/null || true
+  wait_needle "$master_pid" "$master_log" "listening on " 15 >/dev/null
+  local master_addr
+  master_addr="$(listen_addr_from_log "$master_log")"
+  [[ -n "$master_addr" ]] || die "could not parse listen address from $master_log"
+
+  local slave_cfg="$root/slaves/dev-alice/slave.toml"
+  local local_checkout="$root/slaves/dev-alice/checkouts/src"
+  write_file_600 "$slave_cfg" "slave_id = \"dev-alice\"
+master_addr = \"$master_addr\"
+slave_key_path = \"$slave_key\"
+master_public_keys = [\"$master_pub\"]
+db_path = \"$root/slaves/dev-alice/cache.redb\"
+log_level = \"info\"
+max_checkouts_per_slave = 100
+watcher_debounce_ms = 200
+rescan_interval_seconds = 3600
+
+checkouts = [
+    { id = \"src\", central = \"/src\", local = \"$local_checkout\" },
+]
+"
+
+  local slave_log="$root/slave.log"
+  : >"$slave_log"
+  ARBORSYNC_LOG_LEVEL=info nohup "$BIN" slave --config "$slave_cfg" \
+    >"$root/slave.stdout" 2>"$slave_log" &
+  local slave_pid=$!
+  disown "$slave_pid" 2>/dev/null || true
+  wait_needle "$slave_pid" "$slave_log" "connected to " 15 >/dev/null
+
+  cat >"$(state_for "$run_id")" <<EOF
+RUN_ID='$run_id'
+REPO='$REPO'
+BIN='$BIN'
+ROOT='$root'
+ARTIFACTS='$artifacts'
+MASTER_PID='$master_pid'
+SLAVE_PID='$slave_pid'
+MASTER_LOG='$master_log'
+SLAVE_LOG='$slave_log'
+MASTER_CONFIG='$master_cfg'
+SLAVE_CONFIG='$slave_cfg'
+MASTER_KEY='$master_key'
+SLAVE_KEY='$slave_key'
+CENTRAL_ROOT='$root/master/central'
+LOCAL='$local_checkout'
+MASTER_ADDR='$master_addr'
+SLAVE_ID='dev-alice'
+CHECKOUT_ID='src'
+EOF
+
+  printf '%s\n' "$run_id" >"$CURRENT_FILE"
+  echo "launched run $run_id master=$master_addr pid_master=$master_pid pid_slave=$slave_pid"
+  echo "state $(state_for "$run_id")"
+}
+
+cmd_doctor() {
+  local run_id="$1"
+  load_state "$run_id"
+  local ok=0
+
+  kill -0 "$MASTER_PID" 2>/dev/null || { echo "FAIL master pid $MASTER_PID is not running"; ok=1; }
+  kill -0 "$SLAVE_PID" 2>/dev/null || { echo "FAIL slave pid $SLAVE_PID is not running"; ok=1; }
+  [[ -x "$BIN" ]] || { echo "FAIL binary not executable: $BIN"; ok=1; }
+  grep -F -q "listening on $MASTER_ADDR" "$MASTER_LOG" || { echo "FAIL master log missing listening on $MASTER_ADDR"; ok=1; }
+  grep -F -q "connected to " "$SLAVE_LOG" || { echo "FAIL slave log missing connected to"; ok=1; }
+  [[ -d "$CENTRAL_ROOT" ]] || { echo "FAIL missing central_root $CENTRAL_ROOT"; ok=1; }
+  [[ -d "$LOCAL" ]] || { echo "FAIL missing checkout $LOCAL"; ok=1; }
+
+  local mode
+  mode="$(stat -f '%Lp' "$MASTER_CONFIG")"
+  [[ "$mode" == "600" ]] || { echo "FAIL master config mode $mode (want 600)"; ok=1; }
+  mode="$(stat -f '%Lp' "$SLAVE_CONFIG")"
+  [[ "$mode" == "600" ]] || { echo "FAIL slave config mode $mode (want 600)"; ok=1; }
+
+  if [[ "$ok" -ne 0 ]]; then
+    echo "doctor failed for run $run_id"
+    echo "--- master log ---"
+    cat "$MASTER_LOG" || true
+    echo "--- slave log ---"
+    cat "$SLAVE_LOG" || true
+    exit 1
+  fi
+
+  cat <<EOF
+ok run=$run_id
+bin=$BIN
+master_pid=$MASTER_PID
+slave_pid=$SLAVE_PID
+master_addr=$MASTER_ADDR
+central_root=$CENTRAL_ROOT
+local=$LOCAL
+slave_id=$SLAVE_ID
+checkout_id=$CHECKOUT_ID
+artifacts=$ARTIFACTS
+EOF
+}
+
+cmd_paths() {
+  local run_id="$1"
+  load_state "$run_id"
+  cat "$(state_for "$run_id")"
+}
+
+cmd_wait_file() {
+  local path="$1"
+  local expected="$2"
+  local timeout="${3:-15}"
+  local start
+  start="$(date +%s)"
+  while true; do
+    if [[ -f "$path" ]] && [[ "$(cat "$path")" == "$expected" ]]; then
+      echo "ok $path"
+      return 0
+    fi
+    if (( $(date +%s) - start >= timeout )); then
+      die "timed out waiting for $path to become '$expected'"$'\n'"actual=$(cat "$path" 2>/dev/null || echo '<missing>')"
+    fi
+    sleep 0.05
+  done
+}
+
+cmd_capture() {
+  local feature="$1"
+  local run_id="$2"
+  load_state "$run_id"
+  local dest="$ARTIFACTS/$feature"
+  mkdir -p "$dest"
+  cp "$MASTER_LOG" "$dest/master.log"
+  cp "$SLAVE_LOG" "$dest/slave.log"
+  {
+    echo "feature=$feature"
+    echo "run=$run_id"
+    echo "master_addr=$MASTER_ADDR"
+    echo "central_root=$CENTRAL_ROOT"
+    echo "local=$LOCAL"
+    echo
+    echo "== central tree =="
+    (cd "$CENTRAL_ROOT" && find . -print | sort)
+    echo
+    echo "== checkout tree =="
+    (cd "$LOCAL" && find . -print | sort)
+  } >"$dest/trees.txt"
+  echo "captured $dest"
+}
+
+cmd_cleanup() {
+  local run_id="$1"
+  local state
+  state="$(state_for "$run_id")"
+  if [[ -f "$state" ]]; then
+    # shellcheck disable=SC1090
+    source "$state"
+    if [[ -n "${MASTER_PID:-}" ]] && kill -0 "$MASTER_PID" 2>/dev/null; then
+      kill "$MASTER_PID" || true
+      wait "$MASTER_PID" 2>/dev/null || true
+    fi
+    if [[ -n "${SLAVE_PID:-}" ]] && kill -0 "$SLAVE_PID" 2>/dev/null; then
+      kill "$SLAVE_PID" || true
+      wait "$SLAVE_PID" 2>/dev/null || true
+    fi
+  fi
+  rm -rf "$(root_for "$run_id")"
+  if [[ -f "$CURRENT_FILE" ]] && [[ "$(cat "$CURRENT_FILE")" == "$run_id" ]]; then
+    rm -f "$CURRENT_FILE"
+  fi
+  echo "cleaned run $run_id (artifacts kept at $(artifacts_for "$run_id"))"
+}
+
+run_id_flag=""
+timeout_flag=""
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --run-id)
+      run_id_flag="${2:-}"
+      shift 2
+      ;;
+    --timeout)
+      timeout_flag="${2:-}"
+      shift 2
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+cmd="${args[0]:-}"
+[[ -n "$cmd" ]] || { usage; exit 1; }
+
+case "$cmd" in
+  build)
+    cmd_build
+    ;;
+  keygen)
+    cmd_build >/dev/null
+    cmd_keygen "${args[@]:1}"
+    ;;
+  launch)
+    cmd_launch "${run_id_flag}"
+    ;;
+  doctor)
+    cmd_doctor "$(resolve_run_id "$run_id_flag")"
+    ;;
+  paths)
+    cmd_paths "$(resolve_run_id "$run_id_flag")"
+    ;;
+  wait-file)
+    [[ ${#args[@]} -ge 3 ]] || die "usage: wait-file PATH EXPECTED [--timeout SECS]"
+    cmd_wait_file "${args[1]}" "${args[2]}" "${timeout_flag:-15}"
+    ;;
+  capture)
+    [[ ${#args[@]} -ge 2 ]] || die "usage: capture FEATURE_ID [--run-id ID]"
+    cmd_capture "${args[1]}" "$(resolve_run_id "$run_id_flag")"
+    ;;
+  cleanup)
+    cmd_cleanup "$(resolve_run_id "$run_id_flag")"
+    ;;
+  *)
+    die "unknown command $cmd"
+    ;;
+esac
