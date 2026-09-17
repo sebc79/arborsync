@@ -1,18 +1,18 @@
 use std::os::unix::fs::PermissionsExt;
 
+use arborsync_core::LoadedSlave;
 use arborsync_core::config::{CheckoutConfig, ReloadError};
 use arborsync_core::hash::ContentHash;
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::merkle::file_node;
-use arborsync_core::meta::{hash_bytes, FileMetadata};
-use arborsync_core::path::{conflict_sidecar_path, RESERVED_CONFLICTS};
+use arborsync_core::meta::{FileMetadata, hash_bytes};
+use arborsync_core::path::{RESERVED_CONFLICTS, conflict_sidecar_path};
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::slave::{
-    decide_incoming, decide_master_won_delete, DeleteAction, LocalEvent, MemoryContent,
-    ReplicaAction, Reply, Slave, SlaveError,
+    DeleteAction, LocalEvent, MemoryContent, ReplicaAction, Reply, Slave, SlaveError,
+    decide_incoming, decide_master_won_delete,
 };
-use arborsync_core::test_support::{p, MemoryStorage, SyncSandbox};
-use arborsync_core::LoadedSlave;
+use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
 
 const MASTER: [u8; 32] = [0x11; 32];
 const MTIME: i64 = 1_700_000_000_000;
@@ -79,20 +79,41 @@ fn incoming_announce_follows_the_replica_table() {
 fn master_won_delete_sidecars_divergent_content() {
     let live = file(1);
     assert_eq!(
-        decide_master_won_delete(None, file_node(&live), None),
+        decide_master_won_delete(None, file_node(&live), None, None),
         DeleteAction::AlreadyGone
     );
     assert_eq!(
-        decide_master_won_delete(Some(&live), file_node(&live), None),
+        decide_master_won_delete(Some(&live), file_node(&live), None, None),
         DeleteAction::Remove
     );
     assert_eq!(
-        decide_master_won_delete(Some(&live), file_node(&file(9)), Some(file_node(&live))),
+        decide_master_won_delete(
+            Some(&live),
+            file_node(&file(9)),
+            Some(file_node(&live)),
+            None
+        ),
         DeleteAction::Remove
     );
     assert_eq!(
-        decide_master_won_delete(Some(&live), file_node(&file(9)), Some(file_node(&file(8)))),
+        decide_master_won_delete(
+            Some(&live),
+            file_node(&file(9)),
+            Some(file_node(&file(8))),
+            None
+        ),
         DeleteAction::SidecarThenRemove
+    );
+    let mut chmodded = live.clone();
+    chmodded.mode = 0o100755;
+    assert_eq!(
+        decide_master_won_delete(
+            Some(&chmodded),
+            file_node(&live),
+            Some(file_node(&live)),
+            Some(live.content_hash)
+        ),
+        DeleteAction::Remove
     );
 }
 
@@ -130,12 +151,14 @@ fn local_edit_announces_without_moving_last_synced() {
         .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
         .unwrap();
     match &out[..] {
-        [ProtocolMessage::FileAnnounce {
-            checkout_id,
-            path,
-            new,
-            basis,
-        }] => {
+        [
+            ProtocolMessage::FileAnnounce {
+                checkout_id,
+                path,
+                new,
+                basis,
+            },
+        ] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src/hello.txt"));
             assert_eq!(new.content_hash, hash_bytes(b"typed"));
@@ -243,12 +266,14 @@ fn incoming_type_change_file_to_dir_replaces_the_live_file() {
         slave.last_synced("src", &p("/src/hello.txt")).unwrap(),
         Some(file_node(&new))
     );
-    assert!(!conflict_sidecar_path(
-        slave.checkout_local("src").unwrap(),
-        &p("/src/hello.txt"),
-        &previous.content_hash,
-    )
-    .exists());
+    assert!(
+        !conflict_sidecar_path(
+            slave.checkout_local("src").unwrap(),
+            &p("/src/hello.txt"),
+            &previous.content_hash,
+        )
+        .exists()
+    );
 
     let out = slave
         .note_local("src", LocalEvent::Removed(p("/src/hello.txt")))
@@ -360,12 +385,14 @@ fn incoming_type_change_file_to_symlink_replaces_the_live_file() {
         slave.last_synced("src", &p("/src/hello.txt")).unwrap(),
         Some(file_node(&new))
     );
-    assert!(!conflict_sidecar_path(
-        slave.checkout_local("src").unwrap(),
-        &p("/src/hello.txt"),
-        &previous.content_hash,
-    )
-    .exists());
+    assert!(
+        !conflict_sidecar_path(
+            slave.checkout_local("src").unwrap(),
+            &p("/src/hello.txt"),
+            &previous.content_hash,
+        )
+        .exists()
+    );
 }
 
 #[test]
@@ -622,6 +649,62 @@ fn incoming_delete_same_content_different_mode_writes_no_sidecar() {
 }
 
 #[test]
+fn incoming_delete_after_local_chmod_writes_no_sidecar() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let applied = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            new: applied.clone(),
+            basis: None,
+        })
+        .unwrap();
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    assert!(
+        slave
+            .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+            .unwrap()
+            .is_empty()
+    );
+    std::fs::set_permissions(
+        local.join("hello.txt"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    slave
+        .note_local("src", LocalEvent::Metadata(p("/src/hello.txt")))
+        .unwrap();
+    assert_ne!(
+        slave.last_synced("src", &p("/src/hello.txt")).unwrap(),
+        slave
+            .meta("src", &p("/src/hello.txt"))
+            .unwrap()
+            .as_ref()
+            .map(file_node)
+    );
+    match slave
+        .handle(ProtocolMessage::Delete {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            basis: file_node(&applied),
+        })
+        .unwrap()
+    {
+        Reply::Send(msgs) => assert!(msgs.is_empty()),
+        other => panic!("expected empty send, got {other:?}"),
+    }
+    let sidecar = conflict_sidecar_path(&local, &p("/src/hello.txt"), &hash);
+    assert!(!sidecar.exists());
+    assert!(!local.join("hello.txt").exists());
+}
+
+#[test]
 fn directory_delete_removes_nested_file_then_parent() {
     let sandbox = SyncSandbox::new();
     let mut slave = alice_slave(&sandbox, MemoryContent::new());
@@ -720,10 +803,12 @@ fn echo_of_an_applied_dir_or_meta_only_does_not_reannounce() {
         slave.last_synced("src", &p("/src/nested")).unwrap(),
         Some(file_node(&dir))
     );
-    assert!(slave
-        .note_local("src", LocalEvent::Changed(p("/src/nested")))
-        .unwrap()
-        .is_empty());
+    assert!(
+        slave
+            .note_local("src", LocalEvent::Changed(p("/src/nested")))
+            .unwrap()
+            .is_empty()
+    );
 
     let local = slave.checkout_local("src").unwrap().to_path_buf();
     std::fs::set_permissions(local.join("nested"), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -731,9 +816,11 @@ fn echo_of_an_applied_dir_or_meta_only_does_not_reannounce() {
         .note_local("src", LocalEvent::Changed(p("/src/nested")))
         .unwrap()[..]
     {
-        [ProtocolMessage::FileAnnounce {
-            path, new, basis, ..
-        }] => {
+        [
+            ProtocolMessage::FileAnnounce {
+                path, new, basis, ..
+            },
+        ] => {
             assert_eq!(path, &p("/src/nested"));
             assert_eq!(*basis, Some(file_node(&dir)));
             assert_ne!(file_node(new), file_node(&dir));
@@ -765,10 +852,12 @@ fn echo_of_an_applied_dir_or_meta_only_does_not_reannounce() {
             ))),
         })
         .unwrap();
-    assert!(slave
-        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
-        .unwrap()
-        .is_empty());
+    assert!(
+        slave
+            .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -807,13 +896,15 @@ fn local_file_rename_announces_rename_and_cas_accepts_advance_last_synced() {
         )
         .unwrap();
     match &out[..] {
-        [ProtocolMessage::Rename {
-            checkout_id,
-            from,
-            to,
-            from_basis,
-            to_new,
-        }] => {
+        [
+            ProtocolMessage::Rename {
+                checkout_id,
+                from,
+                to,
+                from_basis,
+                to_new,
+            },
+        ] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(from, &p("/src/old.txt"));
             assert_eq!(to, &p("/src/new.txt"));
@@ -1010,10 +1101,12 @@ fn echo_of_an_applied_rename_does_not_reannounce() {
             to_new: new,
         })
         .unwrap();
-    assert!(slave
-        .note_local("src", LocalEvent::Changed(p("/src/new.txt")))
-        .unwrap()
-        .is_empty());
+    assert!(
+        slave
+            .note_local("src", LocalEvent::Changed(p("/src/new.txt")))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1022,16 +1115,18 @@ fn reserved_tmp_rename_produces_no_message() {
     let mut slave = alice_slave(&sandbox, MemoryContent::new());
     let local = slave.checkout_local("src").unwrap().to_path_buf();
     sandbox.tree(&local).file(".arborsync-tmp/x", b"tmp");
-    assert!(slave
-        .note_local(
-            "src",
-            LocalEvent::Renamed {
-                from: p("/src/.arborsync-tmp/x"),
-                to: p("/src/.arborsync-tmp/y"),
-            },
-        )
-        .unwrap()
-        .is_empty());
+    assert!(
+        slave
+            .note_local(
+                "src",
+                LocalEvent::Renamed {
+                    from: p("/src/.arborsync-tmp/x"),
+                    to: p("/src/.arborsync-tmp/y"),
+                },
+            )
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

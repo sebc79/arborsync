@@ -9,16 +9,16 @@ use crate::apply;
 use crate::config::{ConfigError, LoadedSlave, ReloadError, SlaveReload};
 use crate::hash::{ContentHash, FileNode};
 use crate::index;
-use crate::merkle::{file_node, DirChild};
-use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
+use crate::merkle::{DirChild, file_node};
+use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
 use crate::path::{
-    canonical_to_host, conflict_sidecar_path, is_reserved_root_entry, join_central,
-    local_paths_overlap, strip_central, CanonicalPath, PathError,
+    CanonicalPath, PathError, canonical_to_host, conflict_sidecar_path, is_reserved_root_entry,
+    join_central, local_paths_overlap, strip_central,
 };
 use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
-use crate::reconcile::{decide_child, WalkAction};
+use crate::reconcile::{WalkAction, decide_child};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
-use crate::transfer::{self, signature_for, BulkTransfer};
+use crate::transfer::{self, BulkTransfer, signature_for};
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
 pub use crate::master::LocalEvent;
@@ -116,6 +116,7 @@ pub fn decide_master_won_delete(
     local: Option<&FileMetadata>,
     basis: FileNode,
     last_synced: Option<FileNode>,
+    last_content: Option<ContentHash>,
 ) -> DeleteAction {
     let Some(local) = local else {
         return DeleteAction::AlreadyGone;
@@ -125,6 +126,9 @@ pub fn decide_master_won_delete(
         return DeleteAction::Remove;
     }
     if local.kind == EntryKind::Dir {
+        return DeleteAction::Remove;
+    }
+    if last_content == Some(local.content_hash) {
         return DeleteAction::Remove;
     }
     DeleteAction::SidecarThenRemove
@@ -511,6 +515,17 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             .map_err(SlaveError::index)
     }
 
+    fn last_synced_content(
+        &self,
+        checkout_id: &str,
+        path: &CanonicalPath,
+    ) -> Result<Option<ContentHash>, SlaveError> {
+        let checkout = self.checkout(checkout_id)?;
+        self.store
+            .get_last_synced_content(&checkout.id, path)
+            .map_err(SlaveError::index)
+    }
+
     pub fn rescan(&mut self, checkout_id: &str) -> Result<Vec<ProtocolMessage>, SlaveError> {
         let (ck, central) = {
             let checkout = self.checkout(checkout_id)?;
@@ -559,7 +574,12 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         let current = self.meta(&checkout_id, &path)?;
         match decide_incoming(current.as_ref(), basis, &new) {
             ReplicaAction::NoopRefresh => {
-                self.write_last_synced(&checkout_id, &path, Some(file_node(&new)))?;
+                self.write_last_synced(
+                    &checkout_id,
+                    &path,
+                    Some(file_node(&new)),
+                    Some(new.content_hash),
+                )?;
                 Ok(Reply::Send(Vec::new()))
             }
             ReplicaAction::ApplyMetaOnly => {
@@ -582,9 +602,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     ) -> Result<Reply, SlaveError> {
         let current = self.meta(&checkout_id, &path)?;
         let last_synced = self.last_synced(&checkout_id, &path)?;
-        match decide_master_won_delete(current.as_ref(), basis, last_synced) {
+        let last_content = self.last_synced_content(&checkout_id, &path)?;
+        match decide_master_won_delete(current.as_ref(), basis, last_synced, last_content) {
             DeleteAction::AlreadyGone => {
-                self.write_last_synced(&checkout_id, &path, None)?;
+                self.write_last_synced(&checkout_id, &path, None, None)?;
                 Ok(Reply::Send(Vec::new()))
             }
             DeleteAction::SidecarThenRemove => {
@@ -618,12 +639,17 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             &to_new,
         ) {
             RenameAction::NoopRefresh => {
-                self.write_last_synced(&checkout_id, &from, None)?;
-                self.write_last_synced(&checkout_id, &to, Some(file_node(&to_new)))?;
+                self.write_last_synced(&checkout_id, &from, None, None)?;
+                self.write_last_synced(
+                    &checkout_id,
+                    &to,
+                    Some(file_node(&to_new)),
+                    Some(to_new.content_hash),
+                )?;
                 Ok(Reply::Send(Vec::new()))
             }
             RenameAction::CreateAtTo => {
-                self.write_last_synced(&checkout_id, &from, None)?;
+                self.write_last_synced(&checkout_id, &from, None, None)?;
                 self.apply_new(&checkout_id, to, to_new)
             }
             RenameAction::SidecarThenApply => {
@@ -690,7 +716,13 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         path: &CanonicalPath,
         node: Option<FileNode>,
     ) -> Result<(), SlaveError> {
-        self.write_last_synced(checkout_id, path, node)?;
+        let content = match node {
+            Some(accepted) => self
+                .meta(checkout_id, path)?
+                .and_then(|local| (file_node(&local) == accepted).then_some(local.content_hash)),
+            None => None,
+        };
+        self.write_last_synced(checkout_id, path, node, content)?;
         self.clear_pending_rename(checkout_id, path);
         Ok(())
     }
@@ -940,12 +972,13 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         checkout_id: &str,
         path: &CanonicalPath,
         node: Option<FileNode>,
+        content_hash: Option<ContentHash>,
     ) -> Result<(), SlaveError> {
         let ck = self.checkout(checkout_id)?.id.clone();
         let mut batch = self.store.begin_write().map_err(SlaveError::index)?;
         match node {
             Some(node) => batch
-                .put_last_synced(&ck, path, node)
+                .put_last_synced(&ck, path, node, content_hash)
                 .map_err(SlaveError::index)?,
             None => batch
                 .del_last_synced(&ck, path)

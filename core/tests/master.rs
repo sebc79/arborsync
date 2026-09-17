@@ -1,15 +1,15 @@
+use arborsync_core::LoadedMaster;
 use arborsync_core::config::{ReloadError, SlaveAcl};
 use arborsync_core::hash::{ContentHash, FileNode};
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{
-    decide_cas, CasDecision, LocalEvent, Master, MemoryContent, Reply, WholeFileLater,
+    CasDecision, LocalEvent, Master, MemoryContent, Reply, WholeFileLater, decide_cas,
 };
-use arborsync_core::merkle::{self, file_node, DirChild};
-use arborsync_core::meta::{hash_bytes, EntryKind, FileMetadata};
+use arborsync_core::merkle::{self, DirChild, file_node};
+use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};
 use arborsync_core::path::RESERVED_CONFLICTS;
 use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
-use arborsync_core::test_support::{name, p, MemoryStorage, SyncSandbox};
-use arborsync_core::LoadedMaster;
+use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
 
 const ALICE: [u8; 32] = [0xA1; 32];
 const BACKUP: [u8; 32] = [0xB1; 32];
@@ -194,6 +194,64 @@ fn cas_accepts_a_create_on_absence_or_a_matching_basis() {
 }
 
 #[test]
+fn successful_content_replace_writes_no_sidecar() {
+    let sandbox = SyncSandbox::new();
+    let old = b"old";
+    let new = b"new";
+    let old_hash = hash_bytes(old);
+    let new_hash = hash_bytes(new);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(old_hash, old.to_vec());
+    bodies.offer(new_hash, new.to_vec());
+    let mut master = two_slave_master(&sandbox, bodies);
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let previous = FileMetadata::file(old.len() as u64, MTIME, 0o100644, old_hash);
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: previous.clone(),
+                basis: None,
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept { .. }) => {}
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+
+    let incoming = FileMetadata::file(new.len() as u64, MTIME, 0o100644, new_hash);
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: incoming.clone(),
+                basis: Some(file_node(&previous)),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept {
+            file_node: node, ..
+        }) => assert_eq!(node, Some(file_node(&incoming))),
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+
+    assert_eq!(
+        std::fs::read(sandbox.central_root().join("src/hello.txt")).unwrap(),
+        new
+    );
+    assert!(!sandbox.central_root().join(RESERVED_CONFLICTS).exists());
+}
+
+#[test]
 fn handle_type_change_file_to_dir_accepts_and_fans_out() {
     let sandbox = SyncSandbox::new();
     let hello = b"hello";
@@ -331,10 +389,12 @@ fn handle_type_change_file_to_symlink_and_back() {
         other => panic!("expected CasAccept, got {other:?}"),
     }
     let host = sandbox.central_root().join("src/hello.txt");
-    assert!(std::fs::symlink_metadata(&host)
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    assert!(
+        std::fs::symlink_metadata(&host)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(
         std::fs::read_link(&host).unwrap(),
         std::path::Path::new("somewhere")
@@ -964,11 +1024,13 @@ fn handle_rename_moves_the_file_accepts_both_paths_and_fans_out() {
 
     let alice = master.poll(ALICE);
     match &alice[..] {
-        [ProtocolMessage::CasAccept {
-            path,
-            file_node: node,
-            ..
-        }] => {
+        [
+            ProtocolMessage::CasAccept {
+                path,
+                file_node: node,
+                ..
+            },
+        ] => {
             assert_eq!(path, &p("/src/old.txt"));
             assert_eq!(*node, None);
         }
