@@ -21,6 +21,7 @@ type SharedSlave = Arc<Mutex<Slave<RedbStorage, WholeFileLater>>>;
 
 enum Work {
     Local { checkout: String, event: LocalEvent },
+    Rescan { checkout: String },
 }
 
 pub fn run(config: Option<PathBuf>) -> anyhow::Result<()> {
@@ -127,12 +128,22 @@ async fn session(
                 .await?;
             }
             work = work.recv() => {
-                let Some(Work::Local { checkout, event }) = work else {
+                let Some(work) = work else {
                     anyhow::bail!("watch channel closed");
                 };
-                let outs = slave.lock().expect("slave").note_local(&checkout, event)?;
-                for out in outs {
-                    write_control(&mut send, &out).await?;
+                match work {
+                    Work::Local { checkout, event } => {
+                        let outs = slave.lock().expect("slave").note_local(&checkout, event)?;
+                        for out in outs {
+                            write_control(&mut send, &out).await?;
+                        }
+                    }
+                    Work::Rescan { checkout } => {
+                        let outs = slave.lock().expect("slave").rescan(&checkout)?;
+                        for out in outs {
+                            write_control(&mut send, &out).await?;
+                        }
+                    }
                 }
             }
         }
@@ -181,8 +192,19 @@ fn watch_checkout(
                     note(checkout, local, central, &event.path, tx)?;
                 }
             }
-            Ok(Err(err)) => log::warn!("watch {checkout}: {err}"),
-            Err(RecvTimeoutError::Timeout) => {}
+            Ok(Err(err)) => {
+                log::warn!("watch {checkout}: {err}");
+                tx.send(Work::Rescan {
+                    checkout: checkout.into(),
+                })
+                .context("session dropped")?;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                tx.send(Work::Rescan {
+                    checkout: checkout.into(),
+                })
+                .context("session dropped")?;
+            }
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
