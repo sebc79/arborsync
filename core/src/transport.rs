@@ -1,11 +1,15 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use quinn_hyphae::helper::{hyphae_client_endpoint, hyphae_server_endpoint};
 use quinn_hyphae::{HandshakeBuilder, HyphaePeerIdentity, RustCryptoBackend};
+use tokio::sync::mpsc;
 
 use crate::protocol::{
     self, BulkHeader, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE, ProtocolMessage,
@@ -30,6 +34,8 @@ pub enum TransportError {
     Frame(#[from] FrameError),
     #[error("stream: {0}")]
     Stream(String),
+    #[error("session closed")]
+    Closed,
 }
 
 pub struct AttemptLimiter {
@@ -199,4 +205,279 @@ pub async fn accept_bulk(conn: &Connection) -> Result<(BulkHeader, Vec<u8>), Tra
         .await
         .map_err(|err| TransportError::Stream(err.to_string()))?;
     read_bulk(&mut recv).await
+}
+
+pub trait Transport: Send + Sync + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+    type ControlSend: Send;
+    type ControlRecv: Send;
+
+    fn peer_static_key(&self) -> Result<[u8; 32], Self::Error>;
+    fn close(&self);
+
+    fn open_control(
+        &self,
+    ) -> impl Future<Output = Result<(Self::ControlSend, Self::ControlRecv), Self::Error>> + Send;
+    fn accept_control(
+        &self,
+    ) -> impl Future<Output = Result<(Self::ControlSend, Self::ControlRecv), Self::Error>> + Send;
+    fn write_control(
+        send: &mut Self::ControlSend,
+        msg: &ProtocolMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn read_control(
+        recv: &mut Self::ControlRecv,
+    ) -> impl Future<Output = Result<ProtocolMessage, Self::Error>> + Send;
+    fn write_bulk(
+        &self,
+        xfer: &BulkTransfer,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn accept_bulk(
+        &self,
+    ) -> impl Future<Output = Result<(BulkHeader, Vec<u8>), Self::Error>> + Send;
+}
+
+struct Closable<T> {
+    tx: Mutex<Option<mpsc::UnboundedSender<T>>>,
+}
+
+impl<T> Closable<T> {
+    fn new(tx: mpsc::UnboundedSender<T>) -> Arc<Self> {
+        Arc::new(Self {
+            tx: Mutex::new(Some(tx)),
+        })
+    }
+
+    fn send(&self, value: T) -> Result<(), TransportError> {
+        self.tx
+            .lock()
+            .map_err(|_| TransportError::Stream("lock poisoned".into()))?
+            .as_ref()
+            .ok_or(TransportError::Closed)?
+            .send(value)
+            .map_err(|_| TransportError::Closed)
+    }
+
+    fn close(&self) {
+        if let Ok(mut slot) = self.tx.lock() {
+            *slot = None;
+        }
+    }
+}
+
+pub struct MemoryControlSend {
+    out: Arc<Closable<ProtocolMessage>>,
+}
+
+pub struct MemoryControlRecv {
+    rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    closed: Arc<AtomicBool>,
+}
+
+pub struct MemoryTransport {
+    peer_key: [u8; 32],
+    opener: bool,
+    closed: Arc<AtomicBool>,
+    control: Mutex<Option<(MemoryControlSend, MemoryControlRecv)>>,
+    control_out: Arc<Closable<ProtocolMessage>>,
+    bulk_out: Arc<Closable<BulkTransfer>>,
+    bulk_in: tokio::sync::Mutex<mpsc::UnboundedReceiver<BulkTransfer>>,
+}
+
+impl MemoryTransport {
+    pub fn pair(a_public: [u8; 32], b_public: [u8; 32]) -> (Self, Self) {
+        let closed = Arc::new(AtomicBool::new(false));
+        let (left_ctrl_tx, right_ctrl_rx) = mpsc::unbounded_channel();
+        let (right_ctrl_tx, left_ctrl_rx) = mpsc::unbounded_channel();
+        let (left_bulk_tx, right_bulk_rx) = mpsc::unbounded_channel();
+        let (right_bulk_tx, left_bulk_rx) = mpsc::unbounded_channel();
+        let left = Self::side(
+            b_public,
+            true,
+            Arc::clone(&closed),
+            left_ctrl_tx,
+            left_ctrl_rx,
+            left_bulk_tx,
+            left_bulk_rx,
+        );
+        let right = Self::side(
+            a_public,
+            false,
+            closed,
+            right_ctrl_tx,
+            right_ctrl_rx,
+            right_bulk_tx,
+            right_bulk_rx,
+        );
+        (left, right)
+    }
+
+    fn side(
+        peer_key: [u8; 32],
+        opener: bool,
+        closed: Arc<AtomicBool>,
+        ctrl_tx: mpsc::UnboundedSender<ProtocolMessage>,
+        ctrl_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+        bulk_tx: mpsc::UnboundedSender<BulkTransfer>,
+        bulk_rx: mpsc::UnboundedReceiver<BulkTransfer>,
+    ) -> Self {
+        let control_out = Closable::new(ctrl_tx);
+        Self {
+            peer_key,
+            opener,
+            closed: Arc::clone(&closed),
+            control: Mutex::new(Some((
+                MemoryControlSend {
+                    out: Arc::clone(&control_out),
+                },
+                MemoryControlRecv {
+                    rx: ctrl_rx,
+                    closed: Arc::clone(&closed),
+                },
+            ))),
+            control_out,
+            bulk_out: Closable::new(bulk_tx),
+            bulk_in: tokio::sync::Mutex::new(bulk_rx),
+        }
+    }
+
+    fn take_control(
+        &self,
+        as_opener: bool,
+    ) -> Result<(MemoryControlSend, MemoryControlRecv), TransportError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TransportError::Closed);
+        }
+        if self.opener != as_opener {
+            return Err(TransportError::Stream("wrong control role".into()));
+        }
+        self.control
+            .lock()
+            .map_err(|_| TransportError::Stream("lock poisoned".into()))?
+            .take()
+            .ok_or_else(|| TransportError::Stream("control already taken".into()))
+    }
+}
+
+impl Transport for MemoryTransport {
+    type Error = TransportError;
+    type ControlSend = MemoryControlSend;
+    type ControlRecv = MemoryControlRecv;
+
+    fn peer_static_key(&self) -> Result<[u8; 32], Self::Error> {
+        Ok(self.peer_key)
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.control_out.close();
+        self.bulk_out.close();
+    }
+
+    fn open_control(
+        &self,
+    ) -> impl Future<Output = Result<(Self::ControlSend, Self::ControlRecv), Self::Error>> + Send
+    {
+        std::future::ready(self.take_control(true))
+    }
+
+    fn accept_control(
+        &self,
+    ) -> impl Future<Output = Result<(Self::ControlSend, Self::ControlRecv), Self::Error>> + Send
+    {
+        std::future::ready(self.take_control(false))
+    }
+
+    fn write_control(
+        send: &mut Self::ControlSend,
+        msg: &ProtocolMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        std::future::ready(send.out.send(msg.clone()))
+    }
+
+    async fn read_control(recv: &mut Self::ControlRecv) -> Result<ProtocolMessage, Self::Error> {
+        if recv.closed.load(Ordering::Acquire) {
+            return Err(TransportError::Closed);
+        }
+        recv.rx.recv().await.ok_or(TransportError::Closed)
+    }
+
+    fn write_bulk(
+        &self,
+        xfer: &BulkTransfer,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        std::future::ready(if self.closed.load(Ordering::Acquire) {
+            Err(TransportError::Closed)
+        } else {
+            self.bulk_out.send(xfer.clone())
+        })
+    }
+
+    async fn accept_bulk(&self) -> Result<(BulkHeader, Vec<u8>), Self::Error> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TransportError::Closed);
+        }
+        let xfer = self
+            .bulk_in
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(TransportError::Closed)?;
+        Ok((xfer.header, xfer.body))
+    }
+}
+
+impl Transport for Connection {
+    type Error = TransportError;
+    type ControlSend = SendStream;
+    type ControlRecv = RecvStream;
+
+    fn peer_static_key(&self) -> Result<[u8; 32], Self::Error> {
+        crate::transport::peer_static_key(self)
+    }
+
+    fn close(&self) {
+        Connection::close(self, 0u32.into(), b"");
+    }
+
+    fn open_control(
+        &self,
+    ) -> impl Future<Output = Result<(Self::ControlSend, Self::ControlRecv), Self::Error>> + Send
+    {
+        crate::transport::open_control(self)
+    }
+
+    fn accept_control(
+        &self,
+    ) -> impl Future<Output = Result<(Self::ControlSend, Self::ControlRecv), Self::Error>> + Send
+    {
+        crate::transport::accept_control(self)
+    }
+
+    fn write_control(
+        send: &mut Self::ControlSend,
+        msg: &ProtocolMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        crate::transport::write_control(send, msg)
+    }
+
+    fn read_control(
+        recv: &mut Self::ControlRecv,
+    ) -> impl Future<Output = Result<ProtocolMessage, Self::Error>> + Send {
+        crate::transport::read_control(recv)
+    }
+
+    fn write_bulk(
+        &self,
+        xfer: &BulkTransfer,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        crate::transport::write_bulk(self, xfer)
+    }
+
+    fn accept_bulk(
+        &self,
+    ) -> impl Future<Output = Result<(BulkHeader, Vec<u8>), Self::Error>> + Send {
+        crate::transport::accept_bulk(self)
+    }
 }
