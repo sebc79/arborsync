@@ -1,6 +1,7 @@
 mod cli;
 mod keygen;
 mod master;
+mod reload;
 mod slave;
 
 use clap::Parser;
@@ -18,6 +19,11 @@ fn init_logger() {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
     if let Ok(level) = std::env::var("ARBORSYNC_LOG_LEVEL") {
         builder.parse_filters(&level);
+    } else {
+        builder.filter_level(log::LevelFilter::Trace);
     }
     let _ = builder.try_init();
+    if std::env::var_os("ARBORSYNC_LOG_LEVEL").is_none() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
 }
