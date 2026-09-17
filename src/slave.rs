@@ -11,14 +11,12 @@ use arborsync_core::keys::read_static_key;
 use arborsync_core::path::local_to_canonical;
 use arborsync_core::slave::{Reply, Slave, SlaveError, WholeFileLater};
 use arborsync_core::storage::Storage;
-use arborsync_core::transport::{
-    accept_bulk, client_endpoint, connect, open_control, peer_static_key, read_control, write_bulk,
-    write_control,
-};
+use arborsync_core::transport::{Transport, client_endpoint, connect};
 use arborsync_core::watch::to_local_events;
 use arborsync_core::{CanonicalPath, LoadedSlave, RedbStorage, ReloadError, SlaveReload};
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
+use quinn::Connection;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -216,31 +214,31 @@ async fn session(
 
     let endpoint = client_endpoint(secret)?;
     let conn = connect(&endpoint, addr).await?;
-    let peer = peer_static_key(&conn)?;
+    let peer = conn.peer_static_key()?;
     if let Err(Reply::Hangup { reason }) = slave.lock().expect("slave").pin_check(peer) {
         anyhow::bail!("{reason}");
     }
 
-    let (mut send, mut recv) = open_control(&conn).await?;
-    write_control(&mut send, &subscribe).await?;
+    let (mut send, mut recv) = conn.open_control().await?;
+    Connection::write_control(&mut send, &subscribe).await?;
     dispatch_slave(
         &conn,
         &mut send,
         slave
             .lock()
             .expect("slave")
-            .handle(read_control(&mut recv).await?)?,
+            .handle(Connection::read_control(&mut recv).await?)?,
     )
     .await?;
     log::info!("connected to {addr_text}");
 
     loop {
         tokio::select! {
-            msg = read_control(&mut recv) => {
+            msg = Connection::read_control(&mut recv) => {
                 let msg = msg?;
                 dispatch_slave(&conn, &mut send, slave.lock().expect("slave").handle(msg)?).await?;
             }
-            incoming = accept_bulk(&conn) => {
+            incoming = conn.accept_bulk() => {
                 let (header, body) = incoming?;
                 dispatch_slave(
                     &conn,
@@ -258,7 +256,7 @@ async fn session(
                         match slave.lock().expect("slave").note_local(&checkout, event) {
                             Ok(outs) => {
                                 for out in outs {
-                                    write_control(&mut send, &out).await?;
+                                    Connection::write_control(&mut send, &out).await?;
                                 }
                             }
                             Err(SlaveError::UnknownCheckout(_)) => {}
@@ -269,7 +267,7 @@ async fn session(
                         match slave.lock().expect("slave").rescan(&checkout) {
                             Ok(outs) => {
                                 for out in outs {
-                                    write_control(&mut send, &out).await?;
+                                    Connection::write_control(&mut send, &out).await?;
                                 }
                             }
                             Err(SlaveError::UnknownCheckout(_)) => {}
@@ -320,7 +318,7 @@ async fn apply_live_slave_reload(
     }
     if plan.resubscribe {
         let subscribe = slave.lock().expect("slave").subscribe();
-        write_control(send, &subscribe).await?;
+        Connection::write_control(send, &subscribe).await?;
     }
     Ok(())
 }
@@ -334,12 +332,12 @@ async fn dispatch_slave(
         Reply::Hangup { reason } => anyhow::bail!("{reason}"),
         Reply::Send(outs) => {
             for out in outs {
-                write_control(send, &out).await?;
+                Connection::write_control(send, &out).await?;
             }
             Ok(())
         }
         Reply::Bulk(xfer) => {
-            write_bulk(conn, &xfer).await?;
+            conn.write_bulk(&xfer).await?;
             Ok(())
         }
     }

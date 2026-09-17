@@ -11,9 +11,9 @@ use arborsync_core::slave::Slave;
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
 use arborsync_core::transfer::BulkTransfer;
 use arborsync_core::transport::{
-    AttemptLimiter, MemoryTransport, Transport, TransportError, accept_control, client_endpoint,
-    connect, listen, open_control, peer_static_key, read_control, write_control,
+    AttemptLimiter, MemoryTransport, Transport, TransportError, client_endpoint, connect, listen,
 };
+use quinn::Connection;
 
 fn write_key(dir: &std::path::Path, name: &str) -> [u8; 32] {
     write_static_key(dir.join(name)).unwrap()
@@ -62,8 +62,8 @@ async fn xx_accept_exposes_the_peer_static_key() {
     let client_conn = connect(&client, addr).await.unwrap();
     let server_conn = incoming.await.unwrap();
 
-    assert_eq!(peer_static_key(&server_conn).unwrap(), slave_pub);
-    assert_eq!(peer_static_key(&client_conn).unwrap(), master_pub);
+    assert_eq!(server_conn.peer_static_key().unwrap(), slave_pub);
+    assert_eq!(client_conn.peer_static_key().unwrap(), master_pub);
 }
 
 #[tokio::test]
@@ -106,23 +106,25 @@ async fn subscribe_over_xx_acks_a_pinned_slave() {
 
     let server_task = tokio::spawn(async move {
         let conn = server.accept().await.expect("accept").await.expect("hs");
-        let peer = peer_static_key(&conn).unwrap();
-        let (send, mut recv) = accept_control(&conn).await.unwrap();
-        let msg = read_control(&mut recv).await.unwrap();
+        let peer = conn.peer_static_key().unwrap();
+        let (send, mut recv) = conn.accept_control().await.unwrap();
+        let msg = Connection::read_control(&mut recv).await.unwrap();
         (peer, msg, send, recv, conn)
     });
 
     let conn = connect(&client, addr).await.unwrap();
-    slave.pin_check(peer_static_key(&conn).unwrap()).unwrap();
-    let (mut send, mut recv) = open_control(&conn).await.unwrap();
-    write_control(&mut send, &slave.subscribe()).await.unwrap();
+    slave.pin_check(conn.peer_static_key().unwrap()).unwrap();
+    let (mut send, mut recv) = conn.open_control().await.unwrap();
+    Connection::write_control(&mut send, &slave.subscribe())
+        .await
+        .unwrap();
 
     let (peer, incoming, mut server_send, _server_recv, _server_conn) = server_task.await.unwrap();
     match master.handle(peer, incoming).unwrap() {
         Reply::Send(ProtocolMessage::SubscribeAck { checkouts }) => {
             assert_eq!(checkouts.len(), 1);
             assert_eq!(checkouts[0].id, "src");
-            write_control(
+            Connection::write_control(
                 &mut server_send,
                 &ProtocolMessage::SubscribeAck { checkouts },
             )
@@ -132,7 +134,7 @@ async fn subscribe_over_xx_acks_a_pinned_slave() {
         other => panic!("expected SubscribeAck, got {other:?}"),
     }
 
-    match read_control(&mut recv).await.unwrap() {
+    match Connection::read_control(&mut recv).await.unwrap() {
         ProtocolMessage::SubscribeAck { checkouts } => assert_eq!(checkouts[0].id, "src"),
         other => panic!("expected SubscribeAck, got {other:?}"),
     }

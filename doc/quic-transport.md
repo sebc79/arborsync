@@ -115,7 +115,7 @@ Rotation procedures: `spec.md` §4.
 
 ## Tests / in-memory
 
-`Transport` is a live session after handshake. `impl Transport for quinn::Connection` wraps the free functions. `MemoryTransport::pair` is the in-memory test impl. Unit tests still call `handle` for CAS and reconcile. `core/tests/transport.rs` covers XX and the memory pair. The v1 production path is QUIC only.
+`Transport` is a live session after handshake. `impl Transport for quinn::Connection` is the QUIC path. The master and slave binaries and `core/tests/transport.rs` call the trait. `MemoryTransport::pair` is the in-memory test impl. Unit tests still call `handle` for CAS and reconcile. The v1 production path is QUIC only.
 
 ## Struck from earlier drafts
 

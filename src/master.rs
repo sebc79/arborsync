@@ -11,15 +11,12 @@ use arborsync_core::keys::read_static_key;
 use arborsync_core::master::{Master, Reply, WholeFileLater};
 use arborsync_core::path::host_to_canonical;
 use arborsync_core::storage::Storage;
-use arborsync_core::transport::{
-    AttemptLimiter, accept_bulk, accept_control, listen, peer_static_key, read_control, write_bulk,
-    write_control,
-};
+use arborsync_core::transport::{AttemptLimiter, Transport, listen};
 use arborsync_core::watch::to_local_events;
 use arborsync_core::{LoadedMaster, RedbStorage};
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
-use quinn::Incoming;
+use quinn::{Connection, Incoming};
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::reload::{apply_file_log_level, spawn_config_watch};
@@ -176,7 +173,7 @@ async fn accept_session(
         return Ok(());
     }
     let conn = incoming.await.context("handshake")?;
-    let peer = peer_static_key(&conn).context("peer static key")?;
+    let peer = conn.peer_static_key().context("peer static key")?;
     let slave_id = master
         .lock()
         .expect("master")
@@ -213,7 +210,7 @@ async fn accept_session(
         }
     }
 
-    let (mut send, mut recv) = accept_control(&conn).await?;
+    let (mut send, mut recv) = conn.accept_control().await?;
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     loop {
         tokio::select! {
@@ -222,14 +219,14 @@ async fn accept_session(
                     break;
                 }
             }
-            msg = read_control(&mut recv) => {
+            msg = Connection::read_control(&mut recv) => {
                 let msg = msg?;
                 let reply = master.lock().expect("master").handle(peer, msg)?;
                 if dispatch_master(&master, peer, &slave_id, &conn, &mut send, reply, &limiter, ip).await? {
                     break;
                 }
             }
-            incoming = accept_bulk(&conn) => {
+            incoming = conn.accept_bulk() => {
                 let (header, body) = incoming?;
                 let reply = master.lock().expect("master").apply_bulk(peer, header, &body)?;
                 if dispatch_master(&master, peer, &slave_id, &conn, &mut send, reply, &limiter, ip).await? {
@@ -267,12 +264,12 @@ async fn dispatch_master(
             Ok(true)
         }
         Reply::Send(out) => {
-            write_control(send, &out).await?;
+            Connection::write_control(send, &out).await?;
             flush_outbox(master, peer, send).await?;
             Ok(false)
         }
         Reply::Bulk(xfer) => {
-            write_bulk(conn, &xfer).await?;
+            conn.write_bulk(&xfer).await?;
             flush_outbox(master, peer, send).await?;
             Ok(false)
         }
@@ -289,7 +286,7 @@ async fn flush_outbox(
         master.lock().expect("master").set_writable(peer, false);
     }
     for msg in &pending {
-        write_control(send, msg).await?;
+        Connection::write_control(send, msg).await?;
     }
     master.lock().expect("master").set_writable(peer, true);
     Ok(())
