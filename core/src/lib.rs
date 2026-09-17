@@ -35,3 +35,4 @@ pub use path::{
     is_interested, is_reserved_root_entry, local_to_canonical, strip_central,
 };
 pub use storage::{CheckoutId, RedbStorage, Storage, WriteBatch};
+pub use transport::{MemoryTransport, Transport};

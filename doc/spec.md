@@ -401,7 +401,10 @@ Paths in every message are canonical. `checkout_id` is required on slave-scoped 
 - Slave verifies master static key; master maps slave static key → ACL.
 - Unknown keys and ACL misses are disconnects, rate-limited per source IP.
 - Reconnect: exponential backoff, then `Subscribe` + reconcile. No 0-RTT, no replay of announces.
-- A `Transport` trait may exist for tests (in-memory). v1 ships QUIC only.
+- `Transport` is a live session after handshake. It exposes the peer static key, one control stream pair, on-demand bulk transfers, and `close`.
+- `impl Transport for quinn::Connection` is the QUIC path.
+- `MemoryTransport::pair` is the in-memory test impl.
+- The v1 production path is QUIC only. There is no TCP path.
 
 ---
 
@@ -572,7 +575,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §9 patch from the live file into tmp | Specified as built. Spec §8 says never patch in place. `reconstruct` patches in RAM, then `atomic_put` writes the whole buffer. |
 | ✅ | §10 `SubscribeReject` | Slave stores `denied_centrals`. `subscribe()` omits those centrals. On `SubscribeReject`, insert, log, and `Reply::Send(vec![subscribe()])` if any checkout remains, else `Reply::Hangup`. Cleared on a checkout or pin reload. Master prefix-deny stays `SubscribeReject`. |
 | ✅ | §12 one live connection per `slave_id` | Replacing a session `close`s the previous `Connection` and signals the old task. |
-| ❌ | §12 `Transport` trait | None. Tests call `handle`. One XX test lives in `core/tests/transport.rs`. |
+| ✅ | §12 `Transport` trait | `Transport` is a live session. It exposes the peer static key, one control stream pair, on-demand bulk, and `close`. `impl Transport for quinn::Connection` wraps the free functions. `MemoryTransport::pair` is the in-memory test impl. Most unit tests still call `handle`. `core/tests/transport.rs` covers XX and the memory pair. |
 | ➖ | §14 `quic_*` / `reconnect_*` | Struck in `doc/configuration.md`. Not struct fields. Reconnect is 1 s, doubling, cap 60 s. |
 | ✅ | Backpressure (`set_writable`) | `flush_outbox` polls the batch, `set_writable(peer, false)` when `pending.len() > 32` before writing, then `set_writable(peer, true)`. `set_writable(false)` still clears the leftover outbox. |
 | ✅ | In-flight bulk after disconnect | `Master::disconnect` drops pending rows whose `peer` is the disconnected peer. |
