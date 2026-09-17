@@ -2,7 +2,7 @@
 
 **Version:** 2.0 (September 2026)
 
-**Normative.** This file is the source of truth. Topic documents under `doc/` expand procedures; they must not add requirements that contradict this file.
+**Normative.** This file is the source of truth. Start with [`overview.md`](overview.md) for the mental model. Topic documents under `doc/` expand procedures. They must not add requirements that contradict this file.
 
 **Purpose:** A lightweight, bidirectional, central-master file sync daemon:
 
@@ -309,7 +309,7 @@ Recipient-driven. Never compute a forward delta against a cached snapshot of the
 After `SubscribeAck`, every rescan interval, and on reconnect:
 
 1. Slave sends `RootReport { checkout_id, path: central, root }` for each checkout.
-2. Master replies `RootAck { match, master_root }`.
+2. Master replies `RootAck { matched, master_root }`.
 3. On mismatch (or empty slave), slave walks:
    - `DirListRequest` / `DirListResponse` for the directory (`name`, `kind`, `node_hash`).
    - Name only on master → pull create (or `Mkdir`).
@@ -536,23 +536,49 @@ anyhow = "1"
 
 ---
 
-### 16. Implementation roadmap
+### 16. Implementation status
+
+Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen` binaries.
 
 1. `core`: `FileMetadata`, path-Merkle encode/hash, `Storage` + redb, frame codec, canonical-path helpers, reserved-name filter, local-overlap check.
 2. `keygen` + config parse/validate (ACL, pins, checkouts).
 3. Master: watch `central_root`, index, QUIC XX accept, ACL, Subscribe, CAS apply to disk, fan-out.
-   - Decode `Envelope.version` before `ProtocolMessage`. `decode_control` currently decodes the whole envelope in one step, so bincode rejects an unknown v2 variant index before the version check runs, and the caller sees `FrameError::Bincode` instead of `FrameError::UnsupportedVersion`.
-   - Stop sharing one unversioned `bincode_config` between control frames and on-disk `FileMetadata`. Give each surface its own config, or add a schema version table, so a wire change cannot silently reinterpret stored rows.
 4. Slave: connect, pin check, Subscribe, per-checkout watch, announce, apply, sidecar.
-5. Bulk `copia` streams; whole-file fallback.
+5. Bulk `copia` streams; whole-file fallback. Apply reconstructs in memory, then writes the full buffer through `.arborsync-tmp`.
 6. Reconcile walk + rescan + reconnect.
 7. Config watch for checkout add/remove; SIGHUP ACL/log reload.
-8. Tests: temp dirs, two checkouts on one slave (`/src` + `/`), CAS conflict, echo suppression, ACL deny, missed-watcher recover.
+8. Tests: `core/tests/scenarios.rs` covers reserved dirs, two checkouts on one slave (`/src` and `/`), CAS conflict, echo suppression, ACL deny, and rescan-as-missed-watcher. Those tests call `handle`, `note_local`, and `rescan` on `MemoryStorage`. They do not start notify threads or a two-process QUIC sync.
+
+**Framing and storage (done).** `decode_control` reads `Envelope.version`, then `ProtocolMessage`. An unknown version is `FrameError::UnsupportedVersion`, including a v2 variant index under version 2. On-disk `FileMetadata` is `u16le META_SCHEMA_VERSION || bincode` with its own `meta_bincode_config`. Wire frames use `wire_bincode_config`. Both configs are `bincode::config::standard()` today. The schema prefix is what stops a wire change from silently reinterpreting stored rows.
+
+**Open against this spec**
+
+| Requirement | As built |
+|---|---|
+| §3 overlap after symlink-resolved canonicalize | Overlap runs on tilde-expanded paths at parse. `canonicalize` runs later in `Master::open` / `Slave::open`. |
+| §4 / §14 config files `0600` | Key files are `0600` on write. Config mode is not checked. |
+| §4 / §12 unknown-key rate limit | XX always finishes. `AttemptLimiter` only changes the log line. ACL miss is `SubscribeReject`, not a rate-limited disconnect. |
+| §6 skip device, socket, FIFO | Returns `None` without a log. `EACCES` fails the walk instead of skip-and-continue. |
+| §6 / §7 hash only on size/mtime miss | Slave rescan is lazy (also treats mode as a miss). Master rescan and every watcher path call `collect_from_path` and rehash. |
+| §7 event kinds and same-window `Rename` | `notify-debouncer-mini` delivers a path only. Binaries emit `LocalEvent::Changed`. `ProtocolMessage::Rename` is defined and unanswered (`Error { code: "unsupported" }`). Effective rename is Delete + Create. |
+| §7 inflight before apply | Armed after `rename`. Dirs and meta-only apply do not arm. |
+| §8 directory CAS | `decide_cas` rejects any live `EntryKind::Dir`, including delete. Master-local dir edits bypass CAS through `commit`. |
+| §8 type change in one master transaction | Kind mismatch is `CasReject`. Reconcile Pull on the slave can remove then mkdir. |
+| §8 sidecar only for the content-hash loser | Slave apply follows this. `Master::publish` sidecars the previous live file on a successful content replace. Incoming replica delete sidecars when `FileNode` differs, then hashes the copy against `ContentHash::ZERO`. |
+| §8 children-first directory delete | `remove_dir_all` on the live path. |
+| §9 patch from the live file into tmp | `copia` may send `Delta`. `reconstruct` patches in RAM, then `atomic_put` writes the whole buffer. |
+| §10 `SubscribeReject` | Specified: log and do not retry those prefixes until config or ACL changes. Built: hangup, then the binary reconnects with the same set. |
+| §12 one live connection per `slave_id` | New accept signals the old task. It does not `close` the previous `Connection`. Roster swap waits for the new `Subscribe`. |
+| §12 `Transport` trait | None. Tests call `handle`. One XX test lives in `core/tests/transport.rs`. |
+| §14 `quic_*` / `reconnect_*` | Not struct fields. Serde ignores them. Reconnect is 1 s, doubling, cap 60 s. |
+| Backpressure (`set_writable`) | Exists on `Master`. The binary never calls it. A connected slow slave can grow `outbox`. |
+| In-flight bulk after disconnect | `Master::pending` is keyed by `(checkout_id, path)` and is not cleared on `disconnect`. Checkout ids are per slave. |
 
 Topic documents:
 
-| File | Expands |
+| File | Role |
 |---|---|
+| `overview.md` | Mental model. Not normative. |
 | `subscriptions.md` | §3, §4, interest, Subscribe |
 | `building-updating-merkle-trees.md` | §5, §10 |
 | `collecting-metadata.md` | §6 |

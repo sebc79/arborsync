@@ -9,14 +9,14 @@ The master pushes **decisions**, not guessed deltas. Disconnected slaves are not
 A commit is either:
 
 - the master watcher/rescan applied a local FS change to the global index, or
-- the master accepted a slave `FileAnnounce` / `Delete` / `Rename` (CAS succeeded).
+- the master accepted a slave `FileAnnounce` or `Delete` (CAS succeeded). `Rename` is defined and not handled.
 
 Then:
 
 1. Recompute ancestor `DirNode`s (`building-updating-merkle-trees.md`).
 2. Look up interested **connected** checkouts: `central` is a prefix of the changed path (`spec.md` §2).
 3. Skip the `(slave_id, checkout_id)` pair that just committed, when the commit came from a slave.
-4. For each remaining `(slave_id, checkout_id)`, send `FileAnnounce` / `Delete` / `Rename` with that target `checkout_id`. `basis` is the pre-commit `FileNode`.
+4. For each remaining `(slave_id, checkout_id)`, send `FileAnnounce` or `Delete` with that target `checkout_id`. `basis` is the pre-commit `FileNode`.
 5. The **recipient** asks for bytes (`SignatureRequest` + bulk stream) if it decides to apply (`applying-updates.md`).
 
 Do not send `MerkleUpdate` proofs. Do not generate a `copia` delta until a recipient has sent a signature (or asked for whole-file).
@@ -61,11 +61,15 @@ Reconnect = new connection + `Subscribe` + this slow path. “Resume interrupted
 - File-type priority (config vs docs).
 - Administrative “force push this blob to offline nodes.”
 
-A manual resync is: trigger the slave’s reconcile walk (SIGHUP on the slave or a future `arborsync slave reconcile` subcommand).
+A manual resync is a future `arborsync slave reconcile` subcommand, or wait for the next rescan `RootReport`. SIGHUP on the slave reloads config. It does not start reconcile.
 
 ## Backpressure
 
-If a slave’s control stream is blocked, stop sending it more announces; the next `RootReport` after it catches up repairs anything missed. Do not grow an unbounded in-memory queue. `max_concurrent` bulk streams per connection is `quic_max_concurrent_streams` (config). Slow apply on the slave is the slave’s problem; the master does not snapshot file contents for it.
+Specified: if a slave’s control stream is blocked, stop sending it more announces. The next `RootReport` after it catches up repairs anything missed. Do not grow an unbounded in-memory queue.
+
+As built: `Master::set_writable` exists and the binary never calls it. A connected slow slave can grow `outbox`. `quic_max_concurrent_streams` is not parsed. Slow apply on the slave is the slave’s problem. The master does not snapshot file contents for it.
+
+`Master::pending` (in-flight bulk after the master asked for bytes) is not cleared on `disconnect`. The key is `(checkout_id, path)`. Checkout ids are per slave.
 
 ## Offline
 
@@ -80,7 +84,6 @@ Log at `info`: connect/disconnect, Subscribe accept/reject, CAS accept/reject co
 ```toml
 watcher_debounce_ms = 200
 rescan_interval_seconds = 60
-quic_max_concurrent_streams = 256
 ```
 
 Removed: `push_debounce_ms` as a second debounce (the watcher debounce is enough), `max_queued_updates_per_slave`, `max_push_attempts`, `enable_delta_caching`, `max_delta_cache_size_mb`, `push_batch_size` as a correctness parameter. A sender may coalesce multiple control messages in one syscall; that is not a specified batch protocol.

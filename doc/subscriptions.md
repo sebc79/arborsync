@@ -26,13 +26,13 @@ checkouts = [
 |---|---|
 | `id` | Stable string. Unique on that slave. Index prefix. Not reused for a different `(central, local)` without a remove + add. |
 | `central` | Canonical prefix (`spec.md` §1). `/` is the full tree. |
-| `local` | Absolute host path. Canonicalized (symlinks resolved) at config load. |
+| `local` | Absolute host path. `canonicalize` (symlink resolve) runs at `Slave::open`, not at TOML parse. |
 
 The slave does **not** send `local` to the master. `Subscribe` carries `{ id, central }` only.
 
 ## Overlap
 
-- **Local:** forbidden. Reject config if two locals are equal or one is a parent of the other. `/opt/a` and `/opt/a/b` overlap; `/opt/a` and `/opt/ab` do not.
+- **Local:** forbidden. Reject config if two locals are equal or one is a parent of the other after comparing path components. `/opt/a` and `/opt/a/b` overlap. `/opt/a` and `/opt/ab` do not. Spec §3 wants this check after symlink-resolved canonicalize. As built, parse compares the tilde-expanded path before `open` resolves symlinks.
 - **Central:** allowed, including on the same slave. `/src` + `/` is the backup-plus-subset pattern. Inner mappings do **not** “win.” Each checkout is an independent replica of its prefix. The same canonical file may exist as two local files; apply is per `checkout_id`.
 - **Across slaves:** any number of slaves may map the same `central`.
 
@@ -52,7 +52,7 @@ Master keeps an in-memory trie of `(slave_id, checkout_id, central)` for connect
 2. Slave opens the control stream, sends framed `Subscribe { slave_id, checkouts }`.
 3. `slave_id` must match the ACL row for that key. Each `central` must sit under at least one `allowed_prefixes` entry (same prefix rule). Count must be ≤ `max_checkouts_per_slave` (same name and default on both sides: 100).
 4. Central paths need not exist yet. Pre-subscribe is allowed; creates under the ACL succeed later.
-5. Success: `SubscribeAck` with master’s current `DirNode` (or `FileNode`) for each `central`. Failure: `SubscribeReject` with `denied_centrals` and a reason; slave logs and does not retry those prefixes until config or ACL changes.
+5. Success: `SubscribeAck` with master’s current `DirNode` (or `FileNode`) for each `central`. Failure: `SubscribeReject` with `denied_centrals` and a reason. Specified: the slave logs and does not retry those prefixes until config or ACL changes. As built: `Slave::handle` hangs up and the binary reconnects with the same `Subscribe`.
 6. A second `Subscribe` on the same connection **replaces** the set. Removed ids are forgotten on the master; the slave drops those index prefixes. Added ids start reconcile.
 
 `Subscribe` is not authenticated by a shared PSK. The key *is* the identity. There is no separate “path authorization” mechanism beyond `allowed_prefixes`.
