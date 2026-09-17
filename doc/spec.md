@@ -509,6 +509,9 @@ CLI overrides: `--config PATH`. Env: `ARBORSYNC_CONFIG`, `ARBORSYNC_LOG_LEVEL`. 
 ```
 arborsync/
 ├── Cargo.toml          # workspace, binary `arborsync`
+├── flake.nix           # package + NixOS module
+├── flake.lock
+├── nix/                # module.nix, eval fixture
 ├── core/               # arborsync-core
 └── src/                # master / slave / keygen subcommands
 ```
@@ -562,7 +565,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | | Requirement | As built |
 |---|---|---|
 | ✅ | §3 overlap after symlink-resolved canonicalize | Parse checks tilde-expanded paths and `canonicalize`s a local that already exists. `Slave::open` and checkout-add reload `canonicalize` again and reject `LocalOverlap` on the resolved paths. |
-| ✅ | §4 / §14 config files `0600` | `LoadedMaster::load` / `LoadedSlave::load` reject a file whose mode is not `0600` (`ConfigError::InsecureMode`). `parse` does not check mode. |
+| ✅ | §4 / §14 config files `0600` | `LoadedMaster::load` / `LoadedSlave::load` reject a file whose mode is not `0600` (`ConfigError::InsecureMode`). `parse` does not check mode. The NixOS unit copies `services.arborsync.master.configFile` to `/run/arborsync/master.toml` with mode `0600` and passes that path to `--config`. |
 | ✅ | §4 / §12 unknown-key rate limit | `AttemptLimiter::limited` drops the accept before XX. After XX, unknown key records `allow` and closes. `slave_id` mismatch is `Reply::Hangup` (the binary also `allow`s). Prefix deny stays `SubscribeReject`. |
 | ✅ | §6 skip device, socket, FIFO | `collect_from_path` / `collect_for_rescan` return `Ok(None)` and log a warn for device, socket, FIFO, and `PermissionDenied`. The walk continues. |
 | ✅ | §6 / §7 hash only on size/mtime miss | `collect_for_rescan` reuses `content_hash` when kind, size, and mtime match. Mode is not a miss. The returned row carries the fresh mode. Kind is a reuse guard. Rescan walks, Create, Write, Metadata, and same-window Rename use it. A miss falls through to `collect_from_path`. |

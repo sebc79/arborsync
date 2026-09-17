@@ -1,0 +1,9 @@
+central_root = "/var/lib/arborsync/central"
+listen_addr = "0.0.0.0:8443"
+master_key_path = "/var/lib/arborsync/master.key"
+db_path = "/var/lib/arborsync/index.redb"
+
+[[slaves]]
+id = "backup-1"
+public_keys = ["hex:0000000000000000000000000000000000000000000000000000000000000000"]
+allowed_prefixes = ["/"]
