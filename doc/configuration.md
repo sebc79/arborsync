@@ -71,7 +71,7 @@ A `/` checkout on `dev-alice` is rejected (her ACL is `/src` and `/docs`). Full-
 
 Required: `slave_id`, `master_addr`, `slave_key_path`, `master_public_keys`, `checkouts` (may be empty: the process idles until the config watch adds some).
 
-`local` paths are created if missing (`0o755`) and canonicalized at `Slave::open`. Local overlap is checked earlier, on the tilde-expanded path, and refuses to start (or refuses the reload of that checkout list). Two locals that overlap only after symlink resolve can pass parse. `id` unique. `central` absolute canonical (see `subscriptions.md`).
+`local` paths are created if missing (`0o755`) and canonicalized at `Slave::open`. Parse checks tilde-expanded paths and `canonicalize`s a local that already exists. `Slave::open` and checkout-add reload reject `LocalOverlap` on the resolved paths. `id` unique. `central` absolute canonical (see `subscriptions.md`).
 
 Reconnect backoff is hardcoded at 1 s, doubling, cap 60 s. `reconnect_initial_ms`, `reconnect_max_ms`, and the `quic_*` keys from older drafts are not parsed.
 
@@ -106,7 +106,7 @@ No `ARBORSYNC_*` for keys or key paths.
 
 ## Permissions
 
-Specified: config and key files `0600`, owner = the daemon user. As built: `write_static_key` sets `0600`. Config mode is not checked. The process does not need root if it can read the tree, bind the UDP port, and write `db_path`.
+Config and key files are `0600`, owner = the daemon user. `write_static_key` sets `0600`. `LoadedMaster::load` / `LoadedSlave::load` reject any other config mode (`ConfigError::InsecureMode`). `parse` does not check mode. The process does not need root if it can read the tree, bind the UDP port, and write `db_path`.
 
 ## Examples
 
@@ -164,4 +164,4 @@ checkouts = [
 - Config templating, include files, automatic VCS backup of toml.
 - Separate `max_subscriptions_per_connection` (use `max_checkouts_per_slave`).
 - `ARBORSYNC_MASTER_ADDR` as a silent override (use the file or `--config`).
-- `quic_max_concurrent_streams`, `quic_idle_timeout_ms`, `quic_initial_mtu`, `reconnect_initial_ms`, `reconnect_max_ms` (not parsed).
+- `quic_max_concurrent_streams`, `quic_idle_timeout_ms`, `quic_initial_mtu`, `reconnect_initial_ms`, `reconnect_max_ms`.

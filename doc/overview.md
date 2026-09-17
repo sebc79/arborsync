@@ -77,7 +77,7 @@ The slave updates that checkout's index and, when `FileNode` is not `last_synced
 
 `commit_leaf` writes the leaf, every ancestor `DirNode`, and `last_synced` in one redb batch. The master then fans out to connected interested checkouts.
 
-`inflight` remembers the content hash just applied so the local watcher does not re-announce the write. The map expires after twice the debounce. The code arms it after the rename.
+`inflight` remembers the content hash just applied so the local watcher does not re-announce the write. The map expires after twice the debounce. The code arms it before the live `rename`, `mkdir`, or meta apply, including dirs (`ContentHash::ZERO`) and meta-only apply.
 
 ## CAS and the sidecar
 
@@ -88,7 +88,7 @@ The master is the replica of record. The winner is whatever CAS commits there.
 - Success: `CasAccept`. The origin slave sets `last_synced` from that reply.
 - Failure: `CasReject`. The slave writes its bytes under `.arborsync-conflicts` when content differs, then adopts the winner.
 
-The sidecar path is `{local}/.arborsync-conflicts/{canonical}--{first 16 hex chars of the losing content hash}`. Meta-only loss (same content hash, different `FileNode`) does not write a sidecar.
+The sidecar path is `{local}/.arborsync-conflicts/{canonical}--{first 16 hex chars of the losing content hash}`. Announce apply and `CasReject` skip the sidecar when only metadata changed. Incoming `Delete` still sidecars on a `FileNode` miss.
 
 As built, `decide_cas` rejects every live directory, including delete. A slave cannot rmdir or chmod a directory that already exists on the master. Master-local directory edits go through `commit` and skip that guard. Type change (file to dir, or the reverse) is specified as delete plus create in one master transaction. The code rejects the kind change instead.
 
@@ -116,9 +116,9 @@ Config is TOML. `--config` and `ARBORSYNC_CONFIG` pick the file. `ARBORSYNC_LOG_
 
 SIGHUP and a watch on the config's parent directory reload live fields: log level, rate limits, ACL rows, extra public keys, checkout add or remove, debounce, and rescan interval. `listen_addr`, `db_path`, `central_root`, `master_addr`, and key paths need a restart. Changing slave `slave_id` also needs a restart.
 
-A new session with a valid key for an already-connected `slave_id` replaces the old session. The binary signals the old task. It does not call `close` on the previous connection. Roster interest switches on the new `Subscribe`.
+A new session with a valid key for an already-connected `slave_id` replaces the old session. The binary `close`s the previous connection and signals the old task. Roster interest switches on the new `Subscribe`.
 
-`SubscribeReject` is specified as "log and wait for a config or ACL change." As built, the slave hangs up and the binary reconnects with the same set.
+On `SubscribeReject` the slave records `denied_centrals`, omits those prefixes from the next `subscribe()`, and stays on the same connection when any checkout remains. All denied is hangup. Cleared when checkouts or pins change.
 
 Tightening `allowed_prefixes` drops those checkouts from interest and leaves the connection up. The slave is not told. Later `RootReport`s for those ids come back `not_subscribed`.
 
@@ -155,14 +155,11 @@ The ones that change behavior if you run the daemons today:
 - `Rename` is defined and unused. Same-window rename is delete plus create.
 - A slave cannot CAS a live directory.
 - Type change is not one master transaction.
-- `SubscribeReject` reconnects the same denied set.
-- Local overlap is checked before symlink resolve.
+- Local overlap after symlink resolve is rejected at `Slave::open` (and at load when both locals exist).
 - Master `publish` sidecars a successful content replace.
-- In-flight bulk state is keyed by `(checkout_id, path)` and survives disconnect. Checkout ids are per slave, so two slaves named `src` can collide.
-- Unknown-key rate limiting only changes a log line. The handshake always finishes.
+- Unknown-key accepts are dropped by `AttemptLimiter::limited` before XX. After XX, unknown key still records `allow` and closes. `slave_id` mismatch is hangup.
 - An incoming `Error` is answered with `Error { code: "unsupported" }`.
-- Config file mode `0600` is specified and not checked. Topic-doc keys `quic_*` and `reconnect_*` are not parsed. Reconnect backoff is hardcoded 1 s, doubling, cap 60 s.
-- `set_writable` exists for backpressure and the binary never calls it.
+- `quic_*` and `reconnect_*` are struck in `configuration.md`. Reconnect backoff is hardcoded 1 s, doubling, cap 60 s.
 
 `core/tests/scenarios.rs` names the §16.8 cases and drives them through `handle` and `note_local` on `MemoryStorage`. It does not start notify threads or a two-process QUIC sync.
 
