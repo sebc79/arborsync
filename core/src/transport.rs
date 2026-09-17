@@ -60,6 +60,15 @@ impl AttemptLimiter {
         hits.push(now);
         true
     }
+
+    pub fn limited(&self, ip: IpAddr, now: Instant) -> bool {
+        self.hits.get(&ip).is_some_and(|hits| {
+            hits.iter()
+                .filter(|t| now.duration_since(**t) < self.window)
+                .count() as u32
+                >= self.max
+        })
+    }
 }
 
 pub fn listen(addr: SocketAddr, secret: &[u8; 32]) -> Result<Endpoint, TransportError> {

@@ -344,3 +344,238 @@ fn reload_rejects_slave_id_change_and_keeps_checkouts() {
     }
     assert_eq!(slave.checkout_local("src"), Some(src.as_path()));
 }
+
+fn backup_slave(
+    sandbox: &SyncSandbox,
+    bodies: MemoryContent,
+) -> Slave<MemoryStorage, MemoryContent> {
+    let overlap = sandbox.overlap_backup_slave();
+    let cfg_path = sandbox.write_slave_config(
+        "backup-1",
+        vec![
+            CheckoutConfig {
+                id: "src".into(),
+                central: "/src".into(),
+                local: overlap.src.to_string_lossy().into_owned(),
+            },
+            CheckoutConfig {
+                id: "bak".into(),
+                central: "/".into(),
+                local: overlap.bak.to_string_lossy().into_owned(),
+            },
+        ],
+        vec![format_hex_key(&MASTER)],
+    );
+    let cfg = LoadedSlave::load(&cfg_path).unwrap();
+    Slave::open(cfg, MemoryStorage::new(), bodies).unwrap()
+}
+
+#[test]
+fn symlink_resolved_local_overlap_fails_at_open() {
+    let sandbox = SyncSandbox::new();
+    let real = sandbox.add_checkout("overlap", "real");
+    let link_parent = sandbox.slave_root("overlap").join("checkouts");
+    let link = link_parent.join("via-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let cfg_path = sandbox.write_slave_config(
+        "overlap",
+        vec![
+            CheckoutConfig {
+                id: "a".into(),
+                central: "/src".into(),
+                local: real.to_string_lossy().into_owned(),
+            },
+            CheckoutConfig {
+                id: "b".into(),
+                central: "/docs".into(),
+                local: link.to_string_lossy().into_owned(),
+            },
+        ],
+        vec![format_hex_key(&MASTER)],
+    );
+    match LoadedSlave::load(&cfg_path) {
+        Err(arborsync_core::ConfigError::LocalOverlap { a, b }) => {
+            let a_path = std::path::PathBuf::from(&a);
+            let b_path = std::path::PathBuf::from(&b);
+            assert!(a_path.ends_with("real") || b_path.ends_with("real"));
+        }
+        Ok(cfg) => match Slave::open(cfg, MemoryStorage::new(), MemoryContent::new()) {
+            Err(SlaveError::Config(arborsync_core::ConfigError::LocalOverlap { a, b })) => {
+                assert_ne!(a, b);
+            }
+            Err(err) => panic!("expected LocalOverlap at open, got {err}"),
+            Ok(_) => panic!("expected LocalOverlap at open, got Ok"),
+        },
+        other => panic!("expected LocalOverlap or a loadable config, got {other:?}"),
+    }
+}
+
+#[test]
+fn incoming_delete_same_content_different_mode_writes_no_sidecar() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let applied = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            new: applied.clone(),
+            basis: None,
+        })
+        .unwrap();
+    let mut changed = applied.clone();
+    changed.mode = 0o100755;
+    match slave
+        .handle(ProtocolMessage::Delete {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            basis: file_node(&changed),
+        })
+        .unwrap()
+    {
+        Reply::Send(msgs) => assert!(msgs.is_empty()),
+        other => panic!("expected empty send, got {other:?}"),
+    }
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    let sidecar = conflict_sidecar_path(&local, &p("/src/hello.txt"), &hash);
+    assert!(!sidecar.exists());
+    assert!(!local.join("hello.txt").exists());
+}
+
+#[test]
+fn directory_delete_removes_nested_file_then_parent() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("nested/child.txt", b"inside");
+    slave
+        .note_local("src", LocalEvent::Changed(p("/src/nested")))
+        .unwrap();
+    slave
+        .note_local("src", LocalEvent::Changed(p("/src/nested/child.txt")))
+        .unwrap();
+    let dir_meta = slave.meta("src", &p("/src/nested")).unwrap().unwrap();
+    assert_eq!(
+        std::fs::read(local.join("nested/child.txt")).unwrap(),
+        b"inside"
+    );
+    slave
+        .handle(ProtocolMessage::Delete {
+            checkout_id: "src".into(),
+            path: p("/src/nested"),
+            basis: file_node(&dir_meta),
+        })
+        .unwrap();
+    assert!(!local.join("nested/child.txt").exists());
+    assert!(!local.join("nested").exists());
+}
+
+#[test]
+fn subscribe_reject_filters_denied_central_and_hangs_up_when_none_remain() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = backup_slave(&sandbox, MemoryContent::new());
+    match slave.subscribe() {
+        ProtocolMessage::Subscribe { checkouts, .. } => {
+            let mut centrals: Vec<_> = checkouts.iter().map(|c| c.central.as_str()).collect();
+            centrals.sort();
+            assert_eq!(centrals, ["/", "/src"]);
+        }
+        other => panic!("expected Subscribe, got {other:?}"),
+    }
+    match slave
+        .handle(ProtocolMessage::SubscribeReject {
+            reason: "central is outside allowed_prefixes".into(),
+            denied_centrals: vec![p("/")],
+        })
+        .unwrap()
+    {
+        Reply::Send(msgs) => match &msgs[..] {
+            [ProtocolMessage::Subscribe { checkouts, .. }] => {
+                assert_eq!(checkouts.len(), 1);
+                assert_eq!(checkouts[0].id, "src");
+                assert_eq!(checkouts[0].central, p("/src"));
+            }
+            other => panic!("expected filtered Subscribe, got {other:?}"),
+        },
+        other => panic!("expected Send, got {other:?}"),
+    }
+    match slave.subscribe() {
+        ProtocolMessage::Subscribe { checkouts, .. } => {
+            assert_eq!(checkouts.len(), 1);
+            assert_eq!(checkouts[0].central, p("/src"));
+        }
+        other => panic!("expected Subscribe, got {other:?}"),
+    }
+    match slave
+        .handle(ProtocolMessage::SubscribeReject {
+            reason: "central is outside allowed_prefixes".into(),
+            denied_centrals: vec![p("/src")],
+        })
+        .unwrap()
+    {
+        Reply::Hangup { reason } => {
+            assert_eq!(reason, "central is outside allowed_prefixes")
+        }
+        other => panic!("expected Hangup, got {other:?}"),
+    }
+}
+
+#[test]
+fn echo_of_an_applied_dir_or_meta_only_does_not_reannounce() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let dir = FileMetadata::directory(MTIME, 0o040755);
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/nested"),
+            new: dir,
+            basis: None,
+        })
+        .unwrap();
+    assert!(
+        slave
+            .note_local("src", LocalEvent::Changed(p("/src/nested")))
+            .unwrap()
+            .is_empty()
+    );
+
+    let file = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            new: file.clone(),
+            basis: None,
+        })
+        .unwrap();
+    let mut meta_only = file;
+    meta_only.mode = 0o100755;
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            new: meta_only,
+            basis: Some(file_node(&FileMetadata::file(
+                hello.len() as u64,
+                MTIME,
+                0o100644,
+                hash,
+            ))),
+        })
+        .unwrap();
+    assert!(
+        slave
+            .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -160,6 +161,8 @@ pub enum ConfigError {
     BadMasterAddr { value: String },
     #[error("invalid host path at {field}: {value}")]
     BadHostPath { field: String, value: String },
+    #[error("insecure mode {mode:o} on {path}")]
+    InsecureMode { path: PathBuf, mode: u32 },
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -245,6 +248,7 @@ impl LoadedMaster {
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
+        require_mode_600(path)?;
         let text = fs::read_to_string(path).map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
             source,
@@ -387,6 +391,7 @@ impl LoadedSlave {
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
+        require_mode_600(path)?;
         let text = fs::read_to_string(path).map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
             source,
@@ -639,7 +644,10 @@ fn project_slave(config: SlaveConfig) -> Result<LoadedSlave, ConfigError> {
             });
         }
         let central = check_prefix(&format!("checkouts[{i}].central"), &ck.central)?;
-        let local = expand_host_path(&format!("checkouts[{i}].local"), &ck.local)?;
+        let local = resolve_existing_local(expand_host_path(
+            &format!("checkouts[{i}].local"),
+            &ck.local,
+        )?)?;
         checkouts.push(LoadedCheckout {
             id: CheckoutId::new(ck.id),
             central,
@@ -670,6 +678,29 @@ fn project_slave(config: SlaveConfig) -> Result<LoadedSlave, ConfigError> {
         rescan_interval_seconds: config.rescan_interval_seconds,
         max_checkouts_per_slave: config.max_checkouts_per_slave,
     })
+}
+
+fn require_mode_600(path: &Path) -> Result<(), ConfigError> {
+    let metadata = fs::metadata(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        return Err(ConfigError::InsecureMode {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
+fn resolve_existing_local(path: PathBuf) -> Result<PathBuf, ConfigError> {
+    if !path.exists() {
+        return Ok(path);
+    }
+    path.canonicalize()
+        .map_err(|source| ConfigError::Io { path, source })
 }
 
 fn expand_host_path(field: &str, raw: &str) -> Result<PathBuf, ConfigError> {

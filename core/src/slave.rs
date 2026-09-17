@@ -6,14 +6,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::apply;
-use crate::config::{LoadedSlave, ReloadError, SlaveReload};
+use crate::config::{ConfigError, LoadedSlave, ReloadError, SlaveReload};
 use crate::hash::{ContentHash, FileNode};
 use crate::index;
 use crate::merkle::{DirChild, file_node};
 use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
 use crate::path::{
     CanonicalPath, PathError, canonical_to_host, conflict_sidecar_path, is_reserved_root_entry,
-    join_central, strip_central,
+    join_central, local_paths_overlap, strip_central,
 };
 use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
 use crate::reconcile::{WalkAction, decide_child};
@@ -48,6 +48,8 @@ pub enum SlaveError {
     UnknownCheckout(String),
     #[error(transparent)]
     Reload(#[from] ReloadError),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
 }
 
 impl SlaveError {
@@ -176,6 +178,7 @@ pub struct Slave<S: Storage, C: ContentHook> {
     checkouts: HashMap<String, Checkout>,
     pending: HashMap<(String, CanonicalPath), PendingApply>,
     pending_pulls: HashSet<(String, CanonicalPath)>,
+    denied_centrals: HashSet<CanonicalPath>,
 }
 
 impl<S: Storage, C: ContentHook> Slave<S, C> {
@@ -197,6 +200,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 },
             );
         }
+        reject_resolved_overlap(&checkouts)?;
         Ok(Self {
             cfg,
             store,
@@ -204,6 +208,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             checkouts,
             pending: HashMap::new(),
             pending_pulls: HashSet::new(),
+            denied_centrals: HashSet::new(),
         })
     }
 
@@ -224,6 +229,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 .cfg
                 .checkouts()
                 .iter()
+                .filter(|checkout| !self.denied_centrals.contains(checkout.central()))
                 .map(|checkout| CheckoutRef {
                     id: checkout.id().as_str().into(),
                     central: checkout.central().clone(),
@@ -303,14 +309,22 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             }
         }
 
+        reject_resolved_overlap(&self.checkouts)?;
+        let pins_changed = self.cfg.pins_master() != next.pins_master();
         self.cfg = next;
+        if plan.resubscribe || pins_changed {
+            self.denied_centrals.clear();
+        }
         Ok(plan)
     }
 
     pub fn handle(&mut self, msg: ProtocolMessage) -> Result<Reply, SlaveError> {
         match msg {
             ProtocolMessage::SubscribeAck { .. } => self.on_subscribe_ack(),
-            ProtocolMessage::SubscribeReject { reason, .. } => Ok(Reply::Hangup { reason }),
+            ProtocolMessage::SubscribeReject {
+                reason,
+                denied_centrals,
+            } => self.on_subscribe_reject(reason, denied_centrals),
             ProtocolMessage::RootAck {
                 checkout_id,
                 path,
@@ -598,6 +612,13 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             let checkout = self.checkout(checkout_id)?;
             strip_central(&checkout.central, &path)?
         };
+        let hash = match new.kind {
+            EntryKind::Dir => ContentHash::ZERO,
+            EntryKind::File | EntryKind::Symlink => new.content_hash,
+        };
+        self.checkout_mut(checkout_id)?
+            .inflight
+            .arm(path.clone(), hash);
         match new.kind {
             EntryKind::Dir => {
                 self.index_ancestors(checkout_id, &path)?;
@@ -608,17 +629,11 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 self.index_ancestors(checkout_id, &path)?;
                 let local = self.checkout(checkout_id)?.local.clone();
                 apply::atomic_put(&local, &relative, &new, body)?;
-                self.checkout_mut(checkout_id)?
-                    .inflight
-                    .arm(path.clone(), new.content_hash);
             }
             EntryKind::Symlink => {
                 self.index_ancestors(checkout_id, &path)?;
                 let local = self.checkout(checkout_id)?.local.clone();
                 apply::atomic_symlink(&local, &relative, &new, body)?;
-                self.checkout_mut(checkout_id)?
-                    .inflight
-                    .arm(path.clone(), new.content_hash);
             }
         }
         let ck = self.checkout(checkout_id)?.id.clone();
@@ -683,6 +698,13 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             )
         };
         let host = canonical_to_host(&local, &relative);
+        let hash = match new.kind {
+            EntryKind::Dir => ContentHash::ZERO,
+            EntryKind::File | EntryKind::Symlink => new.content_hash,
+        };
+        self.checkout_mut(checkout_id)?
+            .inflight
+            .arm(path.clone(), hash);
         match new.kind {
             EntryKind::Dir => apply::mkdir_live(&local, &relative, new)?,
             EntryKind::File => {
@@ -765,6 +787,27 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 .map_err(SlaveError::index)?,
         }
         batch.commit().map_err(SlaveError::index)
+    }
+
+    fn on_subscribe_reject(
+        &mut self,
+        reason: String,
+        denied_centrals: Vec<CanonicalPath>,
+    ) -> Result<Reply, SlaveError> {
+        for central in denied_centrals {
+            log::warn!("subscribe rejected {}: {reason}", central.as_str());
+            self.denied_centrals.insert(central);
+        }
+        if self
+            .cfg
+            .checkouts()
+            .iter()
+            .any(|checkout| !self.denied_centrals.contains(checkout.central()))
+        {
+            Ok(Reply::Send(vec![self.subscribe()]))
+        } else {
+            Ok(Reply::Hangup { reason })
+        }
     }
 
     fn on_subscribe_ack(&mut self) -> Result<Reply, SlaveError> {
@@ -942,7 +985,15 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             let host = canonical_to_host(&local, &rel_dir);
             let entries = match fs::read_dir(&host) {
                 Ok(entries) => entries,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err)
+                    if err.kind() == io::ErrorKind::NotFound
+                        || err.kind() == io::ErrorKind::PermissionDenied =>
+                {
+                    if err.kind() == io::ErrorKind::PermissionDenied {
+                        log::warn!("skipping {}: permission denied", host.display());
+                    }
+                    continue;
+                }
                 Err(err) => return Err(SlaveError::io(&host)(err)),
             };
             for entry in entries {
@@ -1105,6 +1156,22 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             .get_mut(id)
             .ok_or_else(|| SlaveError::UnknownCheckout(id.into()))
     }
+}
+
+fn reject_resolved_overlap(checkouts: &HashMap<String, Checkout>) -> Result<(), SlaveError> {
+    let locals: Vec<&PathBuf> = checkouts.values().map(|checkout| &checkout.local).collect();
+    for (i, a) in locals.iter().enumerate() {
+        for b in locals.iter().skip(i + 1) {
+            if local_paths_overlap(a, b) {
+                return Err(ConfigError::LocalOverlap {
+                    a: a.display().to_string(),
+                    b: b.display().to_string(),
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_host_bytes(host: &Path) -> Result<Option<Vec<u8>>, SlaveError> {

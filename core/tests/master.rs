@@ -2,7 +2,9 @@ use arborsync_core::LoadedMaster;
 use arborsync_core::config::{ReloadError, SlaveAcl};
 use arborsync_core::hash::{ContentHash, FileNode};
 use arborsync_core::keys::format_hex_key;
-use arborsync_core::master::{CasDecision, LocalEvent, Master, MemoryContent, Reply, decide_cas};
+use arborsync_core::master::{
+    CasDecision, LocalEvent, Master, MemoryContent, Reply, WholeFileLater, decide_cas,
+};
 use arborsync_core::merkle::{self, DirChild, file_node};
 use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};
 use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
@@ -572,7 +574,10 @@ fn reload_removes_acl_and_forgets_the_live_session() {
         .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
         .unwrap()
     {
-        Reply::Hangup { reason } => assert_eq!(reason, "unknown static key"),
+        Reply::Hangup { reason, rate_limit } => {
+            assert_eq!(reason, "unknown static key");
+            assert!(rate_limit);
+        }
         other => panic!("expected Hangup, got {other:?}"),
     }
 }
@@ -656,4 +661,139 @@ fn reload_accepts_an_extra_rotation_key() {
     master.reload(next).unwrap();
     assert_eq!(master.authorize_peer(&ALICE), Some("dev-alice"));
     assert_eq!(master.authorize_peer(&ALICE_NEW), Some("dev-alice"));
+}
+
+#[test]
+fn slave_id_mismatch_is_hangup() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    match master
+        .handle(ALICE, subscribe("backup-1", &[("src", "/src")]))
+        .unwrap()
+    {
+        Reply::Hangup { reason, rate_limit } => {
+            assert_eq!(reason, "slave_id backup-1 is not bound to this key");
+            assert!(rate_limit);
+        }
+        other => panic!("expected Hangup, got {other:?}"),
+    }
+}
+
+#[test]
+fn disconnect_drops_that_peers_pending_and_keeps_the_other() {
+    let sandbox = SyncSandbox::new();
+    let cfg_path = sandbox.write_master_config(vec![
+        slave_acl("dev-alice", ALICE, &["/src"]),
+        slave_acl("backup-1", BACKUP, &["/"]),
+    ]);
+    let cfg = LoadedMaster::load(&cfg_path).unwrap();
+    let mut master = Master::open(cfg, MemoryStorage::new(), WholeFileLater).unwrap();
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    master
+        .handle(BACKUP, subscribe("backup-1", &[("bak", "/")]))
+        .unwrap();
+
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o644, hash);
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/alice.txt"),
+                new: new.clone(),
+                basis: None,
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::SignatureRequest { path, .. }) => {
+            assert_eq!(path, p("/src/alice.txt"))
+        }
+        other => panic!("expected SignatureRequest, got {other:?}"),
+    }
+    match master
+        .handle(
+            BACKUP,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "bak".into(),
+                path: p("/backup.txt"),
+                new,
+                basis: None,
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::SignatureRequest { path, .. }) => {
+            assert_eq!(path, p("/backup.txt"))
+        }
+        other => panic!("expected SignatureRequest, got {other:?}"),
+    }
+
+    master.disconnect(ALICE);
+    match master
+        .apply_bulk(
+            ALICE,
+            arborsync_core::protocol::BulkHeader {
+                checkout_id: "src".into(),
+                path: p("/src/alice.txt"),
+                want_hash: hash,
+                encoding: arborsync_core::protocol::BulkEncoding::Whole,
+                size: hello.len() as u64,
+            },
+            hello,
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::Error { code, .. }) => {
+            assert_eq!(code, "unknown_transfer")
+        }
+        other => panic!("expected unknown_transfer, got {other:?}"),
+    }
+    match master
+        .apply_bulk(
+            BACKUP,
+            arborsync_core::protocol::BulkHeader {
+                checkout_id: "bak".into(),
+                path: p("/backup.txt"),
+                want_hash: hash,
+                encoding: arborsync_core::protocol::BulkEncoding::Whole,
+                size: hello.len() as u64,
+            },
+            hello,
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept { path, .. }) => {
+            assert_eq!(path, p("/backup.txt"))
+        }
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+}
+
+#[test]
+fn rescan_reuses_content_hash_when_only_mode_changes() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    let bytes = vec![b'x'; 8192];
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("big.bin", &bytes);
+    master.rescan().unwrap();
+    let first = master.meta(&p("/big.bin")).unwrap().unwrap();
+    assert_eq!(first.content_hash, hash_bytes(&bytes));
+    sandbox
+        .tree(&sandbox.central_root())
+        .set_mode("big.bin", first.mode | 0o111);
+    sandbox
+        .tree(&sandbox.central_root())
+        .set_mtime_ns("big.bin", first.mtime_ns);
+    master.rescan().unwrap();
+    let second = master.meta(&p("/big.bin")).unwrap().unwrap();
+    assert_eq!(second.content_hash, first.content_hash);
+    assert_eq!(second.content_hash, hash_bytes(&bytes));
+    assert_ne!(second.mode, first.mode);
 }
