@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::apply;
-use crate::config::LoadedMaster;
+use crate::config::{LoadedMaster, MasterReload, ReloadError};
 use crate::hash::{ContentHash, FileNode, SubtreeRoot};
 use crate::index;
 use crate::keys::format_hex_key;
@@ -168,6 +168,10 @@ impl Inflight {
         }
     }
 
+    fn set_window(&mut self, debounce: Duration) {
+        self.window = debounce * 2;
+    }
+
     fn arm(&mut self, path: CanonicalPath, hash: ContentHash) {
         let until = Instant::now() + self.window;
         self.entries.insert(path, InflightEntry { hash, until });
@@ -248,6 +252,25 @@ impl Roster {
             if keys.is_empty() {
                 self.by_central.remove(central);
             }
+        }
+    }
+
+    fn drop_checkout(&mut self, slave: &SlaveId, checkout: &CheckoutName) {
+        let Some(live) = self.by_slave.get_mut(slave) else {
+            return;
+        };
+        let Some(central) = live.checkouts.remove(checkout) else {
+            return;
+        };
+        let Some(keys) = self.by_central.get_mut(&central) else {
+            return;
+        };
+        keys.remove(&InterestKey {
+            slave: slave.clone(),
+            checkout: checkout.clone(),
+        });
+        if keys.is_empty() {
+            self.by_central.remove(&central);
         }
     }
 
@@ -566,6 +589,66 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
 
     pub fn authorize_peer(&self, peer: &[u8; 32]) -> Option<&str> {
         self.cfg.acl_for_public_key(peer).map(|acl| acl.id())
+    }
+
+    pub fn watcher_debounce_ms(&self) -> u64 {
+        self.cfg.watcher_debounce_ms()
+    }
+
+    pub fn rescan_interval_seconds(&self) -> u64 {
+        self.cfg.rescan_interval_seconds()
+    }
+
+    pub fn log_level(&self) -> &str {
+        self.cfg.log_level()
+    }
+
+    pub fn reload(&mut self, next: LoadedMaster) -> Result<MasterReload, ReloadError> {
+        let mut plan = self.cfg.plan_reload(&next)?;
+        let debounce_changed = next.watcher_debounce_ms() != self.cfg.watcher_debounce_ms();
+        self.cfg = next;
+        if debounce_changed {
+            self.inflight
+                .set_window(Duration::from_millis(self.cfg.watcher_debounce_ms()));
+        }
+        let live: Vec<(SlaveId, [u8; 32], Vec<(CheckoutName, CanonicalPath)>)> = self
+            .roster
+            .by_slave
+            .iter()
+            .map(|(id, session)| {
+                (
+                    id.clone(),
+                    session.peer,
+                    session
+                        .checkouts
+                        .iter()
+                        .map(|(checkout, central)| (checkout.clone(), central.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+        let mut drop_peers = Vec::new();
+        for (slave, peer, checkouts) in live {
+            if self.authorize_peer(&peer).is_none() {
+                drop_peers.push(peer);
+                plan.drop_slave_ids.push(slave.as_str().to_string());
+                self.roster.forget(&slave);
+                continue;
+            }
+            for (checkout, central) in checkouts {
+                if !self
+                    .cfg
+                    .acl_for_id(slave.as_str())
+                    .is_some_and(|acl| acl.allows_central(&central))
+                {
+                    self.roster.drop_checkout(&slave, &checkout);
+                }
+            }
+        }
+        plan.drop_peers = drop_peers;
+        plan.drop_slave_ids.sort();
+        plan.drop_slave_ids.dedup();
+        Ok(plan)
     }
 
     pub fn max_connections(&self) -> u32 {

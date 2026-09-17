@@ -47,6 +47,10 @@ impl AttemptLimiter {
         }
     }
 
+    pub fn set_max(&mut self, max: u32) {
+        self.max = max;
+    }
+
     pub fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
         let hits = self.hits.entry(ip).or_default();
         hits.retain(|t| now.duration_since(*t) < self.window);

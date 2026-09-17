@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
 
+use arborsync_core::config::{MasterReload, ReloadError, SlaveReload, log_level_filter};
 use arborsync_core::path::PathError;
 use arborsync_core::test_support::p;
 use arborsync_core::{ConfigError, LoadedMaster, LoadedSlave};
@@ -432,4 +433,147 @@ watcher_debounce_ms = 200
         Some(value) => unsafe { std::env::set_var("HOME", value) },
         None => unsafe { std::env::remove_var("HOME") },
     }
+}
+
+fn src_checkout() -> &'static str {
+    r#"
+checkouts = [
+    { id = "src", central = "/src", local = "/opt/src" },
+]
+"#
+}
+
+fn plan_master(current: &str, next: &str) -> Result<MasterReload, ReloadError> {
+    LoadedMaster::parse(current)
+        .unwrap()
+        .plan_reload(&LoadedMaster::parse(next).unwrap())
+}
+
+fn plan_slave(current: &str, next: &str) -> Result<SlaveReload, ReloadError> {
+    LoadedSlave::parse(current)
+        .unwrap()
+        .plan_reload(&LoadedSlave::parse(next).unwrap())
+}
+
+#[test]
+fn master_reload_rejects_listen_addr_change() {
+    let cases = [
+        (
+            "listen_addr",
+            r#"listen_addr = "127.0.0.1:8443""#,
+            r#"listen_addr = "127.0.0.1:9443""#,
+        ),
+        (
+            "db_path",
+            r#"db_path = "/var/lib/arborsync/index.redb""#,
+            r#"db_path = "/var/lib/arborsync/other.redb""#,
+        ),
+        (
+            "central_root",
+            r#"central_root = "/central""#,
+            r#"central_root = "/other""#,
+        ),
+        (
+            "master_key_path",
+            r#"master_key_path = "/etc/arborsync/master.key""#,
+            r#"master_key_path = "/etc/arborsync/other.key""#,
+        ),
+    ];
+    for (field, from, to) in cases {
+        match plan_master(&valid_master(), &valid_master().replace(from, to)) {
+            Err(ReloadError::RestartRequired { fields }) => {
+                assert!(
+                    fields.contains(&field.to_string()),
+                    "{field} missing from {fields:?}"
+                );
+            }
+            other => panic!("{field}: expected RestartRequired, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn master_reload_adds_and_removes_acl_rows() {
+    let next = master_toml(&format!(
+        r#"
+[[slaves]]
+id = "backup-1"
+public_keys = ["{BB_PIN}"]
+allowed_prefixes = ["/"]
+"#
+    ))
+    .replace(r#"log_level = "info""#, r#"log_level = "debug""#);
+    let plan = plan_master(&valid_master(), &next).unwrap();
+    assert!(plan.drop_peers.is_empty());
+    assert_eq!(plan.drop_slave_ids, vec!["dev-alice".to_string()]);
+    assert_eq!(plan.log_level, "debug");
+}
+
+#[test]
+fn slave_reload_rejects_master_addr_change() {
+    match plan_slave(
+        &slave_toml("checkouts = []"),
+        &slave_toml("checkouts = []").replace("master.example.com:8443", "other.example.com:8443"),
+    ) {
+        Err(ReloadError::RestartRequired { fields }) => {
+            assert!(fields.contains(&"master_addr".to_string()));
+        }
+        other => panic!("expected RestartRequired, got {other:?}"),
+    }
+}
+
+#[test]
+fn slave_reload_add_and_remove_checkouts() {
+    let plan = plan_slave(
+        &slave_toml(src_checkout()),
+        &slave_toml(
+            r#"
+checkouts = [
+    { id = "src",  central = "/src",  local = "/opt/src" },
+    { id = "docs", central = "/docs", local = "/opt/docs" },
+]
+"#,
+        ),
+    )
+    .unwrap();
+    assert_eq!(plan.added, vec!["docs".to_string()]);
+    assert!(plan.removed.is_empty());
+    assert_eq!(plan.resubscribe, true);
+}
+
+#[test]
+fn slave_reload_id_or_central_change_is_remove_and_add() {
+    let plan = plan_slave(
+        &slave_toml(src_checkout()),
+        &slave_toml(
+            r#"
+checkouts = [
+    { id = "src", central = "/docs", local = "/opt/src" },
+]
+"#,
+        ),
+    )
+    .unwrap();
+    assert_eq!(plan.removed, vec!["src".to_string()]);
+    assert_eq!(plan.added, vec!["src".to_string()]);
+    assert_eq!(plan.resubscribe, true);
+}
+
+#[test]
+fn log_level_filter_maps_known_levels_and_rejects_verbose() {
+    assert_eq!(log_level_filter("debug"), Some(log::LevelFilter::Debug));
+    assert_eq!(log_level_filter("verbose"), None);
+}
+
+#[test]
+fn slave_reload_log_only_does_not_resubscribe() {
+    let plan = plan_slave(
+        &slave_toml(src_checkout()),
+        &slave_toml(src_checkout()).replace(r#"log_level = "info""#, r#"log_level = "debug""#),
+    )
+    .unwrap();
+    assert!(plan.added.is_empty());
+    assert!(plan.removed.is_empty());
+    assert_eq!(plan.resubscribe, false);
+    assert_eq!(plan.log_level, "debug");
 }
