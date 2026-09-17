@@ -15,14 +15,14 @@ use crate::hash::{ContentHash, FileNode, SubtreeRoot};
 use crate::index;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
-use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
+use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
 use crate::path::{
-    canonical_to_host, conflict_sidecar_path, is_reserved_root_entry, join_central, CanonicalPath,
-    PathError,
+    CanonicalPath, PathError, canonical_to_host, conflict_sidecar_path, is_reserved_root_entry,
+    join_central,
 };
 use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
 use crate::storage::{CheckoutId, Storage};
-use crate::transfer::{self, signature_for, BulkTransfer};
+use crate::transfer::{self, BulkTransfer, signature_for};
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
 
@@ -813,7 +813,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 basis: None,
             }),
             _ => {
-                let entries = index::dir_children(&self.store, &CheckoutId::master(), &path)
+                let entries = index::list_children(&self.store, &CheckoutId::master(), &path)
                     .map_err(MasterError::index)?;
                 Ok(ProtocolMessage::DirListResponse {
                     checkout_id,

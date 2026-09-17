@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -169,6 +169,7 @@ pub struct Slave<S: Storage, C: ContentHook> {
     bodies: C,
     checkouts: HashMap<String, Checkout>,
     pending: HashMap<(String, CanonicalPath), PendingApply>,
+    pending_pulls: HashSet<(String, CanonicalPath)>,
 }
 
 impl<S: Storage, C: ContentHook> Slave<S, C> {
@@ -196,6 +197,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             bodies,
             checkouts,
             pending: HashMap::new(),
+            pending_pulls: HashSet::new(),
         })
     }
 
@@ -409,6 +411,12 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         new: FileMetadata,
         basis: Option<FileNode>,
     ) -> Result<Reply, SlaveError> {
+        if self
+            .pending_pulls
+            .remove(&(checkout_id.clone(), path.clone()))
+        {
+            return self.apply_new(&checkout_id, path, new);
+        }
         let current = self.meta(&checkout_id, &path)?;
         match decide_incoming(current.as_ref(), basis, &new) {
             ReplicaAction::NoopRefresh => {
@@ -699,13 +707,14 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
 
     fn on_subscribe_ack(&mut self) -> Result<Reply, SlaveError> {
         self.pending.clear();
-        Ok(Reply::Send(self.root_reports()?))
-    }
-
-    fn root_reports(&self) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        self.pending_pulls.clear();
         let mut ids: Vec<String> = self.checkouts.keys().cloned().collect();
         ids.sort();
-        self.root_reports_for(&ids)
+        let mut out = Vec::new();
+        for id in ids {
+            out.extend(self.rescan(&id)?);
+        }
+        Ok(Reply::Send(out))
     }
 
     fn root_reports_for(&self, ids: &[String]) -> Result<Vec<ProtocolMessage>, SlaveError> {
@@ -750,7 +759,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         entries: Vec<DirChild>,
     ) -> Result<Reply, SlaveError> {
         let ck = self.checkout(&checkout_id)?.id.clone();
-        let local = index::dir_children(&self.store, &ck, &path).map_err(SlaveError::index)?;
+        let local = index::list_children(&self.store, &ck, &path).map_err(SlaveError::index)?;
 
         let mut by_name: BTreeMap<String, (Option<DirChild>, Option<DirChild>)> = BTreeMap::new();
         for child in local {
@@ -778,12 +787,14 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 last_synced,
                 local_file,
             ) {
-                WalkAction::Match => {}
+                WalkAction::Matched => {}
                 WalkAction::Recurse => out.push(ProtocolMessage::DirListRequest {
                     checkout_id: checkout_id.clone(),
                     path: child_path,
                 }),
                 WalkAction::Pull => {
+                    self.pending_pulls
+                        .insert((checkout_id.clone(), child_path.clone()));
                     if slave_child.is_none()
                         && matches!(master_child, Some(DirChild::Directory { .. }))
                     {
@@ -795,43 +806,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                     });
                 }
                 WalkAction::AnnounceCreate | WalkAction::AnnounceCas => {
-                    if let Some(new) = local_meta {
-                        out.push(ProtocolMessage::FileAnnounce {
-                            checkout_id: checkout_id.clone(),
-                            path: child_path,
-                            new,
-                            basis: last_synced,
-                        });
-                    }
+                    out.extend(self.note_changed(&checkout_id, child_path)?);
                 }
                 WalkAction::AnnounceDelete => {
-                    if let Some(basis) = last_synced {
-                        out.push(ProtocolMessage::Delete {
-                            checkout_id: checkout_id.clone(),
-                            path: child_path,
-                            basis,
-                        });
-                    }
-                }
-                WalkAction::TypeChange => {
-                    if let Some(basis) = last_synced {
-                        out.push(ProtocolMessage::Delete {
-                            checkout_id: checkout_id.clone(),
-                            path: child_path.clone(),
-                            basis,
-                        });
-                    }
-                    if matches!(master_child, Some(DirChild::Directory { .. }))
-                        && local_meta
-                            .as_ref()
-                            .is_none_or(|meta| meta.kind != EntryKind::Dir)
-                    {
-                        self.ensure_local_dir(&checkout_id, &child_path)?;
-                    }
-                    out.push(ProtocolMessage::DirListRequest {
-                        checkout_id: checkout_id.clone(),
-                        path: child_path,
-                    });
+                    out.extend(self.note_removed(&checkout_id, &child_path)?);
                 }
             }
         }
@@ -886,8 +864,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             .store
             .get_meta(&ck, &central)
             .map_err(SlaveError::index)?;
-        if let Some(root) = meta::collect_for_rescan(&local, previous.as_ref())
-            .map_err(SlaveError::io(&local))?
+        if let Some(root) =
+            meta::collect_for_rescan(&local, previous.as_ref()).map_err(SlaveError::io(&local))?
         {
             found.insert(central.clone(), root);
         }

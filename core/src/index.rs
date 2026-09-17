@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::hash::{DirNode, SubtreeRoot};
-use crate::merkle::{dir_node, empty_dir_node, file_node, DirChild};
+use crate::merkle::{DirChild, dir_node, empty_dir_node, file_node};
 use crate::meta::{EntryKind, FileMetadata};
 use crate::path::{CanonicalPath, EntryName};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
@@ -98,7 +98,7 @@ fn recompute<S: Storage>(
     Ok(dir_node(&children_of(store, ck, dir, pending, computed)?))
 }
 
-pub(crate) fn dir_children<S: Storage>(
+pub(crate) fn list_children<S: Storage>(
     store: &S,
     ck: &CheckoutId,
     dir: &CanonicalPath,
@@ -160,7 +160,7 @@ fn children_of<S: Storage>(
 mod tests {
     use super::*;
     use crate::hash::ContentHash;
-    use crate::test_support::{p, MemoryStorage};
+    use crate::test_support::{MemoryStorage, p};
 
     fn file(byte: u8) -> FileMetadata {
         FileMetadata::file(1, 0, 0o100644, ContentHash::from_bytes([byte; 32]))
