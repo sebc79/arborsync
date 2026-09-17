@@ -108,6 +108,27 @@ No `ARBORSYNC_*` for keys or key paths.
 
 Config and key files are `0600`, owner = the daemon user. `write_static_key` sets `0600`. `LoadedMaster::load` / `LoadedSlave::load` reject any other config mode (`ConfigError::InsecureMode`). `parse` does not check mode. The process does not need root if it can read the tree, bind the UDP port, and write `db_path`.
 
+## Enable the master on NixOS
+
+Import `nixosModules.default` from this flake. Set `services.arborsync.master.enable` and `services.arborsync.master.configFile` to your TOML.
+
+```nix
+{
+  services.arborsync.master.enable = true;
+  services.arborsync.master.configFile = ./master.toml;
+}
+```
+
+The unit is `arborsync-master.service`. It copies `configFile` to `/run/arborsync/master.toml` with mode `0600`, then runs `arborsync master --config /run/arborsync/master.toml`. A store path is `0444`, and `LoadedMaster::load` rejects that mode, including when `/etc` is a symlink to the store. `systemctl reload arborsync-master` copies the file again and sends SIGHUP.
+
+Write the static key on the host, not in the Nix store:
+
+```
+arborsync keygen --out /var/lib/arborsync/master.key
+```
+
+Point `master_key_path` and `db_path` at paths the `arborsync` user can write. `StateDirectory=arborsync` creates `/var/lib/arborsync`. The unit does not create `/central` and does not run `keygen`. Open the UDP port in `listen_addr` yourself.
+
 ## Examples
 
 Minimal master (accept a full-replica slave):
