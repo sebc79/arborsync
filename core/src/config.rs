@@ -177,7 +177,6 @@ pub struct MasterReload {
     pub max_connections: u32,
     pub max_connection_attempts_per_minute: u32,
     pub drop_slave_ids: Vec<String>,
-    pub revoked_prefixes: Vec<(String, String)>,
     pub drop_peers: Vec<[u8; 32]>,
 }
 
@@ -344,23 +343,6 @@ impl LoadedMaster {
             .collect();
         drop_slave_ids.sort();
 
-        let mut revoked_prefixes = Vec::new();
-        for old in &self.slaves {
-            let Some(new) = next_by_id.get(old.id.as_str()) else {
-                continue;
-            };
-            for prefix in &old.allowed_prefixes {
-                if !new
-                    .allowed_prefixes
-                    .iter()
-                    .any(|candidate| candidate.covers(prefix))
-                {
-                    revoked_prefixes.push((old.id.clone(), prefix.as_str().to_string()));
-                }
-            }
-        }
-        revoked_prefixes.sort();
-
         Ok(MasterReload {
             log_level: next.log_level.clone(),
             watcher_debounce_ms: next.watcher_debounce_ms,
@@ -369,13 +351,8 @@ impl LoadedMaster {
             max_connections: next.max_connections,
             max_connection_attempts_per_minute: next.max_connection_attempts_per_minute,
             drop_slave_ids,
-            revoked_prefixes,
             drop_peers: Vec::new(),
         })
-    }
-
-    pub fn reload_plan(&self, next: &LoadedMaster) -> Result<MasterReload, ReloadError> {
-        self.plan_reload(next)
     }
 }
 
@@ -524,9 +501,7 @@ impl LoadedSlave {
         let mut added = added;
         removed.sort();
         added.sort();
-        let resubscribe = !added.is_empty()
-            || !removed.is_empty()
-            || self.master_public_keys != next.master_public_keys;
+        let resubscribe = !added.is_empty() || !removed.is_empty();
         Ok(SlaveReload {
             log_level: next.log_level.clone(),
             watcher_debounce_ms: next.watcher_debounce_ms,
@@ -535,10 +510,6 @@ impl LoadedSlave {
             removed,
             resubscribe,
         })
-    }
-
-    pub fn reload_plan(&self, next: &LoadedSlave) -> Result<SlaveReload, ReloadError> {
-        self.plan_reload(next)
     }
 }
 
