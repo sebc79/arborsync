@@ -2,8 +2,8 @@ use arborsync_core::hash::{ContentHash, DirNode, FileNode};
 use arborsync_core::meta::FileMetadata;
 use arborsync_core::path::{CanonicalPath, EntryName};
 use arborsync_core::protocol::{
-    DirEntry, Envelope, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE, PROTOCOL_VERSION,
-    ProtocolMessage, decode_control, encode_control,
+    BulkEncoding, BulkHeader, DirEntry, Envelope, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE,
+    PROTOCOL_VERSION, ProtocolMessage, decode_bulk, decode_control, encode_bulk, encode_control,
 };
 use arborsync_core::test_support::{name, p};
 
@@ -144,4 +144,49 @@ fn decode_rejects_unknown_v2_variant_as_unsupported_version() {
         decode_control(&frame).unwrap_err(),
         FrameError::UnsupportedVersion(2)
     );
+}
+
+#[test]
+fn bulk_frame_is_header_then_exact_size_bytes() {
+    let header = BulkHeader {
+        path: p("/src/hello.txt"),
+        checkout_id: "src".into(),
+        want_hash: ContentHash::from_bytes([7; 32]),
+        encoding: BulkEncoding::Whole,
+        size: 5,
+    };
+    let frame = encode_bulk(&header, b"hello").unwrap();
+    let (decoded, body, consumed) = decode_bulk(&frame).unwrap();
+    assert_eq!(decoded, header);
+    assert_eq!(body, b"hello");
+    assert_eq!(consumed, frame.len());
+}
+
+#[test]
+fn encode_bulk_rejects_a_body_that_does_not_match_size() {
+    let header = BulkHeader {
+        path: p("/src/hello.txt"),
+        checkout_id: "src".into(),
+        want_hash: ContentHash::from_bytes([7; 32]),
+        encoding: BulkEncoding::Whole,
+        size: 5,
+    };
+    assert_eq!(
+        encode_bulk(&header, b"hi").unwrap_err(),
+        FrameError::BodySize { got: 2, want: 5 }
+    );
+}
+
+#[test]
+fn decode_bulk_rejects_a_truncated_body() {
+    let header = BulkHeader {
+        path: p("/src/hello.txt"),
+        checkout_id: "src".into(),
+        want_hash: ContentHash::from_bytes([7; 32]),
+        encoding: BulkEncoding::Whole,
+        size: 5,
+    };
+    let mut frame = encode_bulk(&header, b"hello").unwrap();
+    frame.pop();
+    assert_eq!(decode_bulk(&frame).unwrap_err(), FrameError::Truncated);
 }

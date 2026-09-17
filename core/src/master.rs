@@ -5,7 +5,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::apply;
@@ -14,13 +15,14 @@ use crate::hash::{ContentHash, FileNode};
 use crate::index;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
-use crate::meta::{self, EntryKind, FileMetadata};
+use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
 use crate::path::{
     CanonicalPath, PathError, canonical_to_host, conflict_sidecar_path, is_reserved_root_entry,
     join_central,
 };
-use crate::protocol::{CheckoutAck, CheckoutRef, ProtocolMessage};
+use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
 use crate::storage::{CheckoutId, Storage};
+use crate::transfer::{self, BulkTransfer, signature_for};
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
 
@@ -79,6 +81,7 @@ impl Origin {
 pub enum Reply {
     Send(ProtocolMessage),
     Hangup { reason: String },
+    Bulk(BulkTransfer),
 }
 
 #[derive(Clone, Debug)]
@@ -342,6 +345,16 @@ enum Fanout {
     },
 }
 
+struct PendingApply {
+    peer: [u8; 32],
+    checkout_id: String,
+    path: CanonicalPath,
+    new: FileMetadata,
+    origin: Origin,
+    previous: Option<FileMetadata>,
+    retried: bool,
+}
+
 pub struct Master<S: Storage, C: ContentHook> {
     cfg: LoadedMaster,
     store: S,
@@ -349,6 +362,7 @@ pub struct Master<S: Storage, C: ContentHook> {
     roster: Roster,
     inflight: Inflight,
     bodies: C,
+    pending: HashMap<(String, CanonicalPath), PendingApply>,
 }
 
 impl<S: Storage, C: ContentHook> Master<S, C> {
@@ -366,6 +380,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             roster: Roster::default(),
             inflight: Inflight::new(debounce),
             bodies,
+            pending: HashMap::new(),
         };
         if index::root_is_dirty(&master.store, &CheckoutId::master()).map_err(MasterError::index)? {
             master.rescan()?;
@@ -412,10 +427,78 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                     reason: "peer disconnect".into(),
                 })
             }
+            ProtocolMessage::SignatureRequest {
+                checkout_id,
+                path,
+                want_hash,
+                signature,
+            } => self.on_signature_request(peer, checkout_id, path, want_hash, signature),
             other => Ok(Reply::Send(ProtocolMessage::Error {
                 code: "unsupported".into(),
                 message: format!("{other:?}"),
             })),
+        }
+    }
+
+    pub fn apply_bulk(
+        &mut self,
+        peer: [u8; 32],
+        header: BulkHeader,
+        body: &[u8],
+    ) -> Result<Reply, MasterError> {
+        let key = (header.checkout_id.clone(), header.path.clone());
+        let Some(pending) = self.pending.get(&key) else {
+            return Ok(Reply::Send(ProtocolMessage::Error {
+                code: "unknown_transfer".into(),
+                message: header.path.as_str().into(),
+            }));
+        };
+        if pending.peer != peer || pending.new.content_hash != header.want_hash {
+            return Ok(Reply::Send(ProtocolMessage::Error {
+                code: "unknown_transfer".into(),
+                message: header.path.as_str().into(),
+            }));
+        }
+        let host = canonical_to_host(&self.central_root, &header.path);
+        let basis = read_host_bytes(&host)?;
+        match transfer::reconstruct(header.encoding, body, basis.as_deref()) {
+            Ok(bytes) if hash_bytes(&bytes) == header.want_hash => {
+                let pending = self.pending.remove(&key).expect("pending");
+                self.publish(
+                    &pending.path,
+                    &pending.new,
+                    pending.previous.as_ref(),
+                    &bytes,
+                )?;
+                self.commit(
+                    &pending.origin,
+                    &pending.path,
+                    Some(&pending.new),
+                    pending.previous.as_ref(),
+                )?;
+                Ok(Reply::Send(ProtocolMessage::CasAccept {
+                    checkout_id: pending.checkout_id,
+                    path: pending.path,
+                    file_node: Some(file_node(&pending.new)),
+                }))
+            }
+            _ => {
+                let pending = self.pending.get_mut(&key).expect("pending");
+                if pending.retried {
+                    self.pending.remove(&key);
+                    return Ok(Reply::Send(ProtocolMessage::Error {
+                        code: "keep_live".into(),
+                        message: header.path.as_str().into(),
+                    }));
+                }
+                pending.retried = true;
+                Ok(Reply::Send(ProtocolMessage::SignatureRequest {
+                    checkout_id: pending.checkout_id.clone(),
+                    path: pending.path.clone(),
+                    want_hash: pending.new.content_hash,
+                    signature: Vec::new(),
+                }))
+            }
         }
     }
 
@@ -587,33 +670,34 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             }
             EntryKind::File | EntryKind::Symlink => match self.bodies.fetch(new.content_hash) {
                 ContentBytes::AskSender => {
+                    let host = canonical_to_host(&self.central_root, &path);
+                    let live = read_host_bytes(&host)?;
+                    let signature = signature_for(new.kind, live.as_deref());
+                    let want_hash = new.content_hash;
+                    self.pending.insert(
+                        (checkout_id.clone(), path.clone()),
+                        PendingApply {
+                            peer,
+                            checkout_id: checkout_id.clone(),
+                            path: path.clone(),
+                            new,
+                            origin: Origin::Slave {
+                                slave: session.slave,
+                                checkout,
+                            },
+                            previous: current,
+                            retried: false,
+                        },
+                    );
                     return Ok(ProtocolMessage::SignatureRequest {
                         checkout_id,
                         path,
-                        want_hash: new.content_hash,
-                        signature: Vec::new(),
+                        want_hash,
+                        signature,
                     });
                 }
                 ContentBytes::Whole(body) => {
-                    if let Some(previous) = &current {
-                        apply::sidecar_if_content_differs(
-                            &canonical_to_host(&self.central_root, &path),
-                            &conflict_sidecar_path(
-                                &self.central_root,
-                                &path,
-                                &previous.content_hash,
-                            ),
-                            previous,
-                            new.content_hash,
-                        )?;
-                    }
-                    self.index_ancestors(&path)?;
-                    if new.kind == EntryKind::File {
-                        apply::atomic_put(&self.central_root, &path, &new, &body)?;
-                    } else {
-                        apply::atomic_symlink(&self.central_root, &path, &new, &body)?;
-                    }
-                    self.inflight.arm(path.clone(), new.content_hash);
+                    self.publish(&path, &new, current.as_ref(), &body)?;
                 }
             },
         }
@@ -776,6 +860,61 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         self.commit(&Origin::Local, &path, Some(&found), current.as_ref())
     }
 
+    fn publish(
+        &mut self,
+        path: &CanonicalPath,
+        new: &FileMetadata,
+        previous: Option<&FileMetadata>,
+        body: &[u8],
+    ) -> Result<(), MasterError> {
+        if let Some(previous) = previous {
+            apply::sidecar_if_content_differs(
+                &canonical_to_host(&self.central_root, path),
+                &conflict_sidecar_path(&self.central_root, path, &previous.content_hash),
+                previous,
+                new.content_hash,
+            )?;
+        }
+        self.index_ancestors(path)?;
+        if new.kind == EntryKind::File {
+            apply::atomic_put(&self.central_root, path, new, body)?;
+        } else {
+            apply::atomic_symlink(&self.central_root, path, new, body)?;
+        }
+        self.inflight.arm(path.clone(), new.content_hash);
+        Ok(())
+    }
+
+    fn on_signature_request(
+        &mut self,
+        peer: [u8; 32],
+        checkout_id: String,
+        path: CanonicalPath,
+        want_hash: ContentHash,
+        signature: Vec<u8>,
+    ) -> Result<Reply, MasterError> {
+        let checkout = CheckoutName::new(checkout_id.clone());
+        let session = match self.live_checkout(&peer, &checkout) {
+            Ok(session) => session,
+            Err(refusal) => return Ok(Reply::Send(refusal.into_error(&checkout))),
+        };
+        if !session.central.covers(&path) {
+            return Ok(Reply::Send(outside_central(&path)));
+        }
+        let host = canonical_to_host(&self.central_root, &path);
+        let Some(source) = read_host_bytes(&host)? else {
+            return Ok(Reply::Send(missing_hash(&path)));
+        };
+        match transfer::fulfill(checkout_id, path.clone(), want_hash, &source, &signature) {
+            Ok(xfer) => Ok(Reply::Bulk(xfer)),
+            Err(transfer::TransferError::HashMismatch) => Ok(Reply::Send(missing_hash(&path))),
+            Err(err) => Ok(Reply::Send(ProtocolMessage::Error {
+                code: "transfer".into(),
+                message: err.to_string(),
+            })),
+        }
+    }
+
     fn note_removed(&mut self, path: &CanonicalPath) -> Result<(), MasterError> {
         if is_reserved(path) {
             return Ok(());
@@ -829,6 +968,25 @@ fn is_reserved(path: &CanonicalPath) -> bool {
         .split('/')
         .next()
         .is_some_and(is_reserved_root_entry)
+}
+
+fn read_host_bytes(host: &Path) -> Result<Option<Vec<u8>>, MasterError> {
+    match fs::symlink_metadata(host) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(MasterError::io(host)(err)),
+        Ok(md) if md.file_type().is_symlink() => {
+            let target = fs::read_link(host).map_err(MasterError::io(host))?;
+            Ok(Some(target.as_os_str().as_bytes().to_vec()))
+        }
+        Ok(_) => Ok(Some(fs::read(host).map_err(MasterError::io(host))?)),
+    }
+}
+
+fn missing_hash(path: &CanonicalPath) -> ProtocolMessage {
+    ProtocolMessage::Error {
+        code: "missing_hash".into(),
+        message: path.as_str().into(),
+    }
 }
 
 fn outside_central(path: &CanonicalPath) -> ProtocolMessage {

@@ -14,6 +14,7 @@ pub mod path;
 pub mod protocol;
 pub mod slave;
 pub mod storage;
+pub mod transfer;
 pub mod transport;
 
 pub mod test_support;

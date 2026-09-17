@@ -7,7 +7,10 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use quinn_hyphae::helper::{hyphae_client_endpoint, hyphae_server_endpoint};
 use quinn_hyphae::{HandshakeBuilder, HyphaePeerIdentity, RustCryptoBackend};
 
-use crate::protocol::{self, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE, ProtocolMessage};
+use crate::protocol::{
+    self, BulkHeader, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE, ProtocolMessage,
+};
+use crate::transfer::BulkTransfer;
 
 pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
@@ -136,4 +139,51 @@ pub async fn read_control(recv: &mut RecvStream) -> Result<ProtocolMessage, Tran
     frame.extend_from_slice(&header);
     frame.extend_from_slice(&payload);
     Ok(protocol::decode_control(&frame)?.0)
+}
+
+pub async fn write_bulk(conn: &Connection, xfer: &BulkTransfer) -> Result<(), TransportError> {
+    let frame = protocol::encode_bulk(&xfer.header, &xfer.body)?;
+    let mut send = conn
+        .open_uni()
+        .await
+        .map_err(|err| TransportError::Stream(err.to_string()))?;
+    send.write_all(&frame)
+        .await
+        .map_err(|err| TransportError::Stream(err.to_string()))?;
+    send.finish()
+        .map_err(|err| TransportError::Stream(err.to_string()))?;
+    Ok(())
+}
+
+pub async fn read_bulk(recv: &mut RecvStream) -> Result<(BulkHeader, Vec<u8>), TransportError> {
+    let mut len_bytes = [0u8; 4];
+    recv.read_exact(&mut len_bytes)
+        .await
+        .map_err(|err| TransportError::Stream(err.to_string()))?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    if len > MAX_CONTROL_FRAME {
+        return Err(TransportError::Frame(FrameError::TooLarge));
+    }
+    let mut payload = vec![0u8; len];
+    recv.read_exact(&mut payload)
+        .await
+        .map_err(|err| TransportError::Stream(err.to_string()))?;
+    let (header, _): (BulkHeader, usize) =
+        bincode::serde::decode_from_slice(&payload, bincode::config::standard())
+            .map_err(|err| TransportError::Frame(FrameError::Bincode(err.to_string())))?;
+    let mut body = vec![0u8; header.size as usize];
+    if !body.is_empty() {
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|err| TransportError::Stream(err.to_string()))?;
+    }
+    Ok((header, body))
+}
+
+pub async fn accept_bulk(conn: &Connection) -> Result<(BulkHeader, Vec<u8>), TransportError> {
+    let mut recv = conn
+        .accept_uni()
+        .await
+        .map_err(|err| TransportError::Stream(err.to_string()))?;
+    read_bulk(&mut recv).await
 }

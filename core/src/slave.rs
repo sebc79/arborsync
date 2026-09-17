@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::apply;
@@ -10,13 +10,14 @@ use crate::config::LoadedSlave;
 use crate::hash::{ContentHash, FileNode};
 use crate::index;
 use crate::merkle::file_node;
-use crate::meta::{self, EntryKind, FileMetadata};
+use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
 use crate::path::{
     CanonicalPath, PathError, canonical_to_host, conflict_sidecar_path, is_reserved_root_entry,
     strip_central,
 };
-use crate::protocol::{CheckoutRef, ProtocolMessage};
+use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
+use crate::transfer::{self, BulkTransfer, signature_for};
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
 pub use crate::master::LocalEvent;
@@ -25,6 +26,7 @@ pub use crate::master::LocalEvent;
 pub enum Reply {
     Send(Vec<ProtocolMessage>),
     Hangup { reason: String },
+    Bulk(BulkTransfer),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -153,11 +155,19 @@ struct Checkout {
     inflight: Inflight,
 }
 
+struct PendingApply {
+    checkout_id: String,
+    path: CanonicalPath,
+    new: FileMetadata,
+    retried: bool,
+}
+
 pub struct Slave<S: Storage, C: ContentHook> {
     cfg: LoadedSlave,
     store: S,
     bodies: C,
     checkouts: HashMap<String, Checkout>,
+    pending: HashMap<(String, CanonicalPath), PendingApply>,
 }
 
 impl<S: Storage, C: ContentHook> Slave<S, C> {
@@ -184,6 +194,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             store,
             bodies,
             checkouts,
+            pending: HashMap::new(),
         })
     }
 
@@ -260,10 +271,57 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 current,
             } => self.on_cas_reject(checkout_id, path, current),
             ProtocolMessage::Disconnect { reason } => Ok(Reply::Hangup { reason }),
+            ProtocolMessage::SignatureRequest {
+                checkout_id,
+                path,
+                want_hash,
+                signature,
+            } => self.on_signature_request(checkout_id, path, want_hash, signature),
             other => Ok(Reply::Send(vec![ProtocolMessage::Error {
                 code: "unsupported".into(),
                 message: format!("{other:?}"),
             }])),
+        }
+    }
+
+    pub fn apply_bulk(&mut self, header: BulkHeader, body: &[u8]) -> Result<Reply, SlaveError> {
+        let key = (header.checkout_id.clone(), header.path.clone());
+        let Some(pending) = self.pending.get(&key) else {
+            return Ok(Reply::Send(vec![ProtocolMessage::Error {
+                code: "unknown_transfer".into(),
+                message: header.path.as_str().into(),
+            }]));
+        };
+        if pending.new.content_hash != header.want_hash {
+            return Ok(Reply::Send(vec![ProtocolMessage::Error {
+                code: "unknown_transfer".into(),
+                message: header.path.as_str().into(),
+            }]));
+        }
+        let host = self.host_for(&header.checkout_id, &header.path)?;
+        let basis = read_host_bytes(&host)?;
+        match transfer::reconstruct(header.encoding, body, basis.as_deref()) {
+            Ok(bytes) if hash_bytes(&bytes) == header.want_hash => {
+                let pending = self.pending.remove(&key).expect("pending");
+                self.finish_apply(&pending.checkout_id, pending.path, pending.new, &bytes)
+            }
+            _ => {
+                let pending = self.pending.get_mut(&key).expect("pending");
+                if pending.retried {
+                    self.pending.remove(&key);
+                    return Ok(Reply::Send(vec![ProtocolMessage::Error {
+                        code: "keep_live".into(),
+                        message: header.path.as_str().into(),
+                    }]));
+                }
+                pending.retried = true;
+                Ok(Reply::Send(vec![ProtocolMessage::SignatureRequest {
+                    checkout_id: pending.checkout_id.clone(),
+                    path: pending.path.clone(),
+                    want_hash: pending.new.content_hash,
+                    signature: Vec::new(),
+                }]))
+            }
         }
     }
 
@@ -386,6 +444,42 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         path: CanonicalPath,
         new: FileMetadata,
     ) -> Result<Reply, SlaveError> {
+        match new.kind {
+            EntryKind::Dir => return self.finish_apply(checkout_id, path, new, &[]),
+            EntryKind::File | EntryKind::Symlink => match self.bodies.fetch(new.content_hash) {
+                ContentBytes::AskSender => {
+                    let host = self.host_for(checkout_id, &path)?;
+                    let live = read_host_bytes(&host)?;
+                    let signature = signature_for(new.kind, live.as_deref());
+                    let want_hash = new.content_hash;
+                    self.pending.insert(
+                        (checkout_id.to_string(), path.clone()),
+                        PendingApply {
+                            checkout_id: checkout_id.into(),
+                            path: path.clone(),
+                            new,
+                            retried: false,
+                        },
+                    );
+                    return Ok(Reply::Send(vec![ProtocolMessage::SignatureRequest {
+                        checkout_id: checkout_id.into(),
+                        path,
+                        want_hash,
+                        signature,
+                    }]));
+                }
+                ContentBytes::Whole(body) => self.finish_apply(checkout_id, path, new, &body),
+            },
+        }
+    }
+
+    fn finish_apply(
+        &mut self,
+        checkout_id: &str,
+        path: CanonicalPath,
+        new: FileMetadata,
+        body: &[u8],
+    ) -> Result<Reply, SlaveError> {
         let relative = {
             let checkout = self.checkout(checkout_id)?;
             strip_central(&checkout.central, &path)?
@@ -396,28 +490,22 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 let local = self.checkout(checkout_id)?.local.clone();
                 apply::mkdir_live(&local, &relative, &new)?;
             }
-            EntryKind::File | EntryKind::Symlink => match self.bodies.fetch(new.content_hash) {
-                ContentBytes::AskSender => {
-                    return Ok(Reply::Send(vec![ProtocolMessage::SignatureRequest {
-                        checkout_id: checkout_id.into(),
-                        path,
-                        want_hash: new.content_hash,
-                        signature: Vec::new(),
-                    }]));
-                }
-                ContentBytes::Whole(body) => {
-                    self.index_ancestors(checkout_id, &path)?;
-                    let local = self.checkout(checkout_id)?.local.clone();
-                    if new.kind == EntryKind::File {
-                        apply::atomic_put(&local, &relative, &new, &body)?;
-                    } else {
-                        apply::atomic_symlink(&local, &relative, &new, &body)?;
-                    }
-                    self.checkout_mut(checkout_id)?
-                        .inflight
-                        .arm(path.clone(), new.content_hash);
-                }
-            },
+            EntryKind::File => {
+                self.index_ancestors(checkout_id, &path)?;
+                let local = self.checkout(checkout_id)?.local.clone();
+                apply::atomic_put(&local, &relative, &new, body)?;
+                self.checkout_mut(checkout_id)?
+                    .inflight
+                    .arm(path.clone(), new.content_hash);
+            }
+            EntryKind::Symlink => {
+                self.index_ancestors(checkout_id, &path)?;
+                let local = self.checkout(checkout_id)?.local.clone();
+                apply::atomic_symlink(&local, &relative, &new, body)?;
+                self.checkout_mut(checkout_id)?
+                    .inflight
+                    .arm(path.clone(), new.content_hash);
+            }
         }
         let ck = self.checkout(checkout_id)?.id.clone();
         index::commit_leaf(
@@ -429,6 +517,41 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         )
         .map_err(SlaveError::index)?;
         Ok(Reply::Send(Vec::new()))
+    }
+
+    fn on_signature_request(
+        &mut self,
+        checkout_id: String,
+        path: CanonicalPath,
+        want_hash: ContentHash,
+        signature: Vec<u8>,
+    ) -> Result<Reply, SlaveError> {
+        let host = self.host_for(&checkout_id, &path)?;
+        let Some(source) = read_host_bytes(&host)? else {
+            return Ok(Reply::Send(vec![ProtocolMessage::Error {
+                code: "missing_hash".into(),
+                message: path.as_str().into(),
+            }]));
+        };
+        match transfer::fulfill(checkout_id, path.clone(), want_hash, &source, &signature) {
+            Ok(xfer) => Ok(Reply::Bulk(xfer)),
+            Err(transfer::TransferError::HashMismatch) => {
+                Ok(Reply::Send(vec![ProtocolMessage::Error {
+                    code: "missing_hash".into(),
+                    message: path.as_str().into(),
+                }]))
+            }
+            Err(err) => Ok(Reply::Send(vec![ProtocolMessage::Error {
+                code: "transfer".into(),
+                message: err.to_string(),
+            }])),
+        }
+    }
+
+    fn host_for(&self, checkout_id: &str, path: &CanonicalPath) -> Result<PathBuf, SlaveError> {
+        let checkout = self.checkout(checkout_id)?;
+        let relative = strip_central(&checkout.central, path)?;
+        Ok(canonical_to_host(&checkout.local, &relative))
     }
 
     fn apply_meta(
@@ -656,6 +779,18 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.checkouts
             .get_mut(id)
             .ok_or_else(|| SlaveError::UnknownCheckout(id.into()))
+    }
+}
+
+fn read_host_bytes(host: &Path) -> Result<Option<Vec<u8>>, SlaveError> {
+    match fs::symlink_metadata(host) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(SlaveError::io(host)(err)),
+        Ok(md) if md.file_type().is_symlink() => {
+            let target = fs::read_link(host).map_err(SlaveError::io(host))?;
+            Ok(Some(target.as_os_str().as_bytes().to_vec()))
+        }
+        Ok(_) => Ok(Some(fs::read(host).map_err(SlaveError::io(host))?)),
     }
 }
 

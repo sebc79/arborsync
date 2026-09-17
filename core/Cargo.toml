@@ -9,6 +9,7 @@ description = "Shared types, path-Merkle, storage, and framing for ArborSync"
 [dependencies]
 bincode.workspace = true
 blake3.workspace = true
+copia.workspace = true
 filetime.workspace = true
 log.workspace = true
 quinn.workspace = true
