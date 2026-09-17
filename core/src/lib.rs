@@ -17,6 +17,7 @@ pub mod slave;
 pub mod storage;
 pub mod transfer;
 pub mod transport;
+pub mod watch;
 
 pub mod test_support;
 

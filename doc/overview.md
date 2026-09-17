@@ -68,10 +68,10 @@ sequenceDiagram
         Slave->>Master: bulk Whole or Delta
     end
     Master->>Slave: CasAccept or CasReject
-    Master->>Other: FileAnnounce or Delete
+    Master->>Other: FileAnnounce, Delete, or Rename
 ```
 
-The fast path is the watcher. `notify-debouncer-mini` delivers paths, not event kinds. The binary turns every path into `LocalEvent::Changed`. If the file is gone, core treats that as a delete. A same-window rename is therefore a delete plus a create. The `Rename` message exists on the wire type and is not handled.
+The fast path is the watcher. `notify-debouncer-full` keeps Create, Write, Remove, Rename, and `Modify(Metadata)`. The binary maps `notify::Event` to `WatchEvent`, then core `to_local_events` produces `LocalEvent`. A same-window same-checkout rename is one `ProtocolMessage::Rename`. Unpaired or cross-checkout rename stays Delete plus Create. Apply is `fs::rename` plus index update, not a bulk copy. Config reload stays on `notify-debouncer-mini`.
 
 The slave updates that checkout's index and, when `FileNode` is not `last_synced`, sends `FileAnnounce`. Production `WholeFileLater` never holds file bytes. The recipient sends `SignatureRequest`. The sender opens a bulk stream with whole bytes or a `copia` delta. Apply reconstructs in memory, writes `.arborsync-tmp`, `fsync`s, checks BLAKE3, then `rename`s onto the live path.
 
@@ -106,7 +106,7 @@ After `SubscribeAck`, after every rescan, and after reconnect, the slave sends `
 
 Initial populate is the same walk with `last_synced` empty.
 
-Rescan is a full `stat` walk, not a dirty-subtree walk. The slave hashes a file again only when size, mtime, kind, or mode disagree with the index. The master walk always rehashes. The 60 s timer is `recv_timeout` on the notify channel, so a busy tree delays rescan.
+Rescan is a full `stat` walk, not a dirty-subtree walk. `collect_for_rescan` hashes again only when kind, size, or mtime disagree with the index. Mode is not a miss. Master `walk_central` uses that path too. The 60 s timer is `recv_timeout` on the notify channel, so a busy tree delays rescan.
 
 ## Identity and reload
 
@@ -140,7 +140,8 @@ Tightening `allowed_prefixes` drops those checkouts from interest and leaves the
 | Walk table only | `core/src/reconcile.rs` |
 | Tmp, rename, sidecar | `core/src/apply.rs` |
 | `copia` signature and patch | `core/src/transfer.rs` |
-| Accept, watch, SIGHUP | `src/master.rs`, `src/slave.rs`, `src/reload.rs` |
+| Accept, watch, SIGHUP | `src/master.rs`, `src/slave.rs`, `src/reload.rs`, `src/watch.rs` |
+| Watch kinds to `LocalEvent` | `core/src/watch.rs` |
 
 `ContentHook` is how tests skip the network. `MemoryContent` returns bytes immediately. `WholeFileLater` always returns `AskSender`, which is what the daemons use.
 
@@ -152,7 +153,6 @@ The library and both daemons implement the core loop in `spec.md` §16 items 1 t
 
 The ones that change behavior if you run the daemons today:
 
-- `Rename` is defined and unused. Same-window rename is delete plus create.
 - Type change is not one master transaction.
 - Local overlap after symlink resolve is rejected at `Slave::open` (and at load when both locals exist).
 - Master `publish` sidecars a successful content replace.

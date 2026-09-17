@@ -815,3 +815,125 @@ fn slave_can_cas_a_new_directory_and_later_delete_it() {
     }
     assert!(!sandbox.central_root().join("src/nested").exists());
 }
+
+#[test]
+fn same_window_rename_is_one_message_and_moves_central() {
+    let sandbox = SyncSandbox::new();
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash_bytes(b"moved"), b"moved".to_vec());
+    let mut master = two_slave_master(&sandbox, bodies);
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    master_msg(
+        master
+            .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+            .unwrap(),
+    );
+    master_msg(
+        master
+            .handle(BACKUP, subscribe("backup-1", &[("bak", "/")]))
+            .unwrap(),
+    );
+
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("old.txt", b"moved");
+    let created = slave
+        .note_local("src", LocalEvent::Changed(p("/src/old.txt")))
+        .unwrap();
+    let ProtocolMessage::FileAnnounce {
+        checkout_id,
+        path,
+        new,
+        basis,
+    } = created.into_iter().next().expect("one announce")
+    else {
+        panic!("expected FileAnnounce");
+    };
+    match master_msg(
+        master
+            .handle(
+                ALICE,
+                ProtocolMessage::FileAnnounce {
+                    checkout_id,
+                    path: path.clone(),
+                    new: new.clone(),
+                    basis,
+                },
+            )
+            .unwrap(),
+    ) {
+        ProtocolMessage::CasAccept {
+            file_node: node, ..
+        } => assert_eq!(node, Some(file_node(&new))),
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    slave_msgs(
+        slave
+            .handle(ProtocolMessage::CasAccept {
+                checkout_id: "src".into(),
+                path: path.clone(),
+                file_node: Some(file_node(&new)),
+            })
+            .unwrap(),
+    );
+    let _ = master.poll(BACKUP);
+
+    std::fs::rename(local.join("old.txt"), local.join("new.txt")).unwrap();
+    let announced = slave
+        .note_local(
+            "src",
+            LocalEvent::Renamed {
+                from: p("/src/old.txt"),
+                to: p("/src/new.txt"),
+            },
+        )
+        .unwrap();
+    let ProtocolMessage::Rename {
+        checkout_id,
+        from,
+        to,
+        from_basis,
+        to_new,
+    } = announced.into_iter().next().expect("one rename")
+    else {
+        panic!("expected Rename");
+    };
+    assert_eq!(from, p("/src/old.txt"));
+    assert_eq!(to, p("/src/new.txt"));
+    assert_eq!(from_basis, file_node(&new));
+    assert_eq!(to_new.content_hash, hash_bytes(b"moved"));
+
+    match master_msg(
+        master
+            .handle(
+                ALICE,
+                ProtocolMessage::Rename {
+                    checkout_id,
+                    from: from.clone(),
+                    to: to.clone(),
+                    from_basis,
+                    to_new: to_new.clone(),
+                },
+            )
+            .unwrap(),
+    ) {
+        ProtocolMessage::CasAccept {
+            path,
+            file_node: node,
+            ..
+        } => {
+            assert_eq!(path, p("/src/new.txt"));
+            assert_eq!(node, Some(file_node(&to_new)));
+        }
+        other => panic!("expected CasAccept on to, got {other:?}"),
+    }
+    assert!(sandbox.central_root().join("src/new.txt").exists());
+    assert!(!sandbox.central_root().join("src/old.txt").exists());
+
+    match &master.poll(BACKUP)[..] {
+        [ProtocolMessage::Rename { from, to, .. }] => {
+            assert_eq!(from, &p("/src/old.txt"));
+            assert_eq!(to, &p("/src/new.txt"));
+        }
+        other => panic!("expected Rename fan-out, got {other:?}"),
+    }
+}

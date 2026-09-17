@@ -8,16 +8,17 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use arborsync_core::ReloadError;
 use arborsync_core::keys::read_static_key;
-use arborsync_core::master::{LocalEvent, Master, Reply, WholeFileLater};
+use arborsync_core::master::{Master, Reply, WholeFileLater};
 use arborsync_core::path::host_to_canonical;
 use arborsync_core::storage::Storage;
 use arborsync_core::transport::{
     AttemptLimiter, accept_bulk, accept_control, listen, peer_static_key, read_control, write_bulk,
     write_control,
 };
+use arborsync_core::watch::to_local_events;
 use arborsync_core::{LoadedMaster, RedbStorage};
-use notify_debouncer_mini::notify::RecursiveMode;
-use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
+use notify::RecursiveMode;
+use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use quinn::Incoming;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -303,9 +304,8 @@ fn watch_central(
 ) -> anyhow::Result<()> {
     let root = master.lock().expect("master").central_root().to_path_buf();
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
-    let mut debouncer = new_debouncer(debounce, tx)?;
+    let mut debouncer = new_debouncer(debounce, None, tx)?;
     debouncer
-        .watcher()
         .watch(&root, RecursiveMode::Recursive)
         .with_context(|| format!("watch {}", root.display()))?;
     master.lock().expect("master").rescan()?;
@@ -316,29 +316,31 @@ fn watch_central(
         }
         match rx.recv_timeout(rescan_every) {
             Ok(Ok(events)) => {
+                let mut need_rescan = false;
+                let mut mapped = Vec::new();
                 for event in events {
-                    note(master, &root, &event.path)?;
+                    if event.need_rescan() {
+                        need_rescan = true;
+                        continue;
+                    }
+                    if let Some(watch) = crate::watch::from_notify(&event) {
+                        mapped.push(watch);
+                    }
+                }
+                if need_rescan {
+                    master.lock().expect("master").rescan()?;
+                }
+                let locals = to_local_events(mapped, |host| host_to_canonical(&root, host).ok());
+                for event in locals {
+                    master.lock().expect("master").note_local(event)?;
                 }
             }
-            Ok(Err(err)) => {
-                log::warn!("watch error, rescanning: {err}");
+            Ok(Err(errs)) => {
+                log::warn!("watch error, rescanning: {errs:?}");
                 master.lock().expect("master").rescan()?;
             }
             Err(RecvTimeoutError::Timeout) => master.lock().expect("master").rescan()?,
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
-        }
-    }
-}
-
-fn note(master: &SharedMaster, root: &Path, host: &Path) -> anyhow::Result<()> {
-    match host_to_canonical(root, host) {
-        Ok(path) => Ok(master
-            .lock()
-            .expect("master")
-            .note_local(LocalEvent::Changed(path))?),
-        Err(err) => {
-            log::warn!("skipping {}: {err}", host.display());
-            Ok(())
         }
     }
 }

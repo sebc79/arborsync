@@ -84,10 +84,15 @@ pub enum Reply {
     Bulk(BulkTransfer),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LocalEvent {
     Changed(CanonicalPath),
+    Metadata(CanonicalPath),
     Removed(CanonicalPath),
+    Renamed {
+        from: CanonicalPath,
+        to: CanonicalPath,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -307,6 +312,28 @@ impl Roster {
         }
     }
 
+    fn central_of(&self, key: &InterestKey) -> Option<&CanonicalPath> {
+        self.by_slave.get(&key.slave)?.checkouts.get(&key.checkout)
+    }
+
+    fn push_peer_checkout(
+        &mut self,
+        peer: &[u8; 32],
+        checkout: &CheckoutName,
+        msg: ProtocolMessage,
+    ) {
+        let Some(slave) = self.by_peer.get(peer).cloned() else {
+            return;
+        };
+        self.push(
+            &InterestKey {
+                slave,
+                checkout: checkout.clone(),
+            },
+            msg,
+        );
+    }
+
     fn take_outbox(&mut self, peer: &[u8; 32]) -> Vec<ProtocolMessage> {
         let Some(slave) = self.by_peer.get(peer).cloned() else {
             return Vec::new();
@@ -363,6 +390,42 @@ enum Fanout {
     Remove {
         basis: FileNode,
     },
+    Rename {
+        from: CanonicalPath,
+        to: CanonicalPath,
+        from_basis: FileNode,
+        to_new: FileMetadata,
+    },
+}
+
+impl Fanout {
+    fn to_message(&self, checkout_id: String, path: &CanonicalPath) -> ProtocolMessage {
+        match self {
+            Self::Announce { new, basis } => ProtocolMessage::FileAnnounce {
+                checkout_id,
+                path: path.clone(),
+                new: new.clone(),
+                basis: *basis,
+            },
+            Self::Remove { basis } => ProtocolMessage::Delete {
+                checkout_id,
+                path: path.clone(),
+                basis: *basis,
+            },
+            Self::Rename {
+                from,
+                to,
+                from_basis,
+                to_new,
+            } => ProtocolMessage::Rename {
+                checkout_id,
+                from: from.clone(),
+                to: to.clone(),
+                from_basis: *from_basis,
+                to_new: to_new.clone(),
+            },
+        }
+    }
 }
 
 struct PendingApply {
@@ -451,6 +514,20 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 checkout_id,
                 path,
                 basis,
+            )?)),
+            ProtocolMessage::Rename {
+                checkout_id,
+                from,
+                to,
+                from_basis,
+                to_new,
+            } => Ok(Reply::Send(self.on_rename(
+                peer,
+                checkout_id,
+                from,
+                to,
+                from_basis,
+                to_new,
             )?)),
             ProtocolMessage::Disconnect { .. } => {
                 self.disconnect(peer);
@@ -550,7 +627,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     pub fn note_local(&mut self, event: LocalEvent) -> Result<(), MasterError> {
         match event {
             LocalEvent::Changed(path) => self.note_changed(path),
+            LocalEvent::Metadata(path) => self.note_metadata(path),
             LocalEvent::Removed(path) => self.note_removed(&path),
+            LocalEvent::Renamed { from, to } => self.note_renamed(from, to),
         }
     }
 
@@ -854,6 +933,76 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         })
     }
 
+    fn on_rename(
+        &mut self,
+        peer: [u8; 32],
+        checkout_id: String,
+        from: CanonicalPath,
+        to: CanonicalPath,
+        from_basis: FileNode,
+        to_new: FileMetadata,
+    ) -> Result<ProtocolMessage, MasterError> {
+        let checkout = CheckoutName::new(checkout_id.clone());
+        let session = match self.live_checkout(&peer, &checkout) {
+            Ok(session) => session,
+            Err(refusal) => return Ok(refusal.into_error(&checkout)),
+        };
+        if !session.central.covers(&from) {
+            return Ok(outside_central(&from));
+        }
+        if !session.central.covers(&to) {
+            return Ok(outside_central(&to));
+        }
+
+        let current_from = self.meta(&from)?;
+        let current_to = self.meta(&to)?;
+        if let CasDecision::Reject { current } =
+            decide_cas(current_to.as_ref(), None, Some(to_new.kind))
+        {
+            return Ok(ProtocolMessage::CasReject {
+                checkout_id,
+                path: to,
+                current,
+            });
+        }
+        if let CasDecision::Reject { current } =
+            decide_cas(current_from.as_ref(), Some(from_basis), None)
+        {
+            return Ok(ProtocolMessage::CasReject {
+                checkout_id,
+                path: from,
+                current,
+            });
+        }
+
+        apply::rename_live(&self.central_root, &from, &to, &to_new)?;
+        let hash = match to_new.kind {
+            EntryKind::Dir => ContentHash::ZERO,
+            EntryKind::File | EntryKind::Symlink => to_new.content_hash,
+        };
+        self.inflight.arm(to.clone(), hash);
+        let origin = Origin::Slave {
+            slave: session.slave,
+            checkout: checkout.clone(),
+        };
+        let from_previous = current_from.expect("from CAS accepted a live path");
+        self.commit_rename(&origin, &from, &to, &from_previous, &to_new)?;
+        self.roster.push_peer_checkout(
+            &peer,
+            &checkout,
+            ProtocolMessage::CasAccept {
+                checkout_id: checkout_id.clone(),
+                path: from,
+                file_node: None,
+            },
+        );
+        Ok(ProtocolMessage::CasAccept {
+            checkout_id,
+            path: to,
+            file_node: Some(file_node(&to_new)),
+        })
+    }
+
     fn on_root_report(
         &self,
         peer: [u8; 32],
@@ -957,20 +1106,72 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 continue;
             }
             let checkout_id = key.checkout.as_str().to_string();
-            let msg = match &payload {
-                Fanout::Announce { new, basis } => ProtocolMessage::FileAnnounce {
-                    checkout_id,
-                    path: path.clone(),
-                    new: new.clone(),
-                    basis: *basis,
-                },
-                Fanout::Remove { basis } => ProtocolMessage::Delete {
-                    checkout_id,
-                    path: path.clone(),
-                    basis: *basis,
-                },
+            self.roster
+                .push(&key, payload.to_message(checkout_id, path));
+        }
+        Ok(())
+    }
+
+    fn commit_rename(
+        &mut self,
+        origin: &Origin,
+        from: &CanonicalPath,
+        to: &CanonicalPath,
+        from_previous: &FileMetadata,
+        to_new: &FileMetadata,
+    ) -> Result<(), MasterError> {
+        index::commit_leaf(
+            &self.store,
+            &CheckoutId::master(),
+            from,
+            None,
+            index::LastSynced::AdoptLeaf,
+        )
+        .map_err(MasterError::index)?;
+        self.index_ancestors(to)?;
+        index::commit_leaf(
+            &self.store,
+            &CheckoutId::master(),
+            to,
+            Some(to_new),
+            index::LastSynced::AdoptLeaf,
+        )
+        .map_err(MasterError::index)?;
+        if to_new.kind == EntryKind::Dir {
+            self.reindex_descendants(to, index::LastSynced::AdoptLeaf)?;
+        }
+
+        let mut keys: HashSet<InterestKey> = self.roster.interested(from).into_iter().collect();
+        keys.extend(self.roster.interested(to));
+        for key in keys {
+            if origin.committed(&key) {
+                continue;
+            }
+            let Some(central) = self.roster.central_of(&key).cloned() else {
+                continue;
             };
-            self.roster.push(&key, msg);
+            let checkout_id = key.checkout.as_str().to_string();
+            let covers_from = central.covers(from);
+            let covers_to = central.covers(to);
+            let payload = match (covers_from, covers_to) {
+                (true, true) => Fanout::Rename {
+                    from: from.clone(),
+                    to: to.clone(),
+                    from_basis: file_node(from_previous),
+                    to_new: to_new.clone(),
+                },
+                (true, false) => Fanout::Remove {
+                    basis: file_node(from_previous),
+                },
+                (false, true) => Fanout::Announce {
+                    new: to_new.clone(),
+                    basis: None,
+                },
+                (false, false) => continue,
+            };
+            let path = if covers_from { from } else { to };
+            self.roster
+                .push(&key, payload.to_message(checkout_id, path));
         }
         Ok(())
     }
@@ -1008,6 +1209,28 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         let Some(found) = meta::collect_from_path(&host).map_err(MasterError::io(&host))? else {
             return self.note_removed(&path);
         };
+        self.note_present(path, found)
+    }
+
+    fn note_metadata(&mut self, path: CanonicalPath) -> Result<(), MasterError> {
+        if is_reserved(&path) {
+            return Ok(());
+        }
+        let host = canonical_to_host(&self.central_root, &path);
+        let previous = self.meta(&path)?;
+        let Some(found) =
+            meta::collect_for_rescan(&host, previous.as_ref()).map_err(MasterError::io(&host))?
+        else {
+            return self.note_removed(&path);
+        };
+        self.note_present(path, found)
+    }
+
+    fn note_present(
+        &mut self,
+        path: CanonicalPath,
+        found: FileMetadata,
+    ) -> Result<(), MasterError> {
         if self.inflight.consume_if_echo(&path, &found.content_hash) {
             return Ok(());
         }
@@ -1017,6 +1240,54 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         }
         self.index_ancestors(&path)?;
         self.commit(&Origin::Local, &path, Some(&found), current.as_ref())
+    }
+
+    fn note_renamed(&mut self, from: CanonicalPath, to: CanonicalPath) -> Result<(), MasterError> {
+        if is_reserved(&from) || is_reserved(&to) {
+            return Ok(());
+        }
+        let host_to = canonical_to_host(&self.central_root, &to);
+        let Some(found) = meta::collect_from_path(&host_to).map_err(MasterError::io(&host_to))?
+        else {
+            return self.note_removed(&from);
+        };
+        if self.inflight.consume_if_echo(&to, &found.content_hash) {
+            return Ok(());
+        }
+        let Some(from_previous) = self.meta(&from)? else {
+            return self.note_present(to, found);
+        };
+        let current_to = self.meta(&to)?;
+        if current_to.as_ref() == Some(&found) && self.meta(&from)?.is_none() {
+            return Ok(());
+        }
+        self.commit_rename(&Origin::Local, &from, &to, &from_previous, &found)
+    }
+
+    fn reindex_descendants(
+        &mut self,
+        dir: &CanonicalPath,
+        last_synced: index::LastSynced,
+    ) -> Result<(), MasterError> {
+        let disk = self.walk_central()?;
+        for (path, found) in disk {
+            if &path == dir || !dir.covers(&path) {
+                continue;
+            }
+            let current = self.meta(&path)?;
+            if current.as_ref() == Some(&found) {
+                continue;
+            }
+            index::commit_leaf(
+                &self.store,
+                &CheckoutId::master(),
+                &path,
+                Some(&found),
+                last_synced,
+            )
+            .map_err(MasterError::index)?;
+        }
+        Ok(())
     }
 
     fn publish(

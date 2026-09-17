@@ -62,7 +62,7 @@ On a changed path `P` (file, symlink, or directory metadata):
 
 Insert: new `meta` row, then ancestor recompute.  
 Delete: remove `meta` (and `dir_nodes` if it was a dir, plus all descendants), then ancestor recompute.  
-Rename (same checkout, one debounce window): specified as delete `from` plus insert `to` in the same batch. As built: two `Changed` events and two `commit_leaf` calls. `ProtocolMessage::Rename` is unanswered.
+Rename (same checkout, one debounce window): `commit_leaf` removes `from` (and its descendants if it was a directory), then inserts `to`. A directory rename walks the host tree under `to` and indexes the children that moved with `fs::rename`. Unpaired or cross-checkout rename is still two independent `commit_leaf` calls (Delete plus Create).
 
 No global leaf array, no “rebuild on insert.”
 

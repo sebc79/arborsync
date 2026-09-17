@@ -169,6 +169,31 @@ pub fn mkdir_live(
     filetime::set_file_mtime(&dir, file_time(meta.mtime_ns)).map_err(at(&dir))
 }
 
+pub fn rename_live(
+    root: &Path,
+    from: &CanonicalPath,
+    to: &CanonicalPath,
+    meta: &FileMetadata,
+) -> Result<(), ApplyError> {
+    let from_host = canonical_to_host(root, from);
+    let to_host = canonical_to_host(root, to);
+    if let Some(parent) = to_host.parent() {
+        fs::create_dir_all(parent).map_err(at(parent))?;
+    }
+    fs::rename(&from_host, &to_host).map_err(at(&to_host))?;
+    match meta.kind {
+        EntryKind::Symlink => {
+            let mtime = file_time(meta.mtime_ns);
+            filetime::set_symlink_file_times(&to_host, mtime, mtime).map_err(at(&to_host))
+        }
+        EntryKind::File | EntryKind::Dir => {
+            fs::set_permissions(&to_host, Permissions::from_mode(meta.mode & 0o7777))
+                .map_err(at(&to_host))?;
+            filetime::set_file_mtime(&to_host, file_time(meta.mtime_ns)).map_err(at(&to_host))
+        }
+    }
+}
+
 pub fn remove_live(central_root: &Path, path: &CanonicalPath) -> Result<(), ApplyError> {
     let host = canonical_to_host(central_root, path);
     match fs::symlink_metadata(&host) {

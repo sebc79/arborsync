@@ -9,14 +9,14 @@ The master pushes **decisions**, not guessed deltas. Disconnected slaves are not
 A commit is either:
 
 - the master watcher/rescan applied a local FS change to the global index, or
-- the master accepted a slave `FileAnnounce` or `Delete` (CAS succeeded). `Rename` is defined and not handled.
+- the master accepted a slave `FileAnnounce`, `Delete`, or `Rename` (CAS succeeded).
 
 Then:
 
 1. Recompute ancestor `DirNode`s (`building-updating-merkle-trees.md`).
 2. Look up interested **connected** checkouts: `central` is a prefix of the changed path (`spec.md` §2).
 3. Skip the `(slave_id, checkout_id)` pair that just committed, when the commit came from a slave.
-4. For each remaining `(slave_id, checkout_id)`, send `FileAnnounce` or `Delete` with that target `checkout_id`. `basis` is the pre-commit `FileNode`.
+4. For each remaining `(slave_id, checkout_id)`, send `FileAnnounce` or `Delete` with that target `checkout_id`. `basis` is the pre-commit `FileNode`. A same-window rename that covers both paths is one `Rename` instead of Delete plus Create. A checkout that covers only `from` gets `Delete`. A checkout that covers only `to` gets a create `FileAnnounce`.
 5. The **recipient** asks for bytes (`SignatureRequest` + bulk stream) if it decides to apply (`applying-updates.md`).
 
 Do not send `MerkleUpdate` proofs. Do not generate a `copia` delta until a recipient has sent a signature (or asked for whole-file).
