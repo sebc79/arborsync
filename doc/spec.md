@@ -226,7 +226,7 @@ pub enum EntryKind { File = 1, Dir = 2, Symlink = 3 }
 
 ### 7. Change detection
 
-- `notify` + `notify-debouncer-mini`, recursive, debounce default 200 ms (configurable 200–500).
+- File watches use `notify` 8 + `notify-debouncer-full` 0.5, recursive, debounce default 200 ms (configurable 200–500). Config reload stays on `notify-debouncer-mini`.
 - Master: one watch on `central_root`.
 - Slave: one watch per checkout `local`.
 - Events: Create, Write, Remove, Rename, chmod/mtime (`Modify(Metadata)`).
@@ -518,6 +518,7 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 quinn-hyphae = "0.1"
 copia = "0.3"
 notify = "8"
+notify-debouncer-full = "0.5"
 notify-debouncer-mini = "0.5"
 redb = "2"
 bincode = "2"
@@ -561,8 +562,8 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §4 / §14 config files `0600` | `LoadedMaster::load` / `LoadedSlave::load` reject a file whose mode is not `0600` (`ConfigError::InsecureMode`). `parse` does not check mode. |
 | ✅ | §4 / §12 unknown-key rate limit | `AttemptLimiter::limited` drops the accept before XX. After XX, unknown key records `allow` and closes. `slave_id` mismatch is `Reply::Hangup` (the binary also `allow`s). Prefix deny stays `SubscribeReject`. |
 | ✅ | §6 skip device, socket, FIFO | `collect_from_path` / `collect_for_rescan` return `Ok(None)` and log a warn for device, socket, FIFO, and `PermissionDenied`. The walk continues. |
-| ⚠️ | §6 / §7 hash only on size/mtime miss | `collect_for_rescan` reuses `content_hash` when kind, size, and mtime match. Mode is not a miss. The returned row carries the fresh mode. Master `walk_central` uses `collect_for_rescan`. Watcher paths still call `collect_from_path`. |
-| ❌ | §7 event kinds and same-window `Rename` | `notify-debouncer-mini` delivers a path only. Binaries emit `LocalEvent::Changed`. `ProtocolMessage::Rename` is defined and unanswered (`Error { code: "unsupported" }`). Effective rename is Delete + Create. |
+| ⚠️ | §6 / §7 hash only on size/mtime miss | `collect_for_rescan` reuses `content_hash` when kind, size, and mtime match. Mode is not a miss. The returned row carries the fresh mode. Master `walk_central` and `LocalEvent::Metadata` use `collect_for_rescan`. Create and Write still call `collect_from_path`. |
+| ✅ | §7 event kinds and same-window `Rename` | `notify-debouncer-full` 0.5 keeps Create, Write, Remove, Rename, and `Modify(Metadata)`. Same-window same-checkout rename is one `ProtocolMessage::Rename`. Unpaired or cross-checkout rename stays Delete plus Create. Apply is `fs::rename` plus index update, not a bulk copy. |
 | ✅ | §7 inflight before apply | Armed before the live `rename` / `mkdir` / meta apply. Files, symlinks, dirs (`ContentHash::ZERO`), and meta-only apply all arm. |
 | ✅ | §8 directory CAS | Live directories CAS on `FileNode` like files (create, meta update, delete). `last_synced` stores that `FileNode`. Kind mismatch is still `CasReject` (the type-change row). Master-local dir edits still `commit` as replica of record, same as files. |
 | ❌ | §8 type change in one master transaction | Kind mismatch is `CasReject`. Reconcile Pull on the slave can remove then mkdir. |

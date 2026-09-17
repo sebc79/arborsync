@@ -72,7 +72,7 @@ Direction (normative):
 | bulk `Whole` / `Delta` | the side that has `want_hash` |
 | `Error` / `Disconnect` | either |
 
-`Rename` is defined and unanswered. Both `handle` methods reply `Error { code: "unsupported" }`.
+`Rename` is handled on both `handle` methods. Same-window same-checkout rename is `fs::rename` plus index update. Unpaired or cross-checkout rename stays Delete plus Create.
 
 `DirListResponse` in v1: when the slave requests a path, the master answers from the global index. When the walk needs the slave’s view, the slave already has it locally and does not need the master to ask. 3-way uses the slave’s index plus the master’s listing. A `DirListRequest` on a file path returns `FileAnnounce`.
 

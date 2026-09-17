@@ -81,7 +81,13 @@ Do not compute a delta against a remembered remote snapshot. Do not put bodies i
 
 **Delete** applies only if local `FileNode == basis` (or `== last_synced`). Otherwise the slave sidecars local bytes (`incoming` hash `ContentHash::ZERO`) and then deletes. Wire `Delete` has no `content_hash`, so a meta-only miss still sidecars. If local is already absent: no-op, clear `last_synced`. Dirs never sidecar on delete.
 
-**Rename** is specified (`from` and `to` in one debounce window, same checkout) as atomic delete `from` plus create `to`. `ProtocolMessage::Rename` is defined and unanswered. The watcher emits two `Changed` events instead (`filesystem-scanning-watching.md`).
+**Rename** applies when `from` and `to` land in the same debounce window and the same checkout. The host path moves with `fs::rename`. Parent directories of `to` are created. Mode and mtime come from `to_new` (`filetime`, symlink times for symlinks). Children of a directory move with the rename. The index then shows those children under `to`.
+
+Master CAS accepts the delete of `from` (`FileNode == from_basis`) and the create of `to` (`to` absent). A miss on `from` is `CasReject { path: from }`. A live `to` is `CasReject { path: to }`. Success replies `CasAccept` on `to` and enqueues `CasAccept` on `from` with `file_node: None`. Fan-out is one `Rename` when a checkout covers both paths, `Delete` when it covers only `from`, and `FileAnnounce` create when it covers only `to`.
+
+Slave apply uses `RenameAction`. `from` absent and `to` already matching `to_new` is `NoopRefresh`. Both absent is `CreateAtTo`. Matching `from_basis` or `last_synced` is `Apply`. Divergent file content sidecars `from`, then `rename_live`. After apply, `last_synced` on `from` is cleared and `last_synced` on `to` becomes `FileNode(to_new)`. Inflight arms on `to`.
+
+Unpaired or cross-checkout rename stays Delete plus Create (`filesystem-scanning-watching.md`).
 
 Master `publish` writes a sidecar whenever the previous live content hash differs from the incoming hash, including a successful CAS replace. Spec §8 reserves the sidecar for the loser.
 
