@@ -68,7 +68,7 @@ No `slave_subscriptions` table. Active interest is process memory, rebuilt from 
 
 Specified: one batch per debounce window, per accepted CAS, or per reconcile directory. As built: one `commit_leaf` per changed path. Origin `CasAccept` writes `last_synced` in a following batch. Order inside a `commit_leaf` batch:
 
-1. Apply leaf `meta` / deletes (and descendant prefix deletes for a directory remove).
+1. Apply leaf `meta` / deletes. A directory remove and a non-dir leaf both drop the path prefix so descendants cannot remain.
 2. Recompute and `put_dir_node` for each affected ancestor, root-ward.
 3. Update `last_synced` for paths whose live content now matches the agreed version.
 4. `commit`.

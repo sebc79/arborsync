@@ -779,11 +779,6 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         body: &[u8],
     ) -> Result<Reply, SlaveError> {
         let previous = self.meta(checkout_id, &path)?;
-        // Kind change: purge then insert. commit_leaf(Some) does not drop descendants.
-        let kind_change = previous.as_ref().is_some_and(|live| live.kind != new.kind);
-        if kind_change {
-            self.remove_path(checkout_id, &path, previous.as_ref())?;
-        }
         let (local, relative) = {
             let checkout = self.checkout(checkout_id)?;
             (
@@ -799,13 +794,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             .inflight
             .arm(path.clone(), hash);
         self.index_ancestors(checkout_id, &path)?;
-        apply::replace_live(
-            &local,
-            &relative,
-            &new,
-            body,
-            if kind_change { None } else { previous.as_ref() },
-        )?;
+        apply::replace_live(&local, &relative, &new, body, previous.as_ref())?;
         let ck = self.checkout(checkout_id)?.id.clone();
         index::commit_leaf(
             &self.store,

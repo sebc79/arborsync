@@ -1094,19 +1094,6 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         new: Option<&FileMetadata>,
         previous: Option<&FileMetadata>,
     ) -> Result<(), MasterError> {
-        // commit_leaf(Some) does not purge descendants; a kind change must.
-        if let (Some(new), Some(previous)) = (new, previous) {
-            if previous.kind != new.kind {
-                index::commit_leaf(
-                    &self.store,
-                    &CheckoutId::master(),
-                    path,
-                    None,
-                    index::LastSynced::AdoptLeaf,
-                )
-                .map_err(MasterError::index)?;
-            }
-        }
         index::commit_leaf(
             &self.store,
             &CheckoutId::master(),
