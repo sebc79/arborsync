@@ -54,6 +54,13 @@ impl CanonicalPath {
         &self.0
     }
 
+    pub fn name(&self) -> &str {
+        match self.0.rsplit_once('/') {
+            Some((_, name)) if !name.is_empty() => name,
+            _ => "/",
+        }
+    }
+
     /// `None` at the hierarchy root. `/src/a` yields `/src`, `/src` yields `/`.
     pub fn parent(&self) -> Option<CanonicalPath> {
         if self.0 == "/" {

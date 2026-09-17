@@ -12,6 +12,7 @@ pub mod merkle;
 pub mod meta;
 pub mod path;
 pub mod protocol;
+pub mod reconcile;
 pub mod slave;
 pub mod storage;
 pub mod transfer;

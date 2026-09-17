@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -9,13 +9,14 @@ use crate::apply;
 use crate::config::LoadedSlave;
 use crate::hash::{ContentHash, FileNode};
 use crate::index;
-use crate::merkle::file_node;
+use crate::merkle::{DirChild, file_node};
 use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
 use crate::path::{
     CanonicalPath, PathError, canonical_to_host, conflict_sidecar_path, is_reserved_root_entry,
-    strip_central,
+    join_central, strip_central,
 };
 use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
+use crate::reconcile::{WalkAction, decide_child};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
 use crate::transfer::{self, BulkTransfer, signature_for};
 
@@ -168,6 +169,7 @@ pub struct Slave<S: Storage, C: ContentHook> {
     bodies: C,
     checkouts: HashMap<String, Checkout>,
     pending: HashMap<(String, CanonicalPath), PendingApply>,
+    pending_pulls: HashSet<(String, CanonicalPath)>,
 }
 
 impl<S: Storage, C: ContentHook> Slave<S, C> {
@@ -195,6 +197,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             bodies,
             checkouts,
             pending: HashMap::new(),
+            pending_pulls: HashSet::new(),
         })
     }
 
@@ -244,8 +247,19 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
 
     pub fn handle(&mut self, msg: ProtocolMessage) -> Result<Reply, SlaveError> {
         match msg {
-            ProtocolMessage::SubscribeAck { .. } => Ok(Reply::Send(Vec::new())),
+            ProtocolMessage::SubscribeAck { .. } => self.on_subscribe_ack(),
             ProtocolMessage::SubscribeReject { reason, .. } => Ok(Reply::Hangup { reason }),
+            ProtocolMessage::RootAck {
+                checkout_id,
+                path,
+                matched,
+                ..
+            } => self.on_root_ack(&checkout_id, path, matched),
+            ProtocolMessage::DirListResponse {
+                checkout_id,
+                path,
+                entries,
+            } => self.on_dir_list(checkout_id, path, entries),
             ProtocolMessage::FileAnnounce {
                 checkout_id,
                 path,
@@ -358,6 +372,38 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             .map_err(SlaveError::index)
     }
 
+    pub fn rescan(&mut self, checkout_id: &str) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        let (ck, central) = {
+            let checkout = self.checkout(checkout_id)?;
+            (checkout.id.clone(), checkout.central.clone())
+        };
+        let disk = self.walk_checkout(checkout_id)?;
+        let indexed = self
+            .store
+            .range_meta(&ck, &central)
+            .map_err(SlaveError::index)?;
+
+        for (path, _) in indexed {
+            if disk.contains_key(&path) {
+                continue;
+            }
+            if self.meta(checkout_id, &path)?.is_none() {
+                continue;
+            }
+            index::commit_leaf(&self.store, &ck, &path, None, index::LastSynced::Keep)
+                .map_err(SlaveError::index)?;
+        }
+        for (path, found) in &disk {
+            let current = self.meta(checkout_id, path)?;
+            if current.as_ref() == Some(found) {
+                continue;
+            }
+            index::commit_leaf(&self.store, &ck, path, Some(found), index::LastSynced::Keep)
+                .map_err(SlaveError::index)?;
+        }
+        self.root_reports_for(&[checkout_id.to_string()])
+    }
+
     fn on_announce(
         &mut self,
         checkout_id: String,
@@ -365,6 +411,12 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         new: FileMetadata,
         basis: Option<FileNode>,
     ) -> Result<Reply, SlaveError> {
+        if self
+            .pending_pulls
+            .remove(&(checkout_id.clone(), path.clone()))
+        {
+            return self.apply_new(&checkout_id, path, new);
+        }
         let current = self.meta(&checkout_id, &path)?;
         match decide_incoming(current.as_ref(), basis, &new) {
             ReplicaAction::NoopRefresh => {
@@ -653,12 +705,222 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         batch.commit().map_err(SlaveError::index)
     }
 
+    fn on_subscribe_ack(&mut self) -> Result<Reply, SlaveError> {
+        self.pending.clear();
+        self.pending_pulls.clear();
+        let mut ids: Vec<String> = self.checkouts.keys().cloned().collect();
+        ids.sort();
+        let mut out = Vec::new();
+        for id in ids {
+            out.extend(self.rescan(&id)?);
+        }
+        Ok(Reply::Send(out))
+    }
+
+    fn root_reports_for(&self, ids: &[String]) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let checkout = self.checkout(id)?;
+            out.push(ProtocolMessage::RootReport {
+                root: index::subtree_root(&self.store, &checkout.id, &checkout.central)
+                    .map_err(SlaveError::index)?,
+                path: checkout.central.clone(),
+                checkout_id: id.clone(),
+            });
+        }
+        Ok(out)
+    }
+
+    fn on_root_ack(
+        &mut self,
+        checkout_id: &str,
+        path: CanonicalPath,
+        matched: bool,
+    ) -> Result<Reply, SlaveError> {
+        let checkout = self.checkout(checkout_id)?;
+        if matched {
+            return Ok(Reply::Send(Vec::new()));
+        }
+        let path = if path == checkout.central {
+            path
+        } else {
+            checkout.central.clone()
+        };
+        Ok(Reply::Send(vec![ProtocolMessage::DirListRequest {
+            checkout_id: checkout_id.into(),
+            path,
+        }]))
+    }
+
+    fn on_dir_list(
+        &mut self,
+        checkout_id: String,
+        path: CanonicalPath,
+        entries: Vec<DirChild>,
+    ) -> Result<Reply, SlaveError> {
+        let ck = self.checkout(&checkout_id)?.id.clone();
+        let local = index::list_children(&self.store, &ck, &path).map_err(SlaveError::index)?;
+
+        let mut by_name: BTreeMap<String, (Option<DirChild>, Option<DirChild>)> = BTreeMap::new();
+        for child in local {
+            by_name.insert(child.name().as_str().to_string(), (Some(child), None));
+        }
+        for child in entries {
+            by_name
+                .entry(child.name().as_str().to_string())
+                .and_modify(|pair| pair.1 = Some(child.clone()))
+                .or_insert((None, Some(child)));
+        }
+
+        let mut out = Vec::new();
+        for (entry, (slave_child, master_child)) in by_name {
+            let child_path = join_central(&path, &entry)?;
+            let last_synced = self.last_synced(&checkout_id, &child_path)?;
+            let local_meta = self.meta(&checkout_id, &child_path)?;
+            let local_file = local_meta
+                .as_ref()
+                .filter(|m| m.kind != EntryKind::Dir)
+                .map(file_node);
+            match decide_child(
+                slave_child.as_ref(),
+                master_child.as_ref(),
+                last_synced,
+                local_file,
+            ) {
+                WalkAction::Matched => {}
+                WalkAction::Recurse => out.push(ProtocolMessage::DirListRequest {
+                    checkout_id: checkout_id.clone(),
+                    path: child_path,
+                }),
+                WalkAction::Pull => {
+                    let master_dir = matches!(master_child, Some(DirChild::Directory { .. }));
+                    let slave_dir = matches!(slave_child, Some(DirChild::Directory { .. }));
+                    if slave_child.is_some() && master_dir != slave_dir {
+                        self.remove_path(&checkout_id, &child_path, local_meta.as_ref())?;
+                    }
+                    if master_dir {
+                        self.ensure_local_dir(&checkout_id, &child_path)?;
+                    } else {
+                        self.pending_pulls
+                            .insert((checkout_id.clone(), child_path.clone()));
+                    }
+                    out.push(ProtocolMessage::DirListRequest {
+                        checkout_id: checkout_id.clone(),
+                        path: child_path,
+                    });
+                }
+                WalkAction::AnnounceCreate | WalkAction::AnnounceCas => {
+                    out.extend(self.note_changed(&checkout_id, child_path)?);
+                }
+                WalkAction::AnnounceDelete => {
+                    out.extend(self.note_removed(&checkout_id, &child_path)?);
+                }
+            }
+        }
+        Ok(Reply::Send(out))
+    }
+
+    fn ensure_local_dir(
+        &mut self,
+        checkout_id: &str,
+        path: &CanonicalPath,
+    ) -> Result<(), SlaveError> {
+        let (local, relative) = {
+            let checkout = self.checkout(checkout_id)?;
+            (
+                checkout.local.clone(),
+                strip_central(&checkout.central, path)?,
+            )
+        };
+        let host = canonical_to_host(&local, &relative);
+        fs::create_dir_all(&host).map_err(SlaveError::io(&host))?;
+        let found = meta::collect_from_path(&host)
+            .map_err(SlaveError::io(&host))?
+            .unwrap_or_else(|| FileMetadata::directory(0, 0o040755));
+        apply::mkdir_live(&local, &relative, &found)?;
+        let ck = self.checkout(checkout_id)?.id.clone();
+        if self.meta(checkout_id, path)?.is_none() {
+            self.index_ancestors(checkout_id, path)?;
+            index::commit_leaf(
+                &self.store,
+                &ck,
+                path,
+                Some(&found),
+                index::LastSynced::Keep,
+            )
+            .map_err(SlaveError::index)?;
+        }
+        Ok(())
+    }
+
+    fn walk_checkout(
+        &self,
+        checkout_id: &str,
+    ) -> Result<BTreeMap<CanonicalPath, FileMetadata>, SlaveError> {
+        let (ck, local, central) = {
+            let checkout = self.checkout(checkout_id)?;
+            (
+                checkout.id.clone(),
+                checkout.local.clone(),
+                checkout.central.clone(),
+            )
+        };
+        let mut found = BTreeMap::new();
+        let previous = self
+            .store
+            .get_meta(&ck, &central)
+            .map_err(SlaveError::index)?;
+        if let Some(root) =
+            meta::collect_for_rescan(&local, previous.as_ref()).map_err(SlaveError::io(&local))?
+        {
+            found.insert(central.clone(), root);
+        }
+        let mut pending = vec![CanonicalPath::root()];
+        while let Some(rel_dir) = pending.pop() {
+            let host = canonical_to_host(&local, &rel_dir);
+            let entries = match fs::read_dir(&host) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(SlaveError::io(&host)(err)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(SlaveError::io(&host))?;
+                let raw = entry.file_name();
+                let Some(name) = raw.to_str() else {
+                    log::warn!("skipping non-UTF-8 name under {}", host.display());
+                    continue;
+                };
+                if rel_dir.as_str() == "/" && is_reserved_root_entry(name) {
+                    continue;
+                }
+                let rel_child = join_central(&rel_dir, name)?;
+                let child = join_central(&central, rel_child.as_str().trim_start_matches('/'))?;
+                let host_child = entry.path();
+                let previous = self
+                    .store
+                    .get_meta(&ck, &child)
+                    .map_err(SlaveError::index)?;
+                let Some(meta) = meta::collect_for_rescan(&host_child, previous.as_ref())
+                    .map_err(SlaveError::io(&host_child))?
+                else {
+                    continue;
+                };
+                if meta.kind == EntryKind::Dir {
+                    pending.push(rel_child);
+                }
+                found.insert(child, meta);
+            }
+        }
+        Ok(found)
+    }
+
     fn note_changed(
         &mut self,
         checkout_id: &str,
         path: CanonicalPath,
     ) -> Result<Vec<ProtocolMessage>, SlaveError> {
-        if is_reserved(&path) {
+        let central = self.checkout(checkout_id)?.central.clone();
+        if is_reserved(&central, &path) {
             return Ok(Vec::new());
         }
         let (local, relative) = {
@@ -706,7 +968,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         checkout_id: &str,
         path: &CanonicalPath,
     ) -> Result<Vec<ProtocolMessage>, SlaveError> {
-        if is_reserved(path) {
+        let central = self.checkout(checkout_id)?.central.clone();
+        if is_reserved(&central, path) {
             return Ok(Vec::new());
         }
         let Some(previous) = self.meta(checkout_id, path)? else {
@@ -794,8 +1057,12 @@ fn read_host_bytes(host: &Path) -> Result<Option<Vec<u8>>, SlaveError> {
     }
 }
 
-fn is_reserved(path: &CanonicalPath) -> bool {
-    path.as_str()
+fn is_reserved(central: &CanonicalPath, path: &CanonicalPath) -> bool {
+    let Ok(relative) = strip_central(central, path) else {
+        return false;
+    };
+    relative
+        .as_str()
         .trim_start_matches('/')
         .split('/')
         .next()

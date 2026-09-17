@@ -95,6 +95,28 @@ fn recompute<S: Storage>(
     pending: &Pending<'_>,
     computed: &HashMap<CanonicalPath, DirNode>,
 ) -> Result<DirNode, S::Error> {
+    Ok(dir_node(&children_of(store, ck, dir, pending, computed)?))
+}
+
+pub(crate) fn list_children<S: Storage>(
+    store: &S,
+    ck: &CheckoutId,
+    dir: &CanonicalPath,
+) -> Result<Vec<DirChild>, S::Error> {
+    let unused = Pending {
+        path: dir,
+        meta: None,
+    };
+    children_of(store, ck, dir, &unused, &HashMap::new())
+}
+
+fn children_of<S: Storage>(
+    store: &S,
+    ck: &CheckoutId,
+    dir: &CanonicalPath,
+    pending: &Pending<'_>,
+    computed: &HashMap<CanonicalPath, DirNode>,
+) -> Result<Vec<DirChild>, S::Error> {
     let mut children: Vec<(CanonicalPath, FileMetadata)> = store
         .range_meta(ck, dir)?
         .into_iter()
@@ -108,7 +130,7 @@ fn recompute<S: Storage>(
 
     let mut entries = Vec::with_capacity(children.len());
     for (path, meta) in children {
-        let Some(name) = leaf_name(&path) else {
+        let Ok(name) = EntryName::parse(path.name()) else {
             continue;
         };
         entries.push(match meta.kind {
@@ -131,11 +153,7 @@ fn recompute<S: Storage>(
             },
         });
     }
-    Ok(dir_node(&entries))
-}
-
-fn leaf_name(path: &CanonicalPath) -> Option<EntryName> {
-    EntryName::parse(path.as_str().rsplit('/').next()?).ok()
+    Ok(entries)
 }
 
 #[cfg(test)]

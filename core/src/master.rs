@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::apply;
 use crate::config::LoadedMaster;
-use crate::hash::{ContentHash, FileNode};
+use crate::hash::{ContentHash, FileNode, SubtreeRoot};
 use crate::index;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
@@ -433,6 +433,19 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 want_hash,
                 signature,
             } => self.on_signature_request(peer, checkout_id, path, want_hash, signature),
+            ProtocolMessage::RootReport {
+                checkout_id,
+                path,
+                root,
+            } => Ok(Reply::Send(self.on_root_report(
+                peer,
+                checkout_id,
+                path,
+                root,
+            )?)),
+            ProtocolMessage::DirListRequest { checkout_id, path } => {
+                Ok(Reply::Send(self.on_dir_list(peer, checkout_id, path)?))
+            }
             other => Ok(Reply::Send(ProtocolMessage::Error {
                 code: "unsupported".into(),
                 message: format!("{other:?}"),
@@ -751,6 +764,64 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             path,
             file_node: None,
         })
+    }
+
+    fn on_root_report(
+        &self,
+        peer: [u8; 32],
+        checkout_id: String,
+        path: CanonicalPath,
+        root: SubtreeRoot,
+    ) -> Result<ProtocolMessage, MasterError> {
+        let checkout = CheckoutName::new(checkout_id.clone());
+        let session = match self.live_checkout(&peer, &checkout) {
+            Ok(session) => session,
+            Err(refusal) => return Ok(refusal.into_error(&checkout)),
+        };
+        if path != session.central {
+            return Ok(outside_central(&path));
+        }
+        let master_root = index::subtree_root(&self.store, &CheckoutId::master(), &path)
+            .map_err(MasterError::index)?;
+        Ok(ProtocolMessage::RootAck {
+            checkout_id,
+            path,
+            matched: root == master_root,
+            master_root,
+        })
+    }
+
+    fn on_dir_list(
+        &self,
+        peer: [u8; 32],
+        checkout_id: String,
+        path: CanonicalPath,
+    ) -> Result<ProtocolMessage, MasterError> {
+        let checkout = CheckoutName::new(checkout_id.clone());
+        let session = match self.live_checkout(&peer, &checkout) {
+            Ok(session) => session,
+            Err(refusal) => return Ok(refusal.into_error(&checkout)),
+        };
+        if !session.central.covers(&path) {
+            return Ok(outside_central(&path));
+        }
+        match self.meta(&path)? {
+            Some(meta) if meta.kind != EntryKind::Dir => Ok(ProtocolMessage::FileAnnounce {
+                checkout_id,
+                path,
+                new: meta,
+                basis: None,
+            }),
+            _ => {
+                let entries = index::list_children(&self.store, &CheckoutId::master(), &path)
+                    .map_err(MasterError::index)?;
+                Ok(ProtocolMessage::DirListResponse {
+                    checkout_id,
+                    path,
+                    entries,
+                })
+            }
+        }
     }
 
     fn live_checkout(
