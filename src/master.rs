@@ -10,7 +10,8 @@ use arborsync_core::master::{LocalEvent, Master, Reply, WholeFileLater};
 use arborsync_core::path::host_to_canonical;
 use arborsync_core::storage::Storage;
 use arborsync_core::transport::{
-    AttemptLimiter, accept_control, listen, peer_static_key, read_control, write_control,
+    AttemptLimiter, accept_bulk, accept_control, listen, peer_static_key, read_control, write_bulk,
+    write_control,
 };
 use arborsync_core::{LoadedMaster, RedbStorage};
 use notify_debouncer_mini::notify::RecursiveMode;
@@ -134,16 +135,15 @@ async fn accept_session(
             msg = read_control(&mut recv) => {
                 let msg = msg?;
                 let reply = master.lock().expect("master").handle(peer, msg)?;
-                match reply {
-                    Reply::Hangup { reason } => {
-                        log::info!("hangup {slave_id}: {reason}");
-                        master.lock().expect("master").disconnect(peer);
-                        break;
-                    }
-                    Reply::Send(out) => {
-                        write_control(&mut send, &out).await?;
-                        flush_outbox(&master, peer, &mut send).await?;
-                    }
+                if dispatch_master(&master, peer, &slave_id, &conn, &mut send, reply).await? {
+                    break;
+                }
+            }
+            incoming = accept_bulk(&conn) => {
+                let (header, body) = incoming?;
+                let reply = master.lock().expect("master").apply_bulk(peer, header, &body)?;
+                if dispatch_master(&master, peer, &slave_id, &conn, &mut send, reply).await? {
+                    break;
                 }
             }
             _ = tick.tick() => flush_outbox(&master, peer, &mut send).await?,
@@ -155,6 +155,33 @@ async fn accept_session(
         master.lock().expect("master").disconnect(peer);
     }
     Ok(())
+}
+
+async fn dispatch_master(
+    master: &SharedMaster,
+    peer: [u8; 32],
+    slave_id: &str,
+    conn: &quinn::Connection,
+    send: &mut quinn::SendStream,
+    reply: Reply,
+) -> anyhow::Result<bool> {
+    match reply {
+        Reply::Hangup { reason } => {
+            log::info!("hangup {slave_id}: {reason}");
+            master.lock().expect("master").disconnect(peer);
+            Ok(true)
+        }
+        Reply::Send(out) => {
+            write_control(send, &out).await?;
+            flush_outbox(master, peer, send).await?;
+            Ok(false)
+        }
+        Reply::Bulk(xfer) => {
+            write_bulk(conn, &xfer).await?;
+            flush_outbox(master, peer, send).await?;
+            Ok(false)
+        }
+    }
 }
 
 async fn flush_outbox(

@@ -10,7 +10,8 @@ use arborsync_core::path::local_to_canonical;
 use arborsync_core::slave::{LocalEvent, Reply, Slave, WholeFileLater};
 use arborsync_core::storage::Storage;
 use arborsync_core::transport::{
-    client_endpoint, connect, open_control, peer_static_key, read_control, write_control,
+    accept_bulk, client_endpoint, connect, open_control, peer_static_key, read_control, write_bulk,
+    write_control,
 };
 use arborsync_core::{CanonicalPath, LoadedSlave, RedbStorage};
 use notify_debouncer_mini::notify::RecursiveMode;
@@ -99,33 +100,31 @@ async fn session(
 
     let (mut send, mut recv) = open_control(&conn).await?;
     write_control(&mut send, &subscribe).await?;
-    match slave
-        .lock()
-        .expect("slave")
-        .handle(read_control(&mut recv).await?)?
-    {
-        Reply::Hangup { reason } => anyhow::bail!("{reason}"),
-        Reply::Send(outs) => {
-            for out in outs {
-                write_control(&mut send, &out).await?;
-            }
-        }
-    }
+    dispatch_slave(
+        &conn,
+        &mut send,
+        slave
+            .lock()
+            .expect("slave")
+            .handle(read_control(&mut recv).await?)?,
+    )
+    .await?;
     log::info!("connected to {addr_text}");
 
     loop {
         tokio::select! {
             msg = read_control(&mut recv) => {
                 let msg = msg?;
-                let reply = slave.lock().expect("slave").handle(msg)?;
-                match reply {
-                    Reply::Hangup { reason } => anyhow::bail!("{reason}"),
-                    Reply::Send(outs) => {
-                        for out in outs {
-                            write_control(&mut send, &out).await?;
-                        }
-                    }
-                }
+                dispatch_slave(&conn, &mut send, slave.lock().expect("slave").handle(msg)?).await?;
+            }
+            incoming = accept_bulk(&conn) => {
+                let (header, body) = incoming?;
+                dispatch_slave(
+                    &conn,
+                    &mut send,
+                    slave.lock().expect("slave").apply_bulk(header, &body)?,
+                )
+                .await?;
             }
             work = work.recv() => {
                 let Some(Work::Local { checkout, event }) = work else {
@@ -136,6 +135,26 @@ async fn session(
                     write_control(&mut send, &out).await?;
                 }
             }
+        }
+    }
+}
+
+async fn dispatch_slave(
+    conn: &quinn::Connection,
+    send: &mut quinn::SendStream,
+    reply: Reply,
+) -> anyhow::Result<()> {
+    match reply {
+        Reply::Hangup { reason } => anyhow::bail!("{reason}"),
+        Reply::Send(outs) => {
+            for out in outs {
+                write_control(send, &out).await?;
+            }
+            Ok(())
+        }
+        Reply::Bulk(xfer) => {
+            write_bulk(conn, &xfer).await?;
+            Ok(())
         }
     }
 }

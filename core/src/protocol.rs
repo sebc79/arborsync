@@ -21,6 +21,8 @@ pub enum FrameError {
     UnsupportedVersion(u16),
     #[error("bincode error: {0}")]
     Bincode(String),
+    #[error("bulk body length {got} does not match header size {want}")]
+    BodySize { got: u64, want: u64 },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -204,4 +206,44 @@ pub fn decode_control(buf: &[u8]) -> Result<(ProtocolMessage, usize), FrameError
     }
     let (msg, _) = decode_wire(&payload[consumed..]).map_err(FrameError::Bincode)?;
     Ok((msg, total))
+}
+
+/// `u32be header_len || bincode(BulkHeader) || exactly header.size raw bytes`.
+pub fn encode_bulk(header: &BulkHeader, body: &[u8]) -> Result<Vec<u8>, FrameError> {
+    if body.len() as u64 != header.size {
+        return Err(FrameError::BodySize {
+            got: body.len() as u64,
+            want: header.size,
+        });
+    }
+    let payload = encode_wire(header).map_err(FrameError::Bincode)?;
+    if payload.len() > MAX_CONTROL_FRAME {
+        return Err(FrameError::TooLarge);
+    }
+    let mut frame = Vec::with_capacity(4 + payload.len() + body.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(body);
+    Ok(frame)
+}
+
+pub fn decode_bulk(buf: &[u8]) -> Result<(BulkHeader, &[u8], usize), FrameError> {
+    if buf.len() < 4 {
+        return Err(FrameError::Truncated);
+    }
+    let len = u32::from_be_bytes(buf[0..4].try_into().expect("4 bytes")) as usize;
+    if len > MAX_CONTROL_FRAME {
+        return Err(FrameError::TooLarge);
+    }
+    let header_end = 4 + len;
+    if buf.len() < header_end {
+        return Err(FrameError::Truncated);
+    }
+    let (header, _): (BulkHeader, usize) =
+        decode_wire(&buf[4..header_end]).map_err(FrameError::Bincode)?;
+    let total = header_end + header.size as usize;
+    if buf.len() < total {
+        return Err(FrameError::Truncated);
+    }
+    Ok((header, &buf[header_end..total], total))
 }
