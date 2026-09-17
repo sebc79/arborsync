@@ -158,7 +158,7 @@ The ones that change behavior if you run the daemons today:
 - An incoming `Error` is answered with `Error { code: "unsupported" }`.
 - `quic_*` and `reconnect_*` are struck in `configuration.md`. Reconnect backoff is hardcoded 1 s, doubling, cap 60 s.
 
-`core/tests/scenarios.rs` names the §16.8 cases and drives them through `handle` and `note_local` on `MemoryStorage`. It does not start notify threads or a two-process QUIC sync.
+`core/tests/scenarios.rs` names the §16.8 cases and drives them through `handle` and `note_local` on `MemoryStorage`. `src/watch.rs` starts a real `notify-debouncer-full` thread. `tests/sync.rs` starts master and slave over QUIC and asserts a post-connect write crosses.
 
 ## What to read next
 

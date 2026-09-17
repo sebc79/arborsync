@@ -553,7 +553,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 5. ✅ Bulk `copia` streams; whole-file fallback. Apply reconstructs in memory, then writes the full buffer through `.arborsync-tmp`.
 6. ✅ Reconcile walk + rescan + reconnect.
 7. ✅ Config watch for checkout add/remove; SIGHUP ACL/log reload.
-8. ⚠️ Tests: `core/tests/scenarios.rs` covers reserved dirs, two checkouts on one slave (`/src` and `/`), CAS conflict, echo suppression, ACL deny, and rescan-as-missed-watcher. Those tests call `handle`, `note_local`, and `rescan` on `MemoryStorage`. They do not start notify threads or a two-process QUIC sync.
+8. ✅ Tests: `core/tests/scenarios.rs` covers reserved dirs, two checkouts on one slave (`/src` and `/`), CAS conflict, echo suppression, ACL deny, and rescan-as-missed-watcher. Those tests call `handle`, `note_local`, and `rescan` on `MemoryStorage`. `src/watch.rs` starts a real `notify-debouncer-full` thread and asserts a FileAnnounce after a post-arm write. `tests/sync.rs` starts master and slave over QUIC and asserts a post-connect write crosses.
 
 **✅ Framing and storage.** `decode_control` reads `Envelope.version`, then `ProtocolMessage`. An unknown version is `FrameError::UnsupportedVersion`, including a v2 variant index under version 2. On-disk `FileMetadata` is `u16le META_SCHEMA_VERSION || bincode` with its own `meta_bincode_config`. Wire frames use `wire_bincode_config`. Both configs are `bincode::config::standard()` today. The schema prefix is what stops a wire change from silently reinterpreting stored rows.
 
