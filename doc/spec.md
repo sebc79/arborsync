@@ -564,7 +564,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ⚠️ | §6 / §7 hash only on size/mtime miss | `collect_for_rescan` reuses `content_hash` when kind, size, and mtime match. Mode is not a miss. The returned row carries the fresh mode. Master `walk_central` uses `collect_for_rescan`. Watcher paths still call `collect_from_path`. |
 | ❌ | §7 event kinds and same-window `Rename` | `notify-debouncer-mini` delivers a path only. Binaries emit `LocalEvent::Changed`. `ProtocolMessage::Rename` is defined and unanswered (`Error { code: "unsupported" }`). Effective rename is Delete + Create. |
 | ✅ | §7 inflight before apply | Armed before the live `rename` / `mkdir` / meta apply. Files, symlinks, dirs (`ContentHash::ZERO`), and meta-only apply all arm. |
-| ❌ | §8 directory CAS | `decide_cas` rejects any live `EntryKind::Dir`, including delete. Master-local dir edits bypass CAS through `commit`. |
+| ✅ | §8 directory CAS | Live directories CAS on `FileNode` like files (create, meta update, delete). `last_synced` stores that `FileNode`. Kind mismatch is still `CasReject` (the type-change row). Master-local dir edits still `commit` as replica of record, same as files. |
 | ❌ | §8 type change in one master transaction | Kind mismatch is `CasReject`. Reconcile Pull on the slave can remove then mkdir. |
 | ⚠️ | §8 sidecar only for the content-hash loser | Slave announce apply and `CasReject` use `sidecar_if_content_differs`. Incoming `Delete` carries a `FileNode`, so the slave sidecars when live matches neither that basis nor `last_synced`. |
 | ✅ | §8 children-first directory delete | `remove_live` removes each child, then `remove_dir`. Files and symlinks use `remove_file`. |

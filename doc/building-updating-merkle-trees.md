@@ -32,7 +32,7 @@ DirNode  = BLAKE3(concat(entries))
 - Symlink `content_hash` = BLAKE3(target bytes from the OS).
 - Empty directory: `DirNode = BLAKE3("")` (no entries). First-class; do not omit empty dirs from the parent.
 
-`FileNode` is the CAS object for a non-directory. `DirNode` is never CAS’d as content; it is recomputed after child mutations.
+`FileNode` is the CAS token for files, symlinks, and directories. `DirNode` is never CAS’d as content; it is recomputed after child mutations.
 
 ## What is stored
 
@@ -40,7 +40,7 @@ DirNode  = BLAKE3(concat(entries))
 |---|---|
 | `(checkout_id, file path)` in `meta` | `FileMetadata` |
 | `(checkout_id, dir path)` in `dir_nodes` | `DirNode` |
-| `(checkout_id, path)` in `last_synced` | last agreed `FileNode` (files/symlinks only) |
+| `(checkout_id, path)` in `last_synced` | last agreed `FileNode`, including directories |
 
 Master uses `checkout_id = ""`. Cache **every** directory node, not a handful of “important” subtrees. The subtree root of a checkout is `dir_nodes[central]` (or the file’s `FileNode` if `central` names a file).
 

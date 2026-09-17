@@ -31,7 +31,7 @@ Specified §7 kinds (Write vs metadata, paired `Rename`) need a watcher that kee
 
 After a successful file or symlink apply, set `inflight[(checkout_id, path)] = incoming content_hash`. On a watcher event, `stat` plus hash (or target hash for a symlink). If it equals `inflight`, clear `inflight` and stop. Timeout: 2× debounce, then clear anyway.
 
-Dirs and meta-only apply do not arm `inflight`. Applied dirs also drop `last_synced`, so a later watcher event on that dir can announce again.
+Dirs and meta-only apply arm `inflight` (`ContentHash::ZERO` for dirs). Applied dirs keep `last_synced` as that `FileNode`.
 
 Master uses the same map with `checkout_id = ""` when applying a slave CAS onto `central_root`, so the master watcher does not re-announce the write it just made.
 

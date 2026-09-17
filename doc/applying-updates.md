@@ -37,7 +37,7 @@ Otherwise `CasReject { path, current }`. The announcing slave sidecars its local
 
 Meta-only mismatch (same `content_hash`, different `FileNode`): no sidecar; the loser adopts winner metadata.
 
-As built, `decide_cas` also rejects whenever the live kind is `Dir`, including delete, and whenever `new.kind` differs from the live kind. A slave cannot CAS-update or CAS-delete a directory that already exists. Type change is specified as delete plus create in one master transaction. The code `CasReject`s the kind change.
+As built, `decide_cas` rejects whenever `new.kind` differs from the live kind. Type change is specified as delete plus create in one master transaction. The code `CasReject`s the kind change.
 
 ## Sidecar
 
