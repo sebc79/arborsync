@@ -882,10 +882,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             let child_path = join_central(&path, &entry)?;
             let last_synced = self.last_synced(&checkout_id, &child_path)?;
             let local_meta = self.meta(&checkout_id, &child_path)?;
-            let local_file = local_meta
-                .as_ref()
-                .filter(|m| m.kind != EntryKind::Dir)
-                .map(file_node);
+            let local_file = local_meta.as_ref().map(file_node);
             match decide_child(
                 slave_child.as_ref(),
                 master_child.as_ref(),

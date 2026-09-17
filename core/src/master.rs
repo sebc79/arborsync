@@ -137,10 +137,7 @@ pub fn decide_cas(
     match (current, basis) {
         (None, None) if new_kind.is_some() => CasDecision::Accept,
         (Some(live), Some(basis)) => {
-            if live.kind == EntryKind::Dir
-                || file_node(live) != basis
-                || new_kind.is_some_and(|kind| kind != live.kind)
-            {
+            if file_node(live) != basis || new_kind.is_some_and(|kind| kind != live.kind) {
                 reject()
             } else {
                 CasDecision::Accept

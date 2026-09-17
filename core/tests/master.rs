@@ -60,6 +60,7 @@ fn cas_accepts_only_a_create_on_absence_or_a_same_kind_match_on_basis() {
     let live = file(1);
     let rival = file(2);
     let live_dir = dir();
+    let stale_dir = FileMetadata::directory(MTIME, 0o040700);
 
     type Case<'a> = (
         &'a str,
@@ -132,10 +133,33 @@ fn cas_accepts_only_a_create_on_absence_or_a_same_kind_match_on_basis() {
             },
         ),
         (
-            "a directory carries no file-node token",
+            "update a directory on a matching basis",
             Some(&live_dir),
             Some(file_node(&live_dir)),
             Some(EntryKind::Dir),
+            CasDecision::Accept,
+        ),
+        (
+            "update a directory on a stale basis",
+            Some(&live_dir),
+            Some(file_node(&stale_dir)),
+            Some(EntryKind::Dir),
+            CasDecision::Reject {
+                current: Some(live_dir.clone()),
+            },
+        ),
+        (
+            "delete a directory on a matching basis",
+            Some(&live_dir),
+            Some(file_node(&live_dir)),
+            None,
+            CasDecision::Accept,
+        ),
+        (
+            "delete a directory on a stale basis",
+            Some(&live_dir),
+            Some(file_node(&stale_dir)),
+            None,
             CasDecision::Reject {
                 current: Some(live_dir.clone()),
             },
@@ -264,6 +288,177 @@ fn subscribe_cas_fanout() {
         hello
     );
     assert!(master.poll(BACKUP).is_empty());
+}
+
+#[test]
+fn directory_cas_create_chmod_and_delete() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    master
+        .handle(
+            BACKUP,
+            subscribe("backup-1", &[("src", "/src"), ("bak", "/")]),
+        )
+        .unwrap();
+
+    let created = dir();
+    let path = p("/src/nested");
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: path.clone(),
+                new: created.clone(),
+                basis: None,
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept {
+            checkout_id,
+            path: accepted,
+            file_node: node,
+        }) => {
+            assert_eq!(checkout_id, "src");
+            assert_eq!(accepted, path);
+            assert_eq!(node, Some(file_node(&created)));
+        }
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    assert!(sandbox.central_root().join("src/nested").is_dir());
+    assert_eq!(master.meta(&path).unwrap().unwrap(), created);
+
+    let pushed = master.poll(BACKUP);
+    assert_eq!(pushed.len(), 2);
+    let mut ids: Vec<String> = pushed
+        .into_iter()
+        .map(|msg| match msg {
+            ProtocolMessage::FileAnnounce {
+                checkout_id,
+                path: announced,
+                new,
+                basis,
+            } => {
+                assert_eq!(announced, path);
+                assert_eq!(new, created);
+                assert_eq!(basis, None);
+                checkout_id
+            }
+            other => panic!("expected FileAnnounce, got {other:?}"),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["bak", "src"]);
+    assert!(master.poll(ALICE).is_empty());
+
+    let chmodded = FileMetadata::directory(MTIME, 0o040700);
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: path.clone(),
+                new: chmodded.clone(),
+                basis: Some(file_node(&created)),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept {
+            file_node: node, ..
+        }) => assert_eq!(node, Some(file_node(&chmodded))),
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    assert_eq!(master.meta(&path).unwrap().unwrap().mode, 0o040700);
+    let _ = master.poll(BACKUP);
+
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: path.clone(),
+                new: FileMetadata::directory(MTIME, 0o040711),
+                basis: Some(file_node(&created)),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasReject { current, .. }) => {
+            assert_eq!(current, Some(chmodded.clone()))
+        }
+        other => panic!("expected CasReject, got {other:?}"),
+    }
+    assert_eq!(master.meta(&path).unwrap().unwrap().mode, 0o040700);
+    assert!(master.poll(BACKUP).is_empty());
+
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::Delete {
+                checkout_id: "src".into(),
+                path: path.clone(),
+                basis: file_node(&created),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasReject { current, .. }) => {
+            assert_eq!(current, Some(chmodded.clone()))
+        }
+        other => panic!("expected CasReject, got {other:?}"),
+    }
+    assert!(sandbox.central_root().join("src/nested").is_dir());
+
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::Delete {
+                checkout_id: "src".into(),
+                path: path.clone(),
+                basis: file_node(&chmodded),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept {
+            checkout_id,
+            path: accepted,
+            file_node: node,
+        }) => {
+            assert_eq!(checkout_id, "src");
+            assert_eq!(accepted, path);
+            assert_eq!(node, None);
+        }
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    assert!(!sandbox.central_root().join("src/nested").exists());
+    assert_eq!(master.meta(&path).unwrap(), None);
+
+    let pushed = master.poll(BACKUP);
+    assert_eq!(pushed.len(), 2);
+    let mut ids: Vec<String> = pushed
+        .into_iter()
+        .map(|msg| match msg {
+            ProtocolMessage::Delete {
+                checkout_id,
+                path: deleted,
+                basis,
+            } => {
+                assert_eq!(deleted, path);
+                assert_eq!(basis, file_node(&chmodded));
+                checkout_id
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["bak", "src"]);
+    assert!(master.poll(ALICE).is_empty());
 }
 
 #[test]

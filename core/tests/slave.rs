@@ -1,3 +1,5 @@
+use std::os::unix::fs::PermissionsExt;
+
 use arborsync_core::LoadedSlave;
 use arborsync_core::config::{CheckoutConfig, ReloadError};
 use arborsync_core::hash::ContentHash;
@@ -537,16 +539,38 @@ fn echo_of_an_applied_dir_or_meta_only_does_not_reannounce() {
         .handle(ProtocolMessage::FileAnnounce {
             checkout_id: "src".into(),
             path: p("/src/nested"),
-            new: dir,
+            new: dir.clone(),
             basis: None,
         })
         .unwrap();
+    assert_eq!(
+        slave.last_synced("src", &p("/src/nested")).unwrap(),
+        Some(file_node(&dir))
+    );
     assert!(
         slave
             .note_local("src", LocalEvent::Changed(p("/src/nested")))
             .unwrap()
             .is_empty()
     );
+
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    std::fs::set_permissions(
+        local.join("nested"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    match &slave
+        .note_local("src", LocalEvent::Changed(p("/src/nested")))
+        .unwrap()[..]
+    {
+        [ProtocolMessage::FileAnnounce { path, new, basis, .. }] => {
+            assert_eq!(path, &p("/src/nested"));
+            assert_eq!(*basis, Some(file_node(&dir)));
+            assert_ne!(file_node(new), file_node(&dir));
+        }
+        other => panic!("expected chmod FileAnnounce, got {other:?}"),
+    }
 
     let file = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
     slave
