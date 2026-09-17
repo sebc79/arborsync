@@ -517,8 +517,8 @@ arborsync/
 [dependencies]
 arborsync-core = { path = "core" }
 tokio = { version = "1", features = ["full"] }
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
-quinn-hyphae = "0.1"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+quinn-hyphae = "0.1.0-beta.0"
 copia = "0.3"
 notify = "8"
 notify-debouncer-full = "0.5"
@@ -536,7 +536,7 @@ thiserror = "2"
 anyhow = "1"
 ```
 
-`quinn` default features may be trimmed further so hyphae supplies crypto; follow hyphae’s current Quinn setup. Disable TLS if unused.
+Quinn is `runtime-tokio` only. Hyphae supplies crypto. See [`quic-transport.md`](quic-transport.md).
 
 ---
 
