@@ -85,7 +85,7 @@ impl CanonicalPath {
 
     /// True iff `other` is this path or below it: `/src` covers `/src` and
     /// `/src/foo.rs`, but not the sibling `/src2` (`spec.md` §2). `/` covers
-    /// everything. This is the interest rule.
+    /// everything.
     pub fn covers(&self, other: &CanonicalPath) -> bool {
         if self.0 == "/" {
             return true;
@@ -98,7 +98,7 @@ impl CanonicalPath {
 
     /// True when the first component is a reserved sidecar name
     /// (`spec.md` §6). `/.arborsync-tmp/x` is reserved. `/src/.arborsync-tmp`
-    /// is not. A checkout walk strips `central` first.
+    /// is not.
     pub fn has_reserved_root_name(&self) -> bool {
         self.as_str()
             .trim_start_matches('/')

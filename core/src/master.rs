@@ -540,7 +540,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         {
             None
         } else {
-            apply::read_live_bytes(&host).map_err(MasterError::io(&host))?
+            apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))?
         };
         match transfer::reconstruct(header.encoding, body, basis.as_deref()) {
             Ok(bytes) if hash_bytes(&bytes) == header.want_hash => {
@@ -813,7 +813,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                         None
                     } else {
                         let host = canonical_to_host(&self.central_root, &path);
-                        apply::read_live_bytes(&host).map_err(MasterError::io(&host))?
+                        apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))?
                     };
                     let signature = signature_for(new.kind, live.as_deref());
                     let want_hash = new.content_hash;
@@ -1288,7 +1288,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             return Ok(Reply::Send(outside_central(&path)));
         }
         let host = canonical_to_host(&self.central_root, &path);
-        let Some(source) = apply::read_live_bytes(&host).map_err(MasterError::io(&host))? else {
+        let Some(source) = apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))? else {
             return Ok(Reply::Send(missing_hash(&path)));
         };
         match transfer::fulfill(checkout_id, path.clone(), want_hash, &source, &signature) {

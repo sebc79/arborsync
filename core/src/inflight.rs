@@ -9,8 +9,6 @@ struct InflightEntry {
     until: Instant,
 }
 
-/// Watcher echo window. An apply arms the path; a matching local event
-/// is dropped and the entry cleared (`spec.md` §7).
 pub(crate) struct Inflight {
     window: Duration,
     entries: HashMap<CanonicalPath, InflightEntry>,

@@ -410,7 +410,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         {
             None
         } else {
-            apply::read_live_bytes(&host).map_err(SlaveError::io(&host))?
+            apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))?
         };
         match transfer::reconstruct(header.encoding, body, basis.as_deref()) {
             Ok(bytes) if hash_bytes(&bytes) == header.want_hash => {
@@ -741,7 +741,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                         None
                     } else {
                         let host = self.host_for(checkout_id, &path)?;
-                        apply::read_live_bytes(&host).map_err(SlaveError::io(&host))?
+                        apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))?
                     };
                     let signature = signature_for(new.kind, live.as_deref());
                     let want_hash = new.content_hash;
@@ -810,7 +810,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         signature: Vec<u8>,
     ) -> Result<Reply, SlaveError> {
         let host = self.host_for(&checkout_id, &path)?;
-        let Some(source) = apply::read_live_bytes(&host).map_err(SlaveError::io(&host))? else {
+        let Some(source) = apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))? else {
             return Ok(Reply::Send(vec![ProtocolMessage::Error {
                 code: "missing_hash".into(),
                 message: path.as_str().into(),

@@ -258,8 +258,7 @@ pub fn sidecar_if_content_differs(
     fs::write(sidecar, bytes).map_err(at(sidecar))
 }
 
-/// Live file bytes or symlink target. `None` if the path is gone.
-pub fn read_live_bytes(host: &Path) -> io::Result<Option<Vec<u8>>> {
+pub fn try_read_file_or_link(host: &Path) -> io::Result<Option<Vec<u8>>> {
     match fs::symlink_metadata(host) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
