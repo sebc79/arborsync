@@ -1,18 +1,18 @@
 use std::os::unix::fs::PermissionsExt;
 
-use arborsync_core::LoadedSlave;
 use arborsync_core::config::{CheckoutConfig, ReloadError};
 use arborsync_core::hash::ContentHash;
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::merkle::file_node;
-use arborsync_core::meta::{FileMetadata, hash_bytes};
-use arborsync_core::path::{RESERVED_CONFLICTS, conflict_sidecar_path};
+use arborsync_core::meta::{hash_bytes, FileMetadata};
+use arborsync_core::path::{conflict_sidecar_path, RESERVED_CONFLICTS};
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::slave::{
-    DeleteAction, LocalEvent, MemoryContent, ReplicaAction, Reply, Slave, SlaveError,
-    decide_incoming, decide_master_won_delete,
+    decide_incoming, decide_master_won_delete, DeleteAction, LocalEvent, MemoryContent,
+    ReplicaAction, Reply, Slave, SlaveError,
 };
-use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
+use arborsync_core::test_support::{p, MemoryStorage, SyncSandbox};
+use arborsync_core::LoadedSlave;
 
 const MASTER: [u8; 32] = [0x11; 32];
 const MTIME: i64 = 1_700_000_000_000;
@@ -64,6 +64,14 @@ fn incoming_announce_follows_the_replica_table() {
     assert_eq!(
         decide_incoming(Some(&live), None, &meta_only),
         ReplicaAction::ApplyMetaOnly
+    );
+
+    let hash = ContentHash::from_bytes([7; 32]);
+    let as_file = FileMetadata::file(3, MTIME, 0o100644, hash);
+    let as_link = FileMetadata::symlink(3, MTIME, 0o120777, hash);
+    assert_eq!(
+        decide_incoming(Some(&as_file), None, &as_link),
+        ReplicaAction::SidecarThenApply
     );
 }
 
@@ -122,14 +130,12 @@ fn local_edit_announces_without_moving_last_synced() {
         .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
         .unwrap();
     match &out[..] {
-        [
-            ProtocolMessage::FileAnnounce {
-                checkout_id,
-                path,
-                new,
-                basis,
-            },
-        ] => {
+        [ProtocolMessage::FileAnnounce {
+            checkout_id,
+            path,
+            new,
+            basis,
+        }] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src/hello.txt"));
             assert_eq!(new.content_hash, hash_bytes(b"typed"));
@@ -193,6 +199,173 @@ fn master_announce_writes_inside_the_checkout_and_sets_last_synced() {
         slave.last_synced("src", &p("/src/hello.txt")).unwrap(),
         Some(file_node(&new))
     );
+}
+
+#[test]
+fn incoming_type_change_file_to_dir_replaces_the_live_file() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let previous = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            new: previous.clone(),
+            basis: None,
+        })
+        .unwrap();
+
+    let new = FileMetadata::directory(MTIME, 0o040755);
+    match slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            new: new.clone(),
+            basis: Some(file_node(&previous)),
+        })
+        .unwrap()
+    {
+        Reply::Send(msgs) => assert!(msgs.is_empty()),
+        other => panic!("expected empty send, got {other:?}"),
+    }
+
+    let host = slave.checkout_local("src").unwrap().join("hello.txt");
+    assert!(host.is_dir());
+    assert_eq!(
+        slave.meta("src", &p("/src/hello.txt")).unwrap(),
+        Some(new.clone())
+    );
+    assert_eq!(
+        slave.last_synced("src", &p("/src/hello.txt")).unwrap(),
+        Some(file_node(&new))
+    );
+    assert!(!conflict_sidecar_path(
+        slave.checkout_local("src").unwrap(),
+        &p("/src/hello.txt"),
+        &previous.content_hash,
+    )
+    .exists());
+
+    let out = slave
+        .note_local("src", LocalEvent::Removed(p("/src/hello.txt")))
+        .unwrap();
+    assert!(out.is_empty());
+    assert!(host.is_dir());
+    assert_eq!(
+        slave.last_synced("src", &p("/src/hello.txt")).unwrap(),
+        Some(file_node(&new))
+    );
+}
+
+#[test]
+fn incoming_type_change_dir_to_file_replaces_the_directory() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let previous = FileMetadata::directory(MTIME, 0o040755);
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            new: previous.clone(),
+            basis: None,
+        })
+        .unwrap();
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt/child.txt"),
+            new: FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash),
+            basis: None,
+        })
+        .unwrap();
+
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    match slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            new: new.clone(),
+            basis: Some(file_node(&previous)),
+        })
+        .unwrap()
+    {
+        Reply::Send(msgs) => assert!(msgs.is_empty()),
+        other => panic!("expected empty send, got {other:?}"),
+    }
+
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    let host = local.join("hello.txt");
+    assert_eq!(std::fs::read(&host).unwrap(), hello);
+    assert_eq!(
+        slave.meta("src", &p("/src/hello.txt")).unwrap(),
+        Some(new.clone())
+    );
+    assert_eq!(
+        slave.last_synced("src", &p("/src/hello.txt")).unwrap(),
+        Some(file_node(&new))
+    );
+    assert_eq!(
+        slave.meta("src", &p("/src/hello.txt/child.txt")).unwrap(),
+        None
+    );
+    assert!(!local.join("hello.txt/child.txt").exists());
+    assert!(!conflict_sidecar_path(&local, &p("/src/hello.txt"), &previous.content_hash).exists());
+}
+
+#[test]
+fn incoming_type_change_file_to_symlink_replaces_the_live_file() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let target = b"somewhere";
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    bodies.offer(hash_bytes(target), target.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let previous = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            new: previous.clone(),
+            basis: None,
+        })
+        .unwrap();
+
+    let new = FileMetadata::symlink(target.len() as u64, MTIME, 0o120777, hash_bytes(target));
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            new: new.clone(),
+            basis: Some(file_node(&previous)),
+        })
+        .unwrap();
+
+    let host = slave.checkout_local("src").unwrap().join("hello.txt");
+    assert!(host.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(
+        std::fs::read_link(&host).unwrap(),
+        std::path::Path::new("somewhere")
+    );
+    assert_eq!(
+        slave.last_synced("src", &p("/src/hello.txt")).unwrap(),
+        Some(file_node(&new))
+    );
+    assert!(!conflict_sidecar_path(
+        slave.checkout_local("src").unwrap(),
+        &p("/src/hello.txt"),
+        &previous.content_hash,
+    )
+    .exists());
 }
 
 #[test]
@@ -547,12 +720,10 @@ fn echo_of_an_applied_dir_or_meta_only_does_not_reannounce() {
         slave.last_synced("src", &p("/src/nested")).unwrap(),
         Some(file_node(&dir))
     );
-    assert!(
-        slave
-            .note_local("src", LocalEvent::Changed(p("/src/nested")))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(slave
+        .note_local("src", LocalEvent::Changed(p("/src/nested")))
+        .unwrap()
+        .is_empty());
 
     let local = slave.checkout_local("src").unwrap().to_path_buf();
     std::fs::set_permissions(local.join("nested"), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -560,11 +731,9 @@ fn echo_of_an_applied_dir_or_meta_only_does_not_reannounce() {
         .note_local("src", LocalEvent::Changed(p("/src/nested")))
         .unwrap()[..]
     {
-        [
-            ProtocolMessage::FileAnnounce {
-                path, new, basis, ..
-            },
-        ] => {
+        [ProtocolMessage::FileAnnounce {
+            path, new, basis, ..
+        }] => {
             assert_eq!(path, &p("/src/nested"));
             assert_eq!(*basis, Some(file_node(&dir)));
             assert_ne!(file_node(new), file_node(&dir));
@@ -596,12 +765,10 @@ fn echo_of_an_applied_dir_or_meta_only_does_not_reannounce() {
             ))),
         })
         .unwrap();
-    assert!(
-        slave
-            .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(slave
+        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -640,15 +807,13 @@ fn local_file_rename_announces_rename_and_cas_accepts_advance_last_synced() {
         )
         .unwrap();
     match &out[..] {
-        [
-            ProtocolMessage::Rename {
-                checkout_id,
-                from,
-                to,
-                from_basis,
-                to_new,
-            },
-        ] => {
+        [ProtocolMessage::Rename {
+            checkout_id,
+            from,
+            to,
+            from_basis,
+            to_new,
+        }] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(from, &p("/src/old.txt"));
             assert_eq!(to, &p("/src/new.txt"));
@@ -813,12 +978,10 @@ fn echo_of_an_applied_rename_does_not_reannounce() {
             to_new: new,
         })
         .unwrap();
-    assert!(
-        slave
-            .note_local("src", LocalEvent::Changed(p("/src/new.txt")))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(slave
+        .note_local("src", LocalEvent::Changed(p("/src/new.txt")))
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -827,16 +990,42 @@ fn reserved_tmp_rename_produces_no_message() {
     let mut slave = alice_slave(&sandbox, MemoryContent::new());
     let local = slave.checkout_local("src").unwrap().to_path_buf();
     sandbox.tree(&local).file(".arborsync-tmp/x", b"tmp");
-    assert!(
-        slave
-            .note_local(
-                "src",
-                LocalEvent::Renamed {
-                    from: p("/src/.arborsync-tmp/x"),
-                    to: p("/src/.arborsync-tmp/y"),
-                },
-            )
-            .unwrap()
-            .is_empty()
+    assert!(slave
+        .note_local(
+            "src",
+            LocalEvent::Renamed {
+                from: p("/src/.arborsync-tmp/x"),
+                to: p("/src/.arborsync-tmp/y"),
+            },
+        )
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn cas_reject_adopts_a_winner_of_a_different_kind() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("hello.txt", b"local");
+    slave
+        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap();
+
+    let winner = FileMetadata::directory(MTIME, 0o040755);
+    slave
+        .handle(ProtocolMessage::CasReject {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            current: Some(winner.clone()),
+        })
+        .unwrap();
+
+    let sidecar = conflict_sidecar_path(&local, &p("/src/hello.txt"), &hash_bytes(b"local"));
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"local");
+    assert!(local.join("hello.txt").is_dir());
+    assert_eq!(
+        slave.meta("src", &p("/src/hello.txt")).unwrap(),
+        Some(winner)
     );
 }

@@ -9,16 +9,16 @@ use crate::apply;
 use crate::config::{ConfigError, LoadedSlave, ReloadError, SlaveReload};
 use crate::hash::{ContentHash, FileNode};
 use crate::index;
-use crate::merkle::{DirChild, file_node};
-use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
+use crate::merkle::{file_node, DirChild};
+use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
 use crate::path::{
-    CanonicalPath, PathError, canonical_to_host, conflict_sidecar_path, is_reserved_root_entry,
-    join_central, local_paths_overlap, strip_central,
+    canonical_to_host, conflict_sidecar_path, is_reserved_root_entry, join_central,
+    local_paths_overlap, strip_central, CanonicalPath, PathError,
 };
 use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
-use crate::reconcile::{WalkAction, decide_child};
+use crate::reconcile::{decide_child, WalkAction};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
-use crate::transfer::{self, BulkTransfer, signature_for};
+use crate::transfer::{self, signature_for, BulkTransfer};
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
 pub use crate::master::LocalEvent;
@@ -102,6 +102,9 @@ pub fn decide_incoming(
     }
     if basis == Some(live) {
         return ReplicaAction::Apply;
+    }
+    if local.kind != new.kind {
+        return ReplicaAction::SidecarThenApply;
     }
     if local.content_hash != new.content_hash {
         return ReplicaAction::SidecarThenApply;
@@ -187,6 +190,12 @@ impl Inflight {
             return true;
         }
         false
+    }
+
+    fn is_armed(&mut self, path: &CanonicalPath) -> bool {
+        let now = Instant::now();
+        self.entries.retain(|_, entry| entry.until > now);
+        self.entries.contains_key(path)
     }
 }
 
@@ -433,7 +442,15 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             }]));
         }
         let host = self.host_for(&header.checkout_id, &header.path)?;
-        let basis = read_host_bytes(&host)?;
+        let previous = self.meta(&header.checkout_id, &header.path)?;
+        let basis = if previous
+            .as_ref()
+            .is_some_and(|prev| prev.kind != pending.new.kind)
+        {
+            None
+        } else {
+            read_host_bytes(&host)?
+        };
         match transfer::reconstruct(header.encoding, body, basis.as_deref()) {
             Ok(bytes) if hash_bytes(&bytes) == header.want_hash => {
                 let pending = self.pending.remove(&key).expect("pending");
@@ -726,12 +743,17 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         path: CanonicalPath,
         new: FileMetadata,
     ) -> Result<Reply, SlaveError> {
+        let previous = self.meta(checkout_id, &path)?;
         match new.kind {
             EntryKind::Dir => return self.finish_apply(checkout_id, path, new, &[]),
             EntryKind::File | EntryKind::Symlink => match self.bodies.fetch(new.content_hash) {
                 ContentBytes::AskSender => {
-                    let host = self.host_for(checkout_id, &path)?;
-                    let live = read_host_bytes(&host)?;
+                    let live = if previous.as_ref().is_some_and(|live| live.kind != new.kind) {
+                        None
+                    } else {
+                        let host = self.host_for(checkout_id, &path)?;
+                        read_host_bytes(&host)?
+                    };
                     let signature = signature_for(new.kind, live.as_deref());
                     let want_hash = new.content_hash;
                     self.pending.insert(
@@ -762,9 +784,13 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         new: FileMetadata,
         body: &[u8],
     ) -> Result<Reply, SlaveError> {
-        let relative = {
+        let previous = self.meta(checkout_id, &path)?;
+        let (local, relative) = {
             let checkout = self.checkout(checkout_id)?;
-            strip_central(&checkout.central, &path)?
+            (
+                checkout.local.clone(),
+                strip_central(&checkout.central, &path)?,
+            )
         };
         let hash = match new.kind {
             EntryKind::Dir => ContentHash::ZERO,
@@ -773,23 +799,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.checkout_mut(checkout_id)?
             .inflight
             .arm(path.clone(), hash);
-        match new.kind {
-            EntryKind::Dir => {
-                self.index_ancestors(checkout_id, &path)?;
-                let local = self.checkout(checkout_id)?.local.clone();
-                apply::mkdir_live(&local, &relative, &new)?;
-            }
-            EntryKind::File => {
-                self.index_ancestors(checkout_id, &path)?;
-                let local = self.checkout(checkout_id)?.local.clone();
-                apply::atomic_put(&local, &relative, &new, body)?;
-            }
-            EntryKind::Symlink => {
-                self.index_ancestors(checkout_id, &path)?;
-                let local = self.checkout(checkout_id)?.local.clone();
-                apply::atomic_symlink(&local, &relative, &new, body)?;
-            }
-        }
+        self.index_ancestors(checkout_id, &path)?;
+        apply::replace_live(&local, &relative, &new, body, previous.as_ref())?;
         let ck = self.checkout(checkout_id)?.id.clone();
         index::commit_leaf(
             &self.store,
@@ -1443,6 +1454,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     ) -> Result<Vec<ProtocolMessage>, SlaveError> {
         let central = self.checkout(checkout_id)?.central.clone();
         if is_reserved(&central, path) {
+            return Ok(Vec::new());
+        }
+        if self.checkout_mut(checkout_id)?.inflight.is_armed(path) {
             return Ok(Vec::new());
         }
         let Some(previous) = self.meta(checkout_id, path)? else {

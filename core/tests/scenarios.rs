@@ -1,14 +1,14 @@
-use arborsync_core::LoadedMaster;
-use arborsync_core::LoadedSlave;
 use arborsync_core::config::{CheckoutConfig, SlaveAcl};
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{Master, MemoryContent, Reply as MasterReply};
 use arborsync_core::merkle::{empty_dir_node, file_node};
-use arborsync_core::meta::{EntryKind, FileMetadata, collect_from_path, hash_bytes};
-use arborsync_core::path::{RESERVED_CONFLICTS, RESERVED_TMP, conflict_sidecar_path};
+use arborsync_core::meta::{collect_from_path, hash_bytes, EntryKind, FileMetadata};
+use arborsync_core::path::{conflict_sidecar_path, RESERVED_CONFLICTS, RESERVED_TMP};
 use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
 use arborsync_core::slave::{LocalEvent, Reply as SlaveReply, Slave};
-use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
+use arborsync_core::test_support::{p, MemoryStorage, SyncSandbox};
+use arborsync_core::LoadedMaster;
+use arborsync_core::LoadedSlave;
 
 const ALICE: [u8; 32] = [0xA1; 32];
 const BACKUP: [u8; 32] = [0xB1; 32];
@@ -182,26 +182,22 @@ fn reserved_sidecar_dirs_stay_off_the_index() {
         .note_local(LocalEvent::Changed(p("/.arborsync-tmp/scratch")))
         .unwrap();
     assert!(master.poll(BACKUP).is_empty());
-    assert!(
-        slave
-            .note_local("src", LocalEvent::Changed(p("/src/.arborsync-tmp/scratch")))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(slave
+        .note_local("src", LocalEvent::Changed(p("/src/.arborsync-tmp/scratch")))
+        .unwrap()
+        .is_empty());
 
-    assert!(
-        slave_msgs(
-            slave
-                .handle(ProtocolMessage::FileAnnounce {
-                    checkout_id: "src".into(),
-                    path: p("/src/hello.txt"),
-                    new: file_meta(hello, 0o100644),
-                    basis: None,
-                })
-                .unwrap()
-        )
-        .is_empty()
-    );
+    assert!(slave_msgs(
+        slave
+            .handle(ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: file_meta(hello, 0o100644),
+                basis: None,
+            })
+            .unwrap()
+    )
+    .is_empty());
     assert_eq!(std::fs::read(local.join("hello.txt")).unwrap(), hello);
     assert!(!tmp_contains_body(&local.join(RESERVED_TMP), hello));
 }
@@ -365,18 +361,16 @@ fn cas_reject_sidecars_loser_then_live_path_is_the_winner() {
     }
 
     let winner_meta = master.meta(&p("/src/hello.txt")).unwrap().unwrap();
-    assert!(
-        slave_msgs(
-            slave
-                .handle(ProtocolMessage::CasReject {
-                    checkout_id: "src".into(),
-                    path: p("/src/hello.txt"),
-                    current: Some(winner_meta),
-                })
-                .unwrap()
-        )
-        .is_empty()
-    );
+    assert!(slave_msgs(
+        slave
+            .handle(ProtocolMessage::CasReject {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                current: Some(winner_meta),
+            })
+            .unwrap()
+    )
+    .is_empty());
 
     let local_hash = hash_bytes(b"local");
     let sidecar = conflict_sidecar_path(&local, &p("/src/hello.txt"), &local_hash);
@@ -403,19 +397,17 @@ fn incoming_announce_sidecars_when_content_differs_and_meta_only_does_not() {
         .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
         .unwrap();
 
-    assert!(
-        slave_msgs(
-            slave
-                .handle(ProtocolMessage::FileAnnounce {
-                    checkout_id: "src".into(),
-                    path: p("/src/hello.txt"),
-                    new: file_meta(remote, 0o100644),
-                    basis: None,
-                })
-                .unwrap()
-        )
-        .is_empty()
-    );
+    assert!(slave_msgs(
+        slave
+            .handle(ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: file_meta(remote, 0o100644),
+                basis: None,
+            })
+            .unwrap()
+    )
+    .is_empty());
     let local_hash = hash_bytes(b"local");
     let sidecar = conflict_sidecar_path(&local, &p("/src/hello.txt"), &local_hash);
     assert_eq!(std::fs::read(&sidecar).unwrap(), b"local");
@@ -424,19 +416,17 @@ fn incoming_announce_sidecars_when_content_differs_and_meta_only_does_not() {
     let live = slave.meta("src", &p("/src/hello.txt")).unwrap().unwrap();
     let mut incoming = live.clone();
     incoming.mode = 0o100755;
-    assert!(
-        slave_msgs(
-            slave
-                .handle(ProtocolMessage::FileAnnounce {
-                    checkout_id: "src".into(),
-                    path: p("/src/hello.txt"),
-                    new: incoming,
-                    basis: None,
-                })
-                .unwrap()
-        )
-        .is_empty()
-    );
+    assert!(slave_msgs(
+        slave
+            .handle(ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: incoming,
+                basis: None,
+            })
+            .unwrap()
+    )
+    .is_empty());
     assert!(!conflict_sidecar_path(&local, &p("/src/hello.txt"), &remote_hash).exists());
     assert_eq!(std::fs::read(local.join("hello.txt")).unwrap(), remote);
     assert_eq!(
@@ -459,19 +449,17 @@ fn inflight_echo_survives_mtime_only_then_a_real_edit_announces() {
     let mut slave = alice_slave(&sandbox, bodies);
     let applied = file_meta(hello, 0o100644);
     let applied_node = file_node(&applied);
-    assert!(
-        slave_msgs(
-            slave
-                .handle(ProtocolMessage::FileAnnounce {
-                    checkout_id: "src".into(),
-                    path: p("/src/hello.txt"),
-                    new: applied.clone(),
-                    basis: None,
-                })
-                .unwrap()
-        )
-        .is_empty()
-    );
+    assert!(slave_msgs(
+        slave
+            .handle(ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: applied.clone(),
+                basis: None,
+            })
+            .unwrap()
+    )
+    .is_empty());
 
     let local = slave.checkout_local("src").unwrap().to_path_buf();
     sandbox
@@ -482,23 +470,19 @@ fn inflight_echo_survives_mtime_only_then_a_real_edit_announces() {
         .unwrap();
     assert_eq!(disk.content_hash, hash);
     assert_ne!(file_node(&disk), applied_node);
-    assert!(
-        slave
-            .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(slave
+        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap()
+        .is_empty());
 
     sandbox.tree(&local).file("hello.txt", b"edited");
     match &slave
         .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
         .unwrap()[..]
     {
-        [
-            ProtocolMessage::FileAnnounce {
-                path, new, basis, ..
-            },
-        ] => {
+        [ProtocolMessage::FileAnnounce {
+            path, new, basis, ..
+        }] => {
             assert_eq!(path, &p("/src/hello.txt"));
             assert_eq!(new.content_hash, hash_bytes(b"edited"));
             assert_eq!(*basis, Some(applied_node));
@@ -704,14 +688,12 @@ fn slave_rescan_then_reconcile_announces_a_file_the_watcher_never_saw() {
             .unwrap(),
     )[..]
     {
-        [
-            ProtocolMessage::FileAnnounce {
-                checkout_id,
-                path,
-                new,
-                basis,
-            },
-        ] => {
+        [ProtocolMessage::FileAnnounce {
+            checkout_id,
+            path,
+            new,
+            basis,
+        }] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src/leftover.txt"));
             assert_eq!(new.content_hash, hash_bytes(b"mine"));
@@ -936,4 +918,156 @@ fn same_window_rename_is_one_message_and_moves_central() {
         }
         other => panic!("expected Rename fan-out, got {other:?}"),
     }
+}
+
+#[test]
+fn alice_replaces_a_synced_file_with_a_directory_and_backup_applies() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut master_bodies = MemoryContent::new();
+    master_bodies.offer(hash, hello.to_vec());
+    let mut backup_bodies = MemoryContent::new();
+    backup_bodies.offer(hash, hello.to_vec());
+    let mut master = two_slave_master(&sandbox, master_bodies);
+    let mut alice = alice_slave(&sandbox, MemoryContent::new());
+    let mut backup = backup_slave(&sandbox, backup_bodies);
+    master_msg(
+        master
+            .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+            .unwrap(),
+    );
+    master_msg(
+        master
+            .handle(
+                BACKUP,
+                subscribe("backup-1", &[("src", "/src"), ("bak", "/")]),
+            )
+            .unwrap(),
+    );
+
+    let local = alice.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("hello.txt", hello);
+    let created = alice
+        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap();
+    let ProtocolMessage::FileAnnounce {
+        checkout_id,
+        path,
+        new,
+        basis,
+    } = created.into_iter().next().expect("one announce")
+    else {
+        panic!("expected FileAnnounce");
+    };
+    match master_msg(
+        master
+            .handle(
+                ALICE,
+                ProtocolMessage::FileAnnounce {
+                    checkout_id: checkout_id.clone(),
+                    path: path.clone(),
+                    new: new.clone(),
+                    basis,
+                },
+            )
+            .unwrap(),
+    ) {
+        ProtocolMessage::CasAccept {
+            file_node: node, ..
+        } => assert_eq!(node, Some(file_node(&new))),
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    slave_msgs(
+        alice
+            .handle(ProtocolMessage::CasAccept {
+                checkout_id: checkout_id.clone(),
+                path: path.clone(),
+                file_node: Some(file_node(&new)),
+            })
+            .unwrap(),
+    );
+    for msg in master.poll(BACKUP) {
+        assert!(slave_msgs(backup.handle(msg).unwrap()).is_empty());
+    }
+    let backup_src = backup.checkout_local("src").unwrap().to_path_buf();
+    assert_eq!(std::fs::read(backup_src.join("hello.txt")).unwrap(), hello);
+
+    std::fs::remove_file(local.join("hello.txt")).unwrap();
+    std::fs::create_dir(local.join("hello.txt")).unwrap();
+    let changed = alice
+        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap();
+    let ProtocolMessage::FileAnnounce {
+        checkout_id,
+        path,
+        new: as_dir,
+        basis,
+    } = changed.into_iter().next().expect("one announce")
+    else {
+        panic!("expected FileAnnounce");
+    };
+    assert_eq!(as_dir.kind, EntryKind::Dir);
+    assert_eq!(basis, Some(file_node(&new)));
+
+    match master_msg(
+        master
+            .handle(
+                ALICE,
+                ProtocolMessage::FileAnnounce {
+                    checkout_id: checkout_id.clone(),
+                    path: path.clone(),
+                    new: as_dir.clone(),
+                    basis,
+                },
+            )
+            .unwrap(),
+    ) {
+        ProtocolMessage::CasAccept {
+            file_node: node, ..
+        } => assert_eq!(node, Some(file_node(&as_dir))),
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    assert!(sandbox.central_root().join("src/hello.txt").is_dir());
+    assert!(!sandbox.central_root().join(RESERVED_CONFLICTS).exists());
+    slave_msgs(
+        alice
+            .handle(ProtocolMessage::CasAccept {
+                checkout_id,
+                path: path.clone(),
+                file_node: Some(file_node(&as_dir)),
+            })
+            .unwrap(),
+    );
+
+    let pushed = master.poll(BACKUP);
+    assert!(!pushed.is_empty());
+    for msg in &pushed {
+        match msg {
+            ProtocolMessage::FileAnnounce {
+                path: announced,
+                new: fanout,
+                basis,
+                ..
+            } => {
+                assert_eq!(announced, &path);
+                assert_eq!(fanout, &as_dir);
+                assert_eq!(*basis, Some(file_node(&new)));
+            }
+            other => panic!("expected FileAnnounce, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        backup.meta("src", &path).unwrap().as_ref().map(file_node),
+        Some(file_node(&new))
+    );
+    for msg in pushed {
+        assert!(slave_msgs(backup.handle(msg).unwrap()).is_empty());
+    }
+    assert!(backup_src.join("hello.txt").is_dir());
+    assert_eq!(
+        backup.last_synced("src", &path).unwrap(),
+        Some(file_node(&as_dir))
+    );
+    assert!(!conflict_sidecar_path(&backup_src, &path, &new.content_hash).exists());
 }

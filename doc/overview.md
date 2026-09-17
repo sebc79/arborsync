@@ -77,7 +77,7 @@ The slave updates that checkout's index and, when `FileNode` is not `last_synced
 
 `commit_leaf` writes the leaf, every ancestor `DirNode`, and `last_synced` in one redb batch. The master then fans out to connected interested checkouts.
 
-`inflight` remembers the content hash just applied so the local watcher does not re-announce the write. The map expires after twice the debounce. The code arms it before the live `rename`, `mkdir`, or meta apply, including dirs (`ContentHash::ZERO`) and meta-only apply.
+`inflight` remembers the content hash just applied so the local watcher does not re-announce the write. The map expires after twice the debounce. The code arms it before the live `rename`, `mkdir`, or meta apply, including dirs (`ContentHash::ZERO`) and meta-only apply. A type-change vacate can look like `Remove`; that event is dropped while the path is armed.
 
 ## CAS and the sidecar
 
@@ -90,7 +90,7 @@ The master is the replica of record. The winner is whatever CAS commits there.
 
 The sidecar path is `{local}/.arborsync-conflicts/{canonical}--{first 16 hex chars of the losing content hash}`. Announce apply and `CasReject` skip the sidecar when only metadata changed. Incoming `Delete` still sidecars on a `FileNode` miss.
 
-Type change (file to dir, or the reverse) is specified as delete plus create in one master transaction. The code rejects the kind change instead.
+Type change (file to dir, or the reverse) is one master transaction. The master accepts when `FileNode(previous)` equals `basis`, deletes the old kind, creates the new kind, and fans out one `FileAnnounce`.
 
 Master `publish` also writes a sidecar when a successful slave update replaces different content. That copies a winner's predecessor, not a CAS loser. Slave apply follows the table above.
 
@@ -153,7 +153,6 @@ The library and both daemons implement the core loop in `spec.md` §16 items 1 t
 
 The ones that change behavior if you run the daemons today:
 
-- Type change is not one master transaction.
 - Local overlap after symlink resolve is rejected at `Slave::open` (and at load when both locals exist).
 - Master `publish` sidecars a successful content replace.
 - Unknown-key accepts are dropped by `AttemptLimiter::limited` before XX. After XX, unknown key still records `allow` and closes. `slave_id` mismatch is hangup.
