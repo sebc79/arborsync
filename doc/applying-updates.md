@@ -37,7 +37,7 @@ Otherwise `CasReject { path, current }`. The announcing slave sidecars its local
 
 Meta-only mismatch (same `content_hash`, different `FileNode`): no sidecar; the loser adopts winner metadata.
 
-As built, `decide_cas` rejects whenever `new.kind` differs from the live kind. Type change is specified as delete plus create in one master transaction. The code `CasReject`s the kind change.
+A kind change with `FileNode(current) == basis` is Accept. The master deletes the old kind, then creates the new kind, in that one accept.
 
 ## Sidecar
 
@@ -65,7 +65,7 @@ Directory create: `create_dir_all` + mode + mtime, then index.
 Directory delete: children first (index prefix delete + FS remove), then `remove_dir`. Files and symlinks use `remove_file`.  
 File delete: `remove_file` after the CAS check.
 
-Type change: specified as delete the old kind, create the new kind, one master transaction. Slaves apply the same pair in order. As built: kind mismatch is `CasReject`. Reconcile Pull on the slave can `remove_path` then mkdir.
+Type change deletes the old kind, then creates the new kind, in one master accept. The wire message is one `FileAnnounce` with `basis = FileNode(previous)`. Slaves apply the same pair in order. Reconcile Pull on the slave can still `remove_path` then mkdir.
 
 ## Content transfer
 

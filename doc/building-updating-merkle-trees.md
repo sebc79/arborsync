@@ -73,7 +73,7 @@ Given roots `A` and `B` for the same canonical directory path:
 - Equal → that subtree is in sync.
 - Differ → exchange `DirList` (`name`, `kind`, `node_hash`) for that directory, then:
   - name only in A or only in B → that child is a create or delete (see `spec.md` §10 for which side announces);
-  - both present, `kind` differs → specified as type change (delete + create) in one master transaction. As built: `decide_cas` rejects the kind change. Reconcile Pull on the slave can remove then mkdir.
+  - both present, `kind` differs → type change. One `FileAnnounce`, CAS on the old `FileNode`, delete then create in the accept. Reconcile Pull on the slave can still remove then mkdir.
   - both present, hashes differ, both dirs → recurse;
   - both present, hashes differ, both files/symlinks → 3-way using `last_synced` (`spec.md` §10).
 
