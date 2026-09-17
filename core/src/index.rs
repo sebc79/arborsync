@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::hash::{DirNode, SubtreeRoot};
-use crate::merkle::{dir_node, empty_dir_node, file_node, DirChild};
+use crate::merkle::{DirChild, dir_node, empty_dir_node, file_node};
 use crate::meta::{EntryKind, FileMetadata};
 use crate::path::{CanonicalPath, EntryName};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
@@ -39,23 +39,27 @@ pub fn commit_leaf<S: Storage>(
             batch.put_meta(ck, path, meta)?;
             batch.put_dir_node(ck, path, node)?;
             if last_synced == LastSynced::AdoptLeaf {
-                batch.put_last_synced(ck, path, file_node(meta))?;
+                batch.put_last_synced(ck, path, file_node(meta), Some(meta.content_hash))?;
             }
         }
         Some(meta) => {
             let kept = match last_synced {
-                LastSynced::Keep => store.get_last_synced(ck, path)?,
+                LastSynced::Keep => {
+                    let node = store.get_last_synced(ck, path)?;
+                    let content = store.get_last_synced_content(ck, path)?;
+                    node.map(|node| (node, content))
+                }
                 LastSynced::AdoptLeaf => None,
             };
             batch.purge_prefix(ck, path)?;
             batch.put_meta(ck, path, meta)?;
             match last_synced {
                 LastSynced::AdoptLeaf => {
-                    batch.put_last_synced(ck, path, file_node(meta))?;
+                    batch.put_last_synced(ck, path, file_node(meta), Some(meta.content_hash))?;
                 }
                 LastSynced::Keep => {
-                    if let Some(node) = kept {
-                        batch.put_last_synced(ck, path, node)?;
+                    if let Some((node, content)) = kept {
+                        batch.put_last_synced(ck, path, node, content)?;
                     }
                 }
             }
@@ -173,7 +177,7 @@ fn children_of<S: Storage>(
 mod tests {
     use super::*;
     use crate::hash::ContentHash;
-    use crate::test_support::{p, MemoryStorage};
+    use crate::test_support::{MemoryStorage, p};
 
     fn file(byte: u8) -> FileMetadata {
         FileMetadata::file(1, 0, 0o100644, ContentHash::from_bytes([byte; 32]))
@@ -192,6 +196,10 @@ mod tests {
         commit_leaf(&store, &ck, &path, Some(&edited), LastSynced::Keep).unwrap();
         assert_eq!(store.get_meta(&ck, &path).unwrap().unwrap(), edited);
         assert_eq!(store.get_last_synced(&ck, &path).unwrap(), Some(committed));
+        assert_eq!(
+            store.get_last_synced_content(&ck, &path).unwrap(),
+            Some(first.content_hash)
+        );
         assert_eq!(store.get_meta(&CheckoutId::master(), &path).unwrap(), None);
     }
 

@@ -56,7 +56,7 @@ key = checkout_id bytes || 0x00 || canonical path UTF-8
 
 1. `meta` — key → `u16le META_SCHEMA_VERSION || bincode(FileMetadata)` (`META_SCHEMA_VERSION = 1`)
 2. `dir_nodes` — key → 32 raw bytes (`DirNode`)
-3. `last_synced` — key → 32 raw bytes (`FileNode` of the last CAS-agreed version)
+3. `last_synced` — key → 32 raw bytes (`FileNode` of the last CAS-agreed version), or 64 bytes (`FileNode` || `content_hash`) when the agreed content hash is known. A 32-byte row still reads as that `FileNode`. The extra hash is what incoming `Delete` uses to skip a meta-only sidecar.
 
 The schema prefix is why a wire change cannot silently reinterpret stored rows. `wire_bincode_config` and `meta_bincode_config` are separate helpers. Both are `bincode::config::standard()` today.
 

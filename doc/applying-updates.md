@@ -79,7 +79,7 @@ Do not compute a delta against a remembered remote snapshot. Do not put bodies i
 
 ## Delete and rename
 
-**Delete** applies only if local `FileNode == basis` (or `== last_synced`). Otherwise the slave sidecars local bytes (`incoming` hash `ContentHash::ZERO`) and then deletes. Wire `Delete` has no `content_hash`, so a meta-only miss still sidecars. If local is already absent: no-op, clear `last_synced`. Dirs never sidecar on delete.
+**Delete** applies only if local `FileNode == basis` (or `== last_synced`). Otherwise the slave sidecars local bytes if `content_hash` differs from the last-synced content, then deletes. A meta-only FileNode miss writes no sidecar. If local is already absent: no-op, clear `last_synced`. Dirs never sidecar on delete.
 
 **Rename** applies when `from` and `to` land in the same debounce window and the same checkout. The host path moves with `fs::rename`. Parent directories of `to` are created. Mode and mtime come from `to_new` (`filetime`, symlink times for symlinks). Children of a directory move with the rename. The index then shows those children under `to`.
 
@@ -89,7 +89,7 @@ Slave apply uses `RenameAction`. `from` absent and `to` already matching `to_new
 
 Unpaired or cross-checkout rename stays Delete plus Create (`filesystem-scanning-watching.md`).
 
-Master `publish` writes a sidecar whenever the previous live content hash differs from the incoming hash, including a successful CAS replace. Spec §8 reserves the sidecar for the loser.
+Master `publish` writes the new live file. It does not write a sidecar. Spec §8 reserves the sidecar for the loser.
 
 ## Echo
 

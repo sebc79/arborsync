@@ -88,11 +88,11 @@ The master is the replica of record. The winner is whatever CAS commits there.
 - Success: `CasAccept`. The origin slave sets `last_synced` from that reply.
 - Failure: `CasReject`. The slave writes its bytes under `.arborsync-conflicts` when content differs, then adopts the winner.
 
-The sidecar path is `{local}/.arborsync-conflicts/{canonical}--{first 16 hex chars of the losing content hash}`. Announce apply and `CasReject` skip the sidecar when only metadata changed. Incoming `Delete` still sidecars on a `FileNode` miss.
+The sidecar path is `{local}/.arborsync-conflicts/{canonical}--{first 16 hex chars of the losing content hash}`. Announce apply, `CasReject`, and incoming `Delete` skip the sidecar when only metadata changed.
 
 Type change (file to dir, or the reverse) is one master transaction. The master accepts when `FileNode(previous)` equals `basis`, deletes the old kind, creates the new kind, and fans out one `FileAnnounce`.
 
-Master `publish` also writes a sidecar when a successful slave update replaces different content. That copies a winner's predecessor, not a CAS loser. Slave apply follows the table above.
+Master `publish` writes the new live file and does not sidecar a successful replace. Slave apply follows the table above.
 
 ## Reconcile
 
@@ -154,7 +154,6 @@ The library and both daemons implement the core loop in `spec.md` §16 items 1 t
 The ones that change behavior if you run the daemons today:
 
 - Local overlap after symlink resolve is rejected at `Slave::open` (and at load when both locals exist).
-- Master `publish` sidecars a successful content replace.
 - Unknown-key accepts are dropped by `AttemptLimiter::limited` before XX. After XX, unknown key still records `allow` and closes. `slave_id` mismatch is hangup.
 - An incoming `Error` is answered with `Error { code: "unsupported" }`.
 - `quic_*` and `reconnect_*` are struck in `configuration.md`. Reconnect backoff is hardcoded 1 s, doubling, cap 60 s.

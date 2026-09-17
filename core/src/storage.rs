@@ -2,7 +2,7 @@ use std::path::Path;
 
 use redb::{Database, ReadableTable, TableDefinition};
 
-use crate::hash::{DirNode, FileNode};
+use crate::hash::{ContentHash, DirNode, FileNode};
 use crate::meta::FileMetadata;
 use crate::path::CanonicalPath;
 
@@ -81,6 +81,11 @@ pub trait Storage: Send + Sync + 'static {
         ck: &CheckoutId,
         path: &CanonicalPath,
     ) -> Result<Option<FileNode>, Self::Error>;
+    fn get_last_synced_content(
+        &self,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+    ) -> Result<Option<ContentHash>, Self::Error>;
     fn range_meta(
         &self,
         ck: &CheckoutId,
@@ -128,6 +133,7 @@ pub trait WriteBatch {
         ck: &CheckoutId,
         path: &CanonicalPath,
         file_node: FileNode,
+        content_hash: Option<ContentHash>,
     ) -> Result<(), Self::Error>;
     fn del_last_synced(&mut self, ck: &CheckoutId, path: &CanonicalPath)
     -> Result<(), Self::Error>;
@@ -253,7 +259,15 @@ impl Storage for RedbStorage {
         ck: &CheckoutId,
         path: &CanonicalPath,
     ) -> Result<Option<FileNode>, Self::Error> {
-        get_hash(&self.db, LAST_SYNCED, ck, path, decode_file_node)
+        Ok(last_synced_row(&self.db, ck, path)?.map(|row| row.node))
+    }
+
+    fn get_last_synced_content(
+        &self,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+    ) -> Result<Option<ContentHash>, Self::Error> {
+        Ok(last_synced_row(&self.db, ck, path)?.and_then(|row| row.content_hash))
     }
 
     fn range_meta(
@@ -361,8 +375,17 @@ impl WriteBatch for RedbWriteBatch {
         ck: &CheckoutId,
         path: &CanonicalPath,
         file_node: FileNode,
+        content_hash: Option<ContentHash>,
     ) -> Result<(), Self::Error> {
-        put_hash(&self.txn, LAST_SYNCED, ck, path, file_node.as_bytes())
+        let key = storage_key(ck, path);
+        let value = LastSyncedRow {
+            node: file_node,
+            content_hash,
+        }
+        .encode();
+        let mut table = self.txn.open_table(LAST_SYNCED)?;
+        table.insert(key.as_slice(), value.as_slice())?;
+        Ok(())
     }
 
     fn del_last_synced(
@@ -423,10 +446,56 @@ fn decode_dir_node(bytes: &[u8]) -> Result<DirNode, RedbStoreError> {
     ))
 }
 
-fn decode_file_node(bytes: &[u8]) -> Result<FileNode, RedbStoreError> {
-    Ok(FileNode::from_bytes(
-        bytes.try_into().map_err(|_| RedbStoreError::BadHash)?,
-    ))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LastSyncedRow {
+    node: FileNode,
+    content_hash: Option<ContentHash>,
+}
+
+impl LastSyncedRow {
+    fn encode(self) -> Vec<u8> {
+        let mut out = self.node.as_bytes().to_vec();
+        if let Some(hash) = self.content_hash {
+            out.extend_from_slice(hash.as_bytes());
+        }
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, RedbStoreError> {
+        match bytes.len() {
+            32 => Ok(Self {
+                node: FileNode::from_bytes(bytes.try_into().map_err(|_| RedbStoreError::BadHash)?),
+                content_hash: None,
+            }),
+            64 => Ok(Self {
+                node: FileNode::from_bytes(
+                    bytes[..32]
+                        .try_into()
+                        .map_err(|_| RedbStoreError::BadHash)?,
+                ),
+                content_hash: Some(ContentHash::from_bytes(
+                    bytes[32..]
+                        .try_into()
+                        .map_err(|_| RedbStoreError::BadHash)?,
+                )),
+            }),
+            _ => Err(RedbStoreError::BadHash),
+        }
+    }
+}
+
+fn last_synced_row(
+    db: &Database,
+    ck: &CheckoutId,
+    path: &CanonicalPath,
+) -> Result<Option<LastSyncedRow>, RedbStoreError> {
+    let txn = db.begin_read()?;
+    let table = txn.open_table(LAST_SYNCED)?;
+    let key = storage_key(ck, path);
+    match table.get(key.as_slice())? {
+        Some(guard) => Ok(Some(LastSyncedRow::decode(guard.value())?)),
+        None => Ok(None),
+    }
 }
 
 fn get_meta_row(

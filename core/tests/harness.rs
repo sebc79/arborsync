@@ -130,10 +130,20 @@ fn memory_storage_purge_prefix_spares_the_sorting_sibling() {
         .put_dir_node(&master, &p("/src"), DirNode::from_bytes([9; 32]))
         .unwrap();
     batch
-        .put_last_synced(&master, &p("/src/foo.rs"), FileNode::from_bytes([8; 32]))
+        .put_last_synced(
+            &master,
+            &p("/src/foo.rs"),
+            FileNode::from_bytes([8; 32]),
+            None,
+        )
         .unwrap();
     batch
-        .put_last_synced(&master, &p("/src2/bar.rs"), FileNode::from_bytes([6; 32]))
+        .put_last_synced(
+            &master,
+            &p("/src2/bar.rs"),
+            FileNode::from_bytes([6; 32]),
+            None,
+        )
         .unwrap();
     batch.commit().unwrap();
 

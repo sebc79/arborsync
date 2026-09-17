@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::config::{CheckoutConfig, MasterConfig, SlaveAcl, SlaveConfig};
-use crate::hash::{DirNode, FileNode};
+use crate::hash::{ContentHash, DirNode, FileNode};
 use crate::meta::FileMetadata;
 use crate::path::{CanonicalPath, EntryName, RESERVED_CONFLICTS, RESERVED_TMP};
 use crate::protocol::ProtocolMessage;
@@ -40,7 +40,7 @@ pub enum MemoryError {
 struct MemoryInner {
     meta: HashMap<(String, CanonicalPath), FileMetadata>,
     dir_nodes: HashMap<(String, CanonicalPath), DirNode>,
-    last_synced: HashMap<(String, CanonicalPath), FileNode>,
+    last_synced: HashMap<(String, CanonicalPath), (FileNode, Option<ContentHash>)>,
 }
 
 /// In-memory [`Storage`] for unit tests. `open` ignores the path.
@@ -107,7 +107,19 @@ impl Storage for MemoryStorage {
             .lock()?
             .last_synced
             .get(&(ck.0.clone(), path.clone()))
-            .copied())
+            .map(|(node, _)| *node))
+    }
+
+    fn get_last_synced_content(
+        &self,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+    ) -> Result<Option<ContentHash>, Self::Error> {
+        Ok(self
+            .lock()?
+            .last_synced
+            .get(&(ck.0.clone(), path.clone()))
+            .and_then(|(_, hash)| *hash))
     }
 
     fn range_meta(
@@ -228,10 +240,11 @@ impl WriteBatch for MemoryWriteBatch<'_> {
         ck: &CheckoutId,
         path: &CanonicalPath,
         file_node: FileNode,
+        content_hash: Option<ContentHash>,
     ) -> Result<(), Self::Error> {
         self.inner
             .last_synced
-            .insert((ck.0.clone(), path.clone()), file_node);
+            .insert((ck.0.clone(), path.clone()), (file_node, content_hash));
         Ok(())
     }
 

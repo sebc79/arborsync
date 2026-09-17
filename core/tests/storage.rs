@@ -32,7 +32,7 @@ fn write_is_invisible_until_commit() {
         .put_dir_node(&ck, &p("/src"), DirNode::from_bytes([9; 32]))
         .unwrap();
     batch
-        .put_last_synced(&ck, &p("/src/foo.rs"), FileNode::from_bytes([8; 32]))
+        .put_last_synced(&ck, &p("/src/foo.rs"), FileNode::from_bytes([8; 32]), None)
         .unwrap();
     batch.commit().unwrap();
 
@@ -47,6 +47,35 @@ fn write_is_invisible_until_commit() {
     assert_eq!(
         store.get_last_synced(&ck, &p("/src/foo.rs")).unwrap(),
         Some(FileNode::from_bytes([8; 32]))
+    );
+    assert_eq!(
+        store
+            .get_last_synced_content(&ck, &p("/src/foo.rs"))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn last_synced_row_keeps_the_content_hash() {
+    let (_dir, store) = open_tmp();
+    let ck = CheckoutId::master();
+    let node = FileNode::from_bytes([8; 32]);
+    let hash = ContentHash::from_bytes([3; 32]);
+    let mut batch = store.begin_write().unwrap();
+    batch
+        .put_last_synced(&ck, &p("/src/foo.rs"), node, Some(hash))
+        .unwrap();
+    batch.commit().unwrap();
+    assert_eq!(
+        store.get_last_synced(&ck, &p("/src/foo.rs")).unwrap(),
+        Some(node)
+    );
+    assert_eq!(
+        store
+            .get_last_synced_content(&ck, &p("/src/foo.rs"))
+            .unwrap(),
+        Some(hash)
     );
 }
 
@@ -160,7 +189,12 @@ fn prefix_delete_and_checkout_delete() {
         .put_dir_node(&master, &p("/src2"), DirNode::from_bytes([7; 32]))
         .unwrap();
     batch
-        .put_last_synced(&master, &p("/src/foo.rs"), FileNode::from_bytes([8; 32]))
+        .put_last_synced(
+            &master,
+            &p("/src/foo.rs"),
+            FileNode::from_bytes([8; 32]),
+            None,
+        )
         .unwrap();
     batch.commit().unwrap();
 
@@ -217,10 +251,20 @@ fn purge_prefix_clears_all_three_tables_and_spares_the_sibling() {
         .put_dir_node(&master, &p("/src2"), DirNode::from_bytes([7; 32]))
         .unwrap();
     batch
-        .put_last_synced(&master, &p("/src/foo.rs"), FileNode::from_bytes([8; 32]))
+        .put_last_synced(
+            &master,
+            &p("/src/foo.rs"),
+            FileNode::from_bytes([8; 32]),
+            None,
+        )
         .unwrap();
     batch
-        .put_last_synced(&master, &p("/src2/bar.rs"), FileNode::from_bytes([6; 32]))
+        .put_last_synced(
+            &master,
+            &p("/src2/bar.rs"),
+            FileNode::from_bytes([6; 32]),
+            None,
+        )
         .unwrap();
     batch.commit().unwrap();
 
@@ -266,7 +310,7 @@ fn del_entry_clears_one_path_from_all_three_tables() {
         .put_dir_node(&master, &p("/src"), DirNode::from_bytes([9; 32]))
         .unwrap();
     batch
-        .put_last_synced(&master, &p("/src"), FileNode::from_bytes([8; 32]))
+        .put_last_synced(&master, &p("/src"), FileNode::from_bytes([8; 32]), None)
         .unwrap();
     batch
         .put_meta(&master, &p("/src/foo.rs"), &meta(2))

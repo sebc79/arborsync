@@ -15,14 +15,13 @@ use crate::hash::{ContentHash, FileNode, SubtreeRoot};
 use crate::index;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
-use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
+use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
 use crate::path::{
-    canonical_to_host, conflict_sidecar_path, is_reserved_root_entry, join_central, CanonicalPath,
-    PathError,
+    CanonicalPath, PathError, canonical_to_host, is_reserved_root_entry, join_central,
 };
 use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
 use crate::storage::{CheckoutId, Storage};
-use crate::transfer::{self, signature_for, BulkTransfer};
+use crate::transfer::{self, BulkTransfer, signature_for};
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
 
@@ -1320,16 +1319,6 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         previous: Option<&FileMetadata>,
         body: &[u8],
     ) -> Result<(), MasterError> {
-        if let Some(previous) = previous {
-            if previous.kind == new.kind {
-                apply::sidecar_if_content_differs(
-                    &canonical_to_host(&self.central_root, path),
-                    &conflict_sidecar_path(&self.central_root, path, &previous.content_hash),
-                    previous,
-                    new.content_hash,
-                )?;
-            }
-        }
         self.inflight.arm(path.clone(), new.content_hash);
         self.index_ancestors(path)?;
         apply::replace_live(&self.central_root, path, new, body, previous)?;
