@@ -1206,7 +1206,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             )
         };
         let host = canonical_to_host(&local, &relative);
-        let Some(found) = meta::collect_from_path(&host).map_err(SlaveError::io(&host))? else {
+        let previous = self.meta(checkout_id, &path)?;
+        let Some(found) =
+            meta::collect_for_rescan(&host, previous.as_ref()).map_err(SlaveError::io(&host))?
+        else {
             return self.note_removed(checkout_id, &path);
         };
         if self
@@ -1344,7 +1347,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             )
         };
         let host = canonical_to_host(&local, &relative);
-        let Some(found) = meta::collect_from_path(&host).map_err(SlaveError::io(&host))? else {
+        let Some(found) =
+            meta::collect_for_rescan(&host, from_meta.as_ref()).map_err(SlaveError::io(&host))?
+        else {
             return self.note_removed(checkout_id, &from);
         };
 

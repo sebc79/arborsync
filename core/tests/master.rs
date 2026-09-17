@@ -1495,6 +1495,42 @@ fn disconnect_drops_that_peers_pending_and_keeps_the_other() {
 }
 
 #[test]
+fn write_event_reuses_content_hash_when_only_mode_changes() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(BACKUP, subscribe("backup-1", &[("bak", "/")]))
+        .unwrap();
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("edit.txt", b"typed by hand");
+    master
+        .note_local(LocalEvent::Changed(p("/edit.txt")))
+        .unwrap();
+    let first = master.meta(&p("/edit.txt")).unwrap().unwrap();
+    let _ = master.poll(BACKUP);
+    sandbox
+        .tree(&sandbox.central_root())
+        .set_mode("edit.txt", first.mode | 0o111);
+    sandbox
+        .tree(&sandbox.central_root())
+        .set_mtime_ns("edit.txt", first.mtime_ns);
+    master
+        .note_local(LocalEvent::Changed(p("/edit.txt")))
+        .unwrap();
+    let second = master.meta(&p("/edit.txt")).unwrap().unwrap();
+    assert_eq!(second.content_hash, first.content_hash);
+    assert_ne!(second.mode, first.mode);
+    match &master.poll(BACKUP)[..] {
+        [ProtocolMessage::FileAnnounce { new, .. }] => {
+            assert_eq!(new.content_hash, first.content_hash);
+            assert_ne!(new.mode, first.mode);
+        }
+        other => panic!("expected chmod FileAnnounce, got {other:?}"),
+    }
+}
+
+#[test]
 fn rescan_reuses_content_hash_when_only_mode_changes() {
     let sandbox = SyncSandbox::new();
     let mut master = two_slave_master(&sandbox, MemoryContent::new());

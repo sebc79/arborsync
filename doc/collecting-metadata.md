@@ -35,15 +35,15 @@ UTF-8 only. Reject non-UTF-8 names (log, skip). `central_root` and each `local` 
 2. Classify: file, dir, symlink, or other. Other (devices, sockets, FIFOs): log a warn with the host path and return `None`.
 3. Fill `size`, `mtime_ns` (`modified()` → duration since epoch; if unavailable, skip and log), `mode` (`PermissionsExt::mode()` on Unix).
 4. **Hash decision:**
-   - File, rescan (`collect_for_rescan`): hash if no index row, or stored size, mtime, or kind differ. Mode is not a miss. The returned row carries the fresh mode.
-   - File, watcher (`collect_from_path`): always hash. Master `walk_central` uses `collect_for_rescan`.
-   - Symlink: always read the target and hash it (cheap).
+   - File (`collect_for_rescan`): hash if no index row, or stored size, mtime, or kind differ. Mode is not a miss. The returned row carries the fresh mode. Rescan, Create, Write, Metadata, and Rename use this.
+   - `collect_from_path` hashes a file unconditionally. The miss path falls through to it.
+   - Symlink: always read the target and hash it (cheap) on a miss. Same-size same-mtime reuse applies.
    - Dir: no content hash.
 5. Streaming BLAKE3 for files.
 
 Rescan is a **full `stat` walk** of the checkout or `central_root`. It is not limited to “changed subtrees.”
 
-**Watcher:** after debounce, re-read each affected path with `collect_from_path`. The mini debouncer does not emit `Remove`. ENOENT during that read is treated as delete.
+**Watcher:** after debounce, re-read each affected path with `collect_for_rescan`. ENOENT during that read is treated as delete.
 
 ## Unix mode
 

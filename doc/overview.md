@@ -106,7 +106,7 @@ After `SubscribeAck`, after every rescan, and after reconnect, the slave sends `
 
 Initial populate is the same walk with `last_synced` empty.
 
-Rescan is a full `stat` walk, not a dirty-subtree walk. `collect_for_rescan` hashes again only when kind, size, or mtime disagree with the index. Mode is not a miss. Master `walk_central` uses that path too. The 60 s timer is `recv_timeout` on the notify channel, so a busy tree delays rescan.
+Rescan is a full `stat` walk, not a dirty-subtree walk. `collect_for_rescan` hashes again only when kind, size, or mtime disagree with the index. Mode is not a miss. Create, Write, Metadata, Rename, and master `walk_central` use that path too. The 60 s timer is `recv_timeout` on the notify channel, so a busy tree delays rescan.
 
 ## Identity and reload
 

@@ -167,6 +167,9 @@ pub fn collect_from_path(host: &Path) -> Result<Option<FileMetadata>, io::Error>
     )))
 }
 
+/// Re-stat `host` and reuse `previous.content_hash` when kind, size, and
+/// mtime match (`spec.md` §6 / §7). Mode is not a miss. Missing row or a
+/// miss falls through to [`collect_from_path`].
 pub fn collect_for_rescan(
     host: &Path,
     previous: Option<&FileMetadata>,
