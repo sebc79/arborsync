@@ -16,7 +16,7 @@ These byte layouts are part of the on-disk and on-the-wire contract. Change them
 
 ```
 FileNode = BLAKE3(
-    u8 kind                         # 1 or 3
+    u8 kind
     || content_hash                 # 32 bytes
     || u64be size
     || i64be mtime_ns
