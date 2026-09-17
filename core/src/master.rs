@@ -806,7 +806,6 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             return Ok(outside_central(&path));
         }
         match self.meta(&path)? {
-            // DirEntry has only node_hash; the slave cannot invert a FileNode into mode/mtime/size/content_hash.
             Some(meta) if meta.kind != EntryKind::Dir => Ok(ProtocolMessage::FileAnnounce {
                 checkout_id,
                 path,
