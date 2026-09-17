@@ -11,10 +11,13 @@ bincode.workspace = true
 blake3.workspace = true
 filetime.workspace = true
 log.workspace = true
+quinn.workspace = true
+quinn-hyphae.workspace = true
 redb.workspace = true
 serde.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 toml.workspace = true
 x25519-dalek.workspace = true
 

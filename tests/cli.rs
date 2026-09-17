@@ -118,6 +118,68 @@ fn master_reads_the_config_path_from_the_environment() {
 }
 
 #[test]
+fn slave_reports_the_missing_key_path_it_could_not_read() {
+    let sandbox = SyncSandbox::new();
+    let local = sandbox.add_checkout("dev-alice", "src");
+    let config = sandbox.write_slave_config(
+        "dev-alice",
+        vec![arborsync_core::config::CheckoutConfig {
+            id: "src".into(),
+            central: "/src".into(),
+            local: local.to_string_lossy().into_owned(),
+        }],
+        vec!["hex:".to_string() + &"11".repeat(32)],
+    );
+    let output = bin()
+        .arg("slave")
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .expect("run slave");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("slave.key"), "stderr={stderr}");
+}
+
+#[test]
+fn slave_keeps_running_while_the_master_is_down() {
+    let sandbox = SyncSandbox::new();
+    let local = sandbox.add_checkout("dev-alice", "src");
+    let key = sandbox.slave_root("dev-alice").join("slave.key");
+    let keygen = bin().args(["keygen", "--out"]).arg(&key).output().unwrap();
+    assert!(keygen.status.success());
+    let config = sandbox.write_slave_config(
+        "dev-alice",
+        vec![arborsync_core::config::CheckoutConfig {
+            id: "src".into(),
+            central: "/src".into(),
+            local: local.to_string_lossy().into_owned(),
+        }],
+        vec!["hex:".to_string() + &"11".repeat(32)],
+    );
+    let mut child = bin()
+        .arg("slave")
+        .arg("--config")
+        .arg(&config)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn slave");
+
+    sleep(Duration::from_millis(1500));
+    if let Some(status) = child.try_wait().unwrap() {
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "slave exited with {status}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(sandbox);
+}
+
+#[test]
 fn master_reports_the_missing_key_path_it_could_not_read() {
     let sandbox = SyncSandbox::new();
     let config = sandbox.write_master_config(Vec::new());
