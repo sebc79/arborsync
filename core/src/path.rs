@@ -145,7 +145,6 @@ pub fn is_reserved_root_entry(name: &str) -> bool {
     name == RESERVED_TMP || name == RESERVED_CONFLICTS
 }
 
-/// Host path under a checkout `local` to the canonical path in `central`.
 pub fn local_to_canonical(
     local: &Path,
     central: &CanonicalPath,
@@ -159,8 +158,7 @@ pub fn local_to_canonical(
 }
 
 /// Convert a host path under `root` (already canonicalized) to a logical
-/// canonical path. `root` is `central_root` on the master, or a checkout
-/// `local` on the slave (then join with that checkout’s `central`).
+/// canonical path.
 pub fn host_to_canonical(root: &Path, host_path: &Path) -> Result<CanonicalPath, PathError> {
     let root_str = root.to_str().ok_or(PathError::NotUtf8)?;
     let host_str = host_path.to_str().ok_or(PathError::NotUtf8)?;
@@ -193,10 +191,7 @@ pub fn canonical_to_host(central_root: &Path, path: &CanonicalPath) -> PathBuf {
     central_root.join(relative)
 }
 
-/// Path under a checkout `local` for a canonical `path` covered by `central`.
-/// `/src` + `/src/foo.rs` is `/foo.rs` so `canonical_to_host(local, …)` lands
-/// in the checkout, not `local/src/foo.rs`.
-pub fn checkout_relative(
+pub fn strip_central(
     central: &CanonicalPath,
     path: &CanonicalPath,
 ) -> Result<CanonicalPath, PathError> {

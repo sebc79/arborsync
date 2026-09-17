@@ -8,7 +8,7 @@ use arborsync_core::path::{RESERVED_CONFLICTS, conflict_sidecar_path};
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::slave::{
     DeleteAction, LocalEvent, MemoryContent, ReplicaAction, Reply, Slave, decide_incoming,
-    decide_replica_delete,
+    decide_master_won_delete,
 };
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
 
@@ -66,22 +66,22 @@ fn incoming_announce_follows_the_replica_table() {
 }
 
 #[test]
-fn replica_delete_sidecars_divergent_content() {
+fn master_won_delete_sidecars_divergent_content() {
     let live = file(1);
     assert_eq!(
-        decide_replica_delete(None, file_node(&live), None),
+        decide_master_won_delete(None, file_node(&live), None),
         DeleteAction::AlreadyGone
     );
     assert_eq!(
-        decide_replica_delete(Some(&live), file_node(&live), None),
+        decide_master_won_delete(Some(&live), file_node(&live), None),
         DeleteAction::Remove
     );
     assert_eq!(
-        decide_replica_delete(Some(&live), file_node(&file(9)), Some(file_node(&live))),
+        decide_master_won_delete(Some(&live), file_node(&file(9)), Some(file_node(&live))),
         DeleteAction::Remove
     );
     assert_eq!(
-        decide_replica_delete(Some(&live), file_node(&file(9)), Some(file_node(&file(8)))),
+        decide_master_won_delete(Some(&live), file_node(&file(9)), Some(file_node(&file(8)))),
         DeleteAction::SidecarThenRemove
     );
 }

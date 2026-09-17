@@ -1,7 +1,3 @@
-//! One synchronous writer of each checkout tree and that checkout’s index.
-//! The binary serializes QUIC and `notify` into [`Slave::handle`] and
-//! [`Slave::note_local`].
-
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -16,8 +12,8 @@ use crate::index;
 use crate::merkle::file_node;
 use crate::meta::{self, EntryKind, FileMetadata};
 use crate::path::{
-    CanonicalPath, PathError, canonical_to_host, checkout_relative, conflict_sidecar_path,
-    is_reserved_root_entry,
+    CanonicalPath, PathError, canonical_to_host, conflict_sidecar_path, is_reserved_root_entry,
+    strip_central,
 };
 use crate::protocol::{CheckoutRef, ProtocolMessage};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
@@ -77,7 +73,6 @@ pub enum DeleteAction {
     SidecarThenRemove,
 }
 
-/// Slave-side table for a master `FileAnnounce` (`spec.md` §8).
 pub fn decide_incoming(
     local: Option<&FileMetadata>,
     basis: Option<FileNode>,
@@ -99,8 +94,7 @@ pub fn decide_incoming(
     ReplicaAction::ApplyMetaOnly
 }
 
-/// Replica delete (`spec.md` §8). Master already won.
-pub fn decide_replica_delete(
+pub fn decide_master_won_delete(
     local: Option<&FileMetadata>,
     basis: FileNode,
     last_synced: Option<FileNode>,
@@ -339,7 +333,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     ) -> Result<Reply, SlaveError> {
         let current = self.meta(&checkout_id, &path)?;
         let last_synced = self.last_synced(&checkout_id, &path)?;
-        match decide_replica_delete(current.as_ref(), basis, last_synced) {
+        match decide_master_won_delete(current.as_ref(), basis, last_synced) {
             DeleteAction::AlreadyGone => {
                 self.write_last_synced(&checkout_id, &path, None)?;
                 Ok(Reply::Send(Vec::new()))
@@ -394,7 +388,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     ) -> Result<Reply, SlaveError> {
         let relative = {
             let checkout = self.checkout(checkout_id)?;
-            checkout_relative(&checkout.central, &path)?
+            strip_central(&checkout.central, &path)?
         };
         match new.kind {
             EntryKind::Dir => {
@@ -448,7 +442,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             let checkout = self.checkout(checkout_id)?;
             (
                 checkout.local.clone(),
-                checkout_relative(&checkout.central, path)?,
+                strip_central(&checkout.central, path)?,
             )
         };
         let host = canonical_to_host(&local, &relative);
@@ -489,7 +483,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             let checkout = self.checkout(checkout_id)?;
             (
                 checkout.local.clone(),
-                checkout_relative(&checkout.central, path)?,
+                strip_central(&checkout.central, path)?,
             )
         };
         apply::remove_live(&local, &relative)?;
@@ -510,7 +504,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             return Ok(());
         };
         let checkout = self.checkout(checkout_id)?;
-        let relative = checkout_relative(&checkout.central, path)?;
+        let relative = strip_central(&checkout.central, path)?;
         let live = canonical_to_host(&checkout.local, &relative);
         let sidecar = conflict_sidecar_path(&checkout.local, path, &previous.content_hash);
         apply::sidecar_if_content_differs(&live, &sidecar, previous, incoming)?;
@@ -548,7 +542,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             let checkout = self.checkout(checkout_id)?;
             (
                 checkout.local.clone(),
-                checkout_relative(&checkout.central, &path)?,
+                strip_central(&checkout.central, &path)?,
             )
         };
         let host = canonical_to_host(&local, &relative);
@@ -634,7 +628,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             {
                 continue;
             }
-            let relative = checkout_relative(&central, &dir)?;
+            let relative = strip_central(&central, &dir)?;
             let host = canonical_to_host(&local, &relative);
             fs::create_dir_all(&host).map_err(SlaveError::io(&host))?;
             let Some(found) = meta::collect_from_path(&host).map_err(SlaveError::io(&host))? else {
