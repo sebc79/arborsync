@@ -52,7 +52,7 @@ No `conflict_resolution` knob, no `max_conflict_files_per_dir`, no `max_update_a
 ## Atomic write
 
 1. Ensure parent dirs exist (mode from announce or `0o755`).
-2. Write `{local}/.arborsync-tmp/{unique}` (same filesystem as `local`). Specified: for a delta, `copia` `patch` from the live file into that tmp file. As built: `reconstruct` patches in RAM, then `atomic_put` writes the full buffer. For whole-file: stream bytes into tmp. For a symlink: tmp is unused; `symlink` after removing the previous name.
+2. Write `{local}/.arborsync-tmp/{unique}` (same filesystem as `local`). Specified as built. Spec §8 says never patch in place. `reconstruct` patches in RAM, then `atomic_put` writes the full buffer. For whole-file: stream bytes into tmp. For a symlink: tmp is unused; `symlink` after removing the previous name.
 3. `fsync` the tmp file.
 4. Verify BLAKE3 of the tmp file (or symlink target) equals `new.content_hash`. Mismatch: drop tmp, send `SignatureRequest` with empty signature (whole-file retry) once; still wrong → log, keep the previous live file, leave `last_synced` unchanged.
 5. Set tmp mode (`mode & 0o7777`) and mtime (`filetime`, announced `mtime_ns`).
@@ -62,7 +62,7 @@ No `conflict_resolution` knob, no `max_conflict_files_per_dir`, no `max_update_a
 Never patch in place. Crash between rename and index: rescan sees the new bytes; reconcile sets `last_synced`.
 
 Directory create: `create_dir_all` + mode + mtime, then index.  
-Directory delete: specified as children first (index prefix delete + FS remove), then the directory. As built: `remove_dir_all` on the live path.  
+Directory delete: children first (index prefix delete + FS remove), then `remove_dir`. Files and symlinks use `remove_file`.  
 File delete: `remove_file` after the CAS check.
 
 Type change: specified as delete the old kind, create the new kind, one master transaction. Slaves apply the same pair in order. As built: kind mismatch is `CasReject`. Reconcile Pull on the slave can `remove_path` then mkdir.
@@ -79,7 +79,7 @@ Do not compute a delta against a remembered remote snapshot. Do not put bodies i
 
 ## Delete and rename
 
-**Delete** applies only if local `FileNode == basis` (or `== last_synced` when the announce’s basis is that). If local `FileNode` differs: sidecar, then delete live (master won). Incoming replica delete then hashes that sidecar against `ContentHash::ZERO`, so any non-dir whose content hash is not zero is copied, including a meta-only mismatch. If local is already absent: no-op, clear `last_synced`. Dirs never sidecar on delete.
+**Delete** applies only if local `FileNode == basis` (or `== last_synced`). Otherwise the slave sidecars local bytes (`incoming` hash `ContentHash::ZERO`) and then deletes. Wire `Delete` has no `content_hash`, so a meta-only miss still sidecars. If local is already absent: no-op, clear `last_synced`. Dirs never sidecar on delete.
 
 **Rename** is specified (`from` and `to` in one debounce window, same checkout) as atomic delete `from` plus create `to`. `ProtocolMessage::Rename` is defined and unanswered. The watcher emits two `Changed` events instead (`filesystem-scanning-watching.md`).
 
@@ -87,7 +87,7 @@ Master `publish` writes a sidecar whenever the previous live content hash differ
 
 ## Echo
 
-`inflight[(checkout_id, canonical)] = content_hash` after a successful file or symlink `rename`, until the next watcher event for that path is consumed or 2× debounce elapses. Matching hash → drop the event, do not announce. A later real edit has a different hash and announces as usual. Dirs and meta-only apply do not arm.
+`inflight[(checkout_id, canonical)] = content_hash` before the live `rename`, `mkdir`, or meta apply, until the next watcher event for that path is consumed or 2× debounce elapses. Dirs arm `ContentHash::ZERO`. Matching hash → drop the event, do not announce. A later real edit has a different hash and announces as usual.
 
 Set announced mtime on the file **before** clearing `inflight`.
 

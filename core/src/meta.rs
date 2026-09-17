@@ -111,12 +111,16 @@ pub fn hash_file(host: &Path) -> Result<ContentHash, io::Error> {
 }
 
 /// Read one host path as an index row (`spec.md` §6). `None` for a path
-/// that is gone and for the types the spec skips: device files, sockets,
-/// FIFOs. Symlinks are stored, never followed.
+/// that is gone, for `PermissionDenied`, and for the types the spec skips:
+/// device files, sockets, FIFOs. Symlinks are stored, never followed.
 pub fn collect_from_path(host: &Path) -> Result<Option<FileMetadata>, io::Error> {
     let md = match fs::symlink_metadata(host) {
         Ok(md) => md,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            log::warn!("skipping {}: permission denied", host.display());
+            return Ok(None);
+        }
         Err(err) => return Err(err),
     };
     let mode = md.mode();
@@ -124,7 +128,14 @@ pub fn collect_from_path(host: &Path) -> Result<Option<FileMetadata>, io::Error>
     let kind = md.file_type();
 
     if kind.is_symlink() {
-        let target = fs::read_link(host)?;
+        let target = match fs::read_link(host) {
+            Ok(target) => target,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                log::warn!("skipping {}: permission denied", host.display());
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
         let bytes = target.as_os_str().as_bytes();
         return Ok(Some(FileMetadata::symlink(
             bytes.len() as u64,
@@ -137,13 +148,22 @@ pub fn collect_from_path(host: &Path) -> Result<Option<FileMetadata>, io::Error>
         return Ok(Some(FileMetadata::directory(mtime_ns, mode)));
     }
     if !kind.is_file() {
+        log::warn!("skipping special file {}", host.display());
         return Ok(None);
     }
+    let content_hash = match hash_file(host) {
+        Ok(hash) => hash,
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            log::warn!("skipping {}: permission denied", host.display());
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
     Ok(Some(FileMetadata::file(
         md.len(),
         mtime_ns,
         mode,
-        hash_file(host)?,
+        content_hash,
     )))
 }
 
@@ -154,6 +174,10 @@ pub fn collect_for_rescan(
     let md = match fs::symlink_metadata(host) {
         Ok(md) => md,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            log::warn!("skipping {}: permission denied", host.display());
+            return Ok(None);
+        }
         Err(err) => return Err(err),
     };
     let mode = md.mode();
@@ -166,11 +190,11 @@ pub fn collect_for_rescan(
     } else if ft.is_file() {
         (EntryKind::File, md.len())
     } else {
+        log::warn!("skipping special file {}", host.display());
         return Ok(None);
     };
     if let Some(prev) = previous {
-        if prev.kind == kind && prev.size == size && prev.mtime_ns == mtime_ns && prev.mode == mode
-        {
+        if prev.kind == kind && prev.size == size && prev.mtime_ns == mtime_ns {
             return Ok(Some(FileMetadata {
                 kind,
                 size,

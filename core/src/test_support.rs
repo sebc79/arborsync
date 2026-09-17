@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, MutexGuard};
@@ -481,6 +482,7 @@ impl SyncSandbox {
         };
         let path = self.master_config_path();
         fs::write(&path, cfg.to_toml().expect("toml")).expect("write master.toml");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod master.toml");
         path
     }
 
@@ -506,6 +508,7 @@ impl SyncSandbox {
         };
         let path = root.join("slave.toml");
         fs::write(&path, cfg.to_toml().expect("toml")).expect("write slave.toml");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod slave.toml");
         path
     }
 }

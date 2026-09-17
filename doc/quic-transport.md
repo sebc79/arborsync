@@ -21,7 +21,7 @@ Workspace pin is `quinn-hyphae = "0.1.0-beta.0"`. Quinn is `default-features = f
 After XX:
 
 - Slave disconnects if the peer static key is not in `master_public_keys`.
-- Master looks up the peer static key in `[[slaves]]`. Unknown key: disconnect after XX. `AttemptLimiter` only changes the log line. Known key: that row’s `id` is the only legal `slave_id` on `Subscribe`.
+- Master looks up the peer static key in `[[slaves]]`. `AttemptLimiter::limited` drops the accept before XX. After XX, unknown key records `allow` and disconnects. Known key: that row’s `id` is the only legal `slave_id` on `Subscribe`. `slave_id` mismatch is hangup (the binary also `allow`s).
 
 Preamble `arborsync-v1` is the hyphae Noise prologue (`with_prologue`), not an application frame after XX.
 
@@ -80,9 +80,9 @@ Direction (normative):
 
 Exponential backoff (1 s, 2 s, 4 s, cap 60 s). Full handshake (no 0-RTT). `Subscribe` plus reconcile. Do not replay in-flight announces from the previous connection.
 
-A new successful session for the same `slave_id` replaces the old one. The binary signals the old accept task. It does not call `close` on the previous `Connection`. Roster interest switches when the new session sends `Subscribe`.
+A new successful session for the same `slave_id` replaces the old one. The binary `close`s the previous `Connection` and signals the old accept task. Roster interest switches when the new session sends `Subscribe`.
 
-`SubscribeReject` is specified as log-and-wait (`subscriptions.md`). As built, the slave hangs up and the binary reconnects with the same set.
+On `SubscribeReject` the slave records `denied_centrals` and omits those prefixes from the next `subscribe()`. It stays on the connection when any checkout remains. All denied is hangup.
 
 ## Limits
 
@@ -93,7 +93,7 @@ max_connection_attempts_per_minute = 60
 
 `quic_max_concurrent_streams`, `quic_idle_timeout_ms`, `quic_initial_mtu`, `reconnect_initial_ms`, and `reconnect_max_ms` appear in older drafts. They are not parsed. Quinn defaults and the hardcoded backoff apply.
 
-Idle timeout closes the QUIC connection. The slave reconnects. Unknown-key disconnects increment `AttemptLimiter` and still complete XX and `close`. Broken frames do not increment the limiter. ACL misses are `SubscribeReject`, not a rate-limited disconnect.
+Idle timeout closes the QUIC connection. The slave reconnects. Unknown-key disconnects increment `AttemptLimiter` after XX and still `close`. A limited IP is ignored before XX. Broken frames do not increment the limiter. Prefix deny stays `SubscribeReject`. `slave_id` mismatch is hangup.
 
 ## Security
 

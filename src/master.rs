@@ -24,6 +24,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::reload::{apply_file_log_level, spawn_config_watch};
 
 const DEFAULT_CONFIG: &str = "/etc/arborsync/master.toml";
+const OUTBOX_BACKPRESSURE: usize = 32;
 
 type SharedMaster = Arc<Mutex<Master<RedbStorage, WholeFileLater>>>;
 
@@ -168,9 +169,13 @@ async fn accept_session(
     limiter: Arc<Mutex<AttemptLimiter>>,
     sessions: Arc<Mutex<HashMap<String, SessionHandle>>>,
 ) -> anyhow::Result<()> {
+    let ip = incoming.remote_address().ip();
+    if limiter.lock().expect("limiter").limited(ip, Instant::now()) {
+        incoming.ignore();
+        return Ok(());
+    }
     let conn = incoming.await.context("handshake")?;
     let peer = peer_static_key(&conn).context("peer static key")?;
-    let ip = conn.remote_address().ip();
     let slave_id = master
         .lock()
         .expect("master")
@@ -202,6 +207,7 @@ async fn accept_session(
                 conn: conn.clone(),
             },
         ) {
+            previous.conn.close(0u32.into(), b"replaced");
             let _ = previous.replaced.send(true);
         }
     }
@@ -218,14 +224,14 @@ async fn accept_session(
             msg = read_control(&mut recv) => {
                 let msg = msg?;
                 let reply = master.lock().expect("master").handle(peer, msg)?;
-                if dispatch_master(&master, peer, &slave_id, &conn, &mut send, reply).await? {
+                if dispatch_master(&master, peer, &slave_id, &conn, &mut send, reply, &limiter, ip).await? {
                     break;
                 }
             }
             incoming = accept_bulk(&conn) => {
                 let (header, body) = incoming?;
                 let reply = master.lock().expect("master").apply_bulk(peer, header, &body)?;
-                if dispatch_master(&master, peer, &slave_id, &conn, &mut send, reply).await? {
+                if dispatch_master(&master, peer, &slave_id, &conn, &mut send, reply, &limiter, ip).await? {
                     break;
                 }
             }
@@ -247,9 +253,14 @@ async fn dispatch_master(
     conn: &quinn::Connection,
     send: &mut quinn::SendStream,
     reply: Reply,
+    limiter: &Mutex<AttemptLimiter>,
+    ip: std::net::IpAddr,
 ) -> anyhow::Result<bool> {
     match reply {
-        Reply::Hangup { reason } => {
+        Reply::Hangup { reason, rate_limit } => {
+            if rate_limit {
+                limiter.lock().expect("limiter").allow(ip, Instant::now());
+            }
             log::info!("hangup {slave_id}: {reason}");
             master.lock().expect("master").disconnect(peer);
             Ok(true)
@@ -273,9 +284,13 @@ async fn flush_outbox(
     send: &mut quinn::SendStream,
 ) -> anyhow::Result<()> {
     let pending = master.lock().expect("master").poll(peer);
-    for msg in pending {
-        write_control(send, &msg).await?;
+    if pending.len() > OUTBOX_BACKPRESSURE {
+        master.lock().expect("master").set_writable(peer, false);
     }
+    for msg in &pending {
+        write_control(send, msg).await?;
+    }
+    master.lock().expect("master").set_writable(peer, true);
     Ok(())
 }
 

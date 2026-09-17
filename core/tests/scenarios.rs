@@ -549,10 +549,14 @@ fn restricted_slave_cannot_subscribe_root_or_announce_outside_src() {
         })
         .unwrap()
     {
-        SlaveReply::Hangup { reason } => {
-            assert_eq!(reason, "central is outside allowed_prefixes")
-        }
-        other => panic!("expected Hangup, got {other:?}"),
+        SlaveReply::Send(msgs) => match &msgs[..] {
+            [ProtocolMessage::Subscribe { checkouts, .. }] => {
+                assert_eq!(checkouts.len(), 1);
+                assert_eq!(checkouts[0].central, p("/src"));
+            }
+            other => panic!("expected filtered Subscribe, got {other:?}"),
+        },
+        other => panic!("expected Send, got {other:?}"),
     }
 
     match master_msg(
@@ -576,7 +580,10 @@ fn restricted_slave_cannot_subscribe_root_or_announce_outside_src() {
         .handle([0xEE; 32], subscribe("dev-alice", &[("src", "/src")]))
         .unwrap()
     {
-        MasterReply::Hangup { reason } => assert_eq!(reason, "unknown static key"),
+        MasterReply::Hangup { reason, rate_limit } => {
+            assert_eq!(reason, "unknown static key");
+            assert!(rate_limit);
+        }
         other => panic!("expected Hangup, got {other:?}"),
     }
 

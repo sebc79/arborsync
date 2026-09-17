@@ -80,7 +80,7 @@ impl Origin {
 #[derive(Debug)]
 pub enum Reply {
     Send(ProtocolMessage),
-    Hangup { reason: String },
+    Hangup { reason: String, rate_limit: bool },
     Bulk(BulkTransfer),
 }
 
@@ -415,13 +415,24 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         if self.cfg.acl_for_public_key(&peer).is_none() {
             return Ok(Reply::Hangup {
                 reason: "unknown static key".into(),
+                rate_limit: true,
             });
         }
         match msg {
             ProtocolMessage::Subscribe {
                 slave_id,
                 checkouts,
-            } => Ok(Reply::Send(self.on_subscribe(peer, slave_id, checkouts)?)),
+            } => {
+                if let Some(acl) = self.cfg.acl_for_public_key(&peer) {
+                    if acl.id() != slave_id {
+                        return Ok(Reply::Hangup {
+                            reason: format!("slave_id {slave_id} is not bound to this key"),
+                            rate_limit: true,
+                        });
+                    }
+                }
+                Ok(Reply::Send(self.on_subscribe(peer, slave_id, checkouts)?))
+            }
             ProtocolMessage::FileAnnounce {
                 checkout_id,
                 path,
@@ -448,6 +459,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 self.disconnect(peer);
                 Ok(Reply::Hangup {
                     reason: "peer disconnect".into(),
+                    rate_limit: false,
                 })
             }
             ProtocolMessage::SignatureRequest {
@@ -573,6 +585,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
 
     pub fn disconnect(&mut self, peer: [u8; 32]) {
         self.roster.disconnect_peer(&peer);
+        self.pending.retain(|_, row| row.peer != peer);
     }
 
     pub fn poll(&mut self, peer: [u8; 32]) -> Vec<ProtocolMessage> {
@@ -674,12 +687,6 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         let Some(acl) = self.cfg.acl_for_public_key(&peer) else {
             return Ok(reject_all(&checkouts, "unknown static key"));
         };
-        if acl.id() != slave_id {
-            return Ok(reject_all(
-                &checkouts,
-                &format!("slave_id {slave_id} is not bound to this key"),
-            ));
-        }
         if checkouts.len() > self.cfg.max_checkouts_per_slave() as usize {
             return Ok(reject_all(&checkouts, "too many checkouts"));
         }
@@ -761,6 +768,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
 
         match new.kind {
             EntryKind::Dir => {
+                self.inflight.arm(path.clone(), ContentHash::ZERO);
                 self.index_ancestors(&path)?;
                 apply::mkdir_live(&self.central_root, &path, &new)?;
             }
@@ -1029,13 +1037,13 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 new.content_hash,
             )?;
         }
+        self.inflight.arm(path.clone(), new.content_hash);
         self.index_ancestors(path)?;
         if new.kind == EntryKind::File {
             apply::atomic_put(&self.central_root, path, new, body)?;
         } else {
             apply::atomic_symlink(&self.central_root, path, new, body)?;
         }
-        self.inflight.arm(path.clone(), new.content_hash);
         Ok(())
     }
 
@@ -1081,7 +1089,8 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
 
     fn walk_central(&self) -> Result<BTreeMap<CanonicalPath, FileMetadata>, MasterError> {
         let mut found = BTreeMap::new();
-        if let Some(root) = meta::collect_from_path(&self.central_root)
+        let root_prev = self.meta(&CanonicalPath::root())?;
+        if let Some(root) = meta::collect_for_rescan(&self.central_root, root_prev.as_ref())
             .map_err(MasterError::io(&self.central_root))?
         {
             found.insert(CanonicalPath::root(), root);
@@ -1089,7 +1098,15 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         let mut pending = vec![CanonicalPath::root()];
         while let Some(dir) = pending.pop() {
             let host = canonical_to_host(&self.central_root, &dir);
-            for entry in fs::read_dir(&host).map_err(MasterError::io(&host))? {
+            let entries = match fs::read_dir(&host) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                    log::warn!("skipping {}: permission denied", host.display());
+                    continue;
+                }
+                Err(err) => return Err(MasterError::io(&host)(err)),
+            };
+            for entry in entries {
                 let entry = entry.map_err(MasterError::io(&host))?;
                 let raw = entry.file_name();
                 let Some(name) = raw.to_str() else {
@@ -1101,8 +1118,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 }
                 let child = join_central(&dir, name)?;
                 let host_child = entry.path();
-                let Some(meta) =
-                    meta::collect_from_path(&host_child).map_err(MasterError::io(&host_child))?
+                let previous = self.meta(&child)?;
+                let Some(meta) = meta::collect_for_rescan(&host_child, previous.as_ref())
+                    .map_err(MasterError::io(&host_child))?
                 else {
                     continue;
                 };

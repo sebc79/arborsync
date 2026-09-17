@@ -174,9 +174,23 @@ pub fn remove_live(central_root: &Path, path: &CanonicalPath) -> Result<(), Appl
     match fs::symlink_metadata(&host) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(at(&host)(err)),
-        Ok(md) if md.is_dir() => fs::remove_dir_all(&host).map_err(at(&host)),
+        Ok(md) if md.is_dir() => remove_dir_children_first(&host),
         Ok(_) => fs::remove_file(&host).map_err(at(&host)),
     }
+}
+
+fn remove_dir_children_first(dir: &Path) -> Result<(), ApplyError> {
+    for entry in fs::read_dir(dir).map_err(at(dir))? {
+        let entry = entry.map_err(at(dir))?;
+        let child = entry.path();
+        match fs::symlink_metadata(&child) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(at(&child)(err)),
+            Ok(md) if md.is_dir() => remove_dir_children_first(&child)?,
+            Ok(_) => fs::remove_file(&child).map_err(at(&child))?,
+        }
+    }
+    fs::remove_dir(dir).map_err(at(dir))
 }
 
 pub fn sidecar_if_content_differs(

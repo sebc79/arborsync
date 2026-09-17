@@ -376,9 +376,29 @@ fn load_reads_a_temp_file_parse_would_accept() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("master.toml");
     fs::write(&path, valid_master()).unwrap();
+    chmod(&path, 0o600);
     let loaded = LoadedMaster::load(&path).unwrap();
     let row = loaded.acl_for_public_key(&AA_BYTES).unwrap();
     assert_eq!(row.id(), "dev-alice");
+}
+
+#[test]
+fn load_rejects_0644_and_accepts_0600() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("master.toml");
+    fs::write(&path, valid_master()).unwrap();
+    chmod(&path, 0o644);
+    match LoadedMaster::load(&path) {
+        Err(ConfigError::InsecureMode { mode, .. }) => assert_eq!(mode, 0o644),
+        other => panic!("expected InsecureMode, got {other:?}"),
+    }
+    chmod(&path, 0o600);
+    LoadedMaster::load(&path).unwrap();
+}
+
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
 #[test]

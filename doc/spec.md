@@ -555,24 +555,24 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 
 | Requirement | As built |
 |---|---|
-| §3 overlap after symlink-resolved canonicalize | Overlap runs on tilde-expanded paths at parse. `canonicalize` runs later in `Master::open` / `Slave::open`. |
-| §4 / §14 config files `0600` | Key files are `0600` on write. Config mode is not checked. |
-| §4 / §12 unknown-key rate limit | XX always finishes. `AttemptLimiter` only changes the log line. ACL miss is `SubscribeReject`, not a rate-limited disconnect. |
-| §6 skip device, socket, FIFO | Returns `None` without a log. `EACCES` fails the walk instead of skip-and-continue. |
-| §6 / §7 hash only on size/mtime miss | Slave rescan is lazy (also treats mode as a miss). Master rescan and every watcher path call `collect_from_path` and rehash. |
+| §3 overlap after symlink-resolved canonicalize | Parse checks tilde-expanded paths and `canonicalize`s a local that already exists. `Slave::open` and checkout-add reload `canonicalize` again and reject `LocalOverlap` on the resolved paths. |
+| §4 / §14 config files `0600` | `LoadedMaster::load` / `LoadedSlave::load` reject a file whose mode is not `0600` (`ConfigError::InsecureMode`). `parse` does not check mode. |
+| §4 / §12 unknown-key rate limit | `AttemptLimiter::limited` drops the accept before XX. After XX, unknown key records `allow` and closes. `slave_id` mismatch is `Reply::Hangup` (the binary also `allow`s). Prefix deny stays `SubscribeReject`. |
+| §6 skip device, socket, FIFO | `collect_from_path` / `collect_for_rescan` return `Ok(None)` and log a warn for device, socket, FIFO, and `PermissionDenied`. The walk continues. |
+| §6 / §7 hash only on size/mtime miss | `collect_for_rescan` reuses `content_hash` when kind, size, and mtime match. Mode is not a miss. The returned row carries the fresh mode. Master `walk_central` uses `collect_for_rescan`. Watcher paths still call `collect_from_path`. |
 | §7 event kinds and same-window `Rename` | `notify-debouncer-mini` delivers a path only. Binaries emit `LocalEvent::Changed`. `ProtocolMessage::Rename` is defined and unanswered (`Error { code: "unsupported" }`). Effective rename is Delete + Create. |
-| §7 inflight before apply | Armed after `rename`. Dirs and meta-only apply do not arm. |
+| §7 inflight before apply | Armed before the live `rename` / `mkdir` / meta apply. Files, symlinks, dirs (`ContentHash::ZERO`), and meta-only apply all arm. |
 | §8 directory CAS | `decide_cas` rejects any live `EntryKind::Dir`, including delete. Master-local dir edits bypass CAS through `commit`. |
 | §8 type change in one master transaction | Kind mismatch is `CasReject`. Reconcile Pull on the slave can remove then mkdir. |
-| §8 sidecar only for the content-hash loser | Slave apply follows this. `Master::publish` sidecars the previous live file on a successful content replace. Incoming replica delete sidecars when `FileNode` differs, then hashes the copy against `ContentHash::ZERO`. |
-| §8 children-first directory delete | `remove_dir_all` on the live path. |
-| §9 patch from the live file into tmp | `copia` may send `Delta`. `reconstruct` patches in RAM, then `atomic_put` writes the whole buffer. |
-| §10 `SubscribeReject` | Specified: log and do not retry those prefixes until config or ACL changes. Built: hangup, then the binary reconnects with the same set. |
-| §12 one live connection per `slave_id` | New accept signals the old task. It does not `close` the previous `Connection`. Roster swap waits for the new `Subscribe`. |
+| §8 sidecar only for the content-hash loser | Slave announce apply and `CasReject` use `sidecar_if_content_differs`. Incoming `Delete` carries a `FileNode`, so the slave sidecars when live matches neither that basis nor `last_synced`. |
+| §8 children-first directory delete | `remove_live` removes each child, then `remove_dir`. Files and symlinks use `remove_file`. |
+| §9 patch from the live file into tmp | Specified as built. Spec §8 says never patch in place. `reconstruct` patches in RAM, then `atomic_put` writes the whole buffer. |
+| §10 `SubscribeReject` | Slave stores `denied_centrals`. `subscribe()` omits those centrals. On `SubscribeReject`, insert, log, and `Reply::Send(vec![subscribe()])` if any checkout remains, else `Reply::Hangup`. Cleared on a checkout or pin reload. Master prefix-deny stays `SubscribeReject`. |
+| §12 one live connection per `slave_id` | Replacing a session `close`s the previous `Connection` and signals the old task. |
 | §12 `Transport` trait | None. Tests call `handle`. One XX test lives in `core/tests/transport.rs`. |
-| §14 `quic_*` / `reconnect_*` | Not struct fields. Serde ignores them. Reconnect is 1 s, doubling, cap 60 s. |
-| Backpressure (`set_writable`) | Exists on `Master`. The binary never calls it. A connected slow slave can grow `outbox`. |
-| In-flight bulk after disconnect | `Master::pending` is keyed by `(checkout_id, path)` and is not cleared on `disconnect`. Checkout ids are per slave. |
+| §14 `quic_*` / `reconnect_*` | Struck in `doc/configuration.md`. Not struct fields. Reconnect is 1 s, doubling, cap 60 s. |
+| Backpressure (`set_writable`) | `flush_outbox` polls the batch, `set_writable(peer, false)` when `pending.len() > 32` before writing, then `set_writable(peer, true)`. `set_writable(false)` still clears the leftover outbox. |
+| In-flight bulk after disconnect | `Master::disconnect` drops pending rows whose `peer` is the disconnected peer. |
 
 Topic documents:
 

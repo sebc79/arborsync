@@ -24,6 +24,7 @@ fn attempt_limiter_caps_one_ip_inside_the_window() {
     let t0 = Instant::now();
     assert!(limiter.allow(ip, t0));
     assert!(limiter.allow(ip, t0));
+    assert!(limiter.limited(ip, t0));
     assert!(!limiter.allow(ip, t0));
     assert!(limiter.allow(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), t0));
 }

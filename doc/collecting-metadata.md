@@ -25,18 +25,18 @@ Index keys are **canonical** (`spec.md` §1): `/src/foo.rs`, never `/central/src
 - Master: `canonical = "/" + relative(central_root, os_path)` with `/` for the root itself.
 - Slave: `canonical = checkout.central` joined with `relative(checkout.local, os_path)`.
 
-UTF-8 only. Reject non-UTF-8 names (log, skip). `central_root` and each `local` are `canonicalize`d at `Master::open` / `Slave::open` (symlinks resolved there only). Overlap is checked earlier on the unresolved path (`subscriptions.md`).
+UTF-8 only. Reject non-UTF-8 names (log, skip). `central_root` and each `local` are `canonicalize`d at `Master::open` / `Slave::open` (symlinks resolved there only). Parse also `canonicalize`s a local that already exists before the overlap check. `Slave::open` rejects resolved overlap.
 
 ## Scan
 
 **Initial and rescan:** recursive walk. Skip `.arborsync-tmp` and `.arborsync-conflicts` at the tree root being walked. For each entry:
 
 1. `symlink_metadata` (do not follow).
-2. Classify: file, dir, symlink, or other. Other (devices, sockets, FIFOs): specified as log and skip. As built: `collect_from_path` returns `None` with no log.
+2. Classify: file, dir, symlink, or other. Other (devices, sockets, FIFOs): log a warn with the host path and return `None`.
 3. Fill `size`, `mtime_ns` (`modified()` → duration since epoch; if unavailable, skip and log), `mode` (`PermissionsExt::mode()` on Unix).
 4. **Hash decision:**
-   - File, slave rescan (`collect_for_rescan`): hash if no index row, or stored size, mtime, kind, or mode differ.
-   - File, watcher or master walk (`collect_from_path`): always hash.
+   - File, rescan (`collect_for_rescan`): hash if no index row, or stored size, mtime, or kind differ. Mode is not a miss. The returned row carries the fresh mode.
+   - File, watcher (`collect_from_path`): always hash. Master `walk_central` uses `collect_for_rescan`.
    - Symlink: always read the target and hash it (cheap).
    - Dir: no content hash.
 5. Streaming BLAKE3 for files.
@@ -60,7 +60,7 @@ Do not resolve in-tree links during scan, index, or apply. Resolving duplicates 
 
 ## Errors
 
-- `EACCES`: specified as log, skip that name, continue the walk. As built: the walk returns the I/O error and stops.
+- `EACCES`: log a warn with the host path, return `None`, continue the walk.
 - Transient I/O: specified as retry once, then skip. As built: the error propagates.
 - Non-UTF-8 names: log and skip (matches spec).
 - Partial trees are allowed only when a name is skipped as `None` (special files).
