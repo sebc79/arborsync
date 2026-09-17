@@ -115,7 +115,7 @@ Rotation procedures: `spec.md` §4.
 
 ## Tests / in-memory
 
-There is no `Transport` trait. Unit tests call `Master::handle` and `Slave::handle`. `core/tests/transport.rs` runs one real XX handshake plus Subscribe. v1 production path is QUIC only. No TCP fallback.
+`Transport` is a live session after handshake. `impl Transport for quinn::Connection` wraps the free functions. `MemoryTransport::pair` is the in-memory test impl. Unit tests still call `handle` for CAS and reconcile. `core/tests/transport.rs` covers XX and the memory pair. The v1 production path is QUIC only.
 
 ## Struck from earlier drafts
 

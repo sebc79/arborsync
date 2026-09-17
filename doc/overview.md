@@ -145,7 +145,7 @@ Tightening `allowed_prefixes` drops those checkouts from interest and leaves the
 
 `ContentHook` is how tests skip the network. `MemoryContent` returns bytes immediately. `WholeFileLater` always returns `AskSender`, which is what the daemons use.
 
-There is no `Transport` trait. Unit tests call `Master::handle` and `Slave::handle`. `core/tests/transport.rs` runs one real XX handshake.
+`Transport` is a live session after handshake. `impl Transport for quinn::Connection` is the QUIC path. `MemoryTransport::pair` is the in-memory test impl. Unit tests still call `Master::handle` and `Slave::handle`.
 
 ## What still lags the spec
 
