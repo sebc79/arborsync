@@ -5,14 +5,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::apply;
 use crate::config::{LoadedMaster, MasterReload, ReloadError};
 use crate::hash::{ContentHash, FileNode, SubtreeRoot};
 use crate::index;
+use crate::inflight::Inflight;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
 use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
@@ -22,6 +22,7 @@ use crate::path::{
 use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
 use crate::storage::{CheckoutId, Storage};
 use crate::transfer::{self, BulkTransfer, signature_for};
+use crate::watch::LocalEvent;
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
 
@@ -83,17 +84,6 @@ pub enum Reply {
     Bulk(BulkTransfer),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LocalEvent {
-    Changed(CanonicalPath),
-    Metadata(CanonicalPath),
-    Removed(CanonicalPath),
-    Renamed {
-        from: CanonicalPath,
-        to: CanonicalPath,
-    },
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum MasterError {
     #[error("{path}: {source}")]
@@ -148,50 +138,6 @@ pub fn decide_cas(
             }
         }
         _ => reject(),
-    }
-}
-
-struct InflightEntry {
-    hash: ContentHash,
-    until: Instant,
-}
-
-struct Inflight {
-    window: Duration,
-    entries: HashMap<CanonicalPath, InflightEntry>,
-}
-
-impl Inflight {
-    fn new(debounce: Duration) -> Self {
-        Self {
-            window: debounce * 2,
-            entries: HashMap::new(),
-        }
-    }
-
-    fn set_window(&mut self, debounce: Duration) {
-        self.window = debounce * 2;
-    }
-
-    fn arm(&mut self, path: CanonicalPath, hash: ContentHash) {
-        let until = Instant::now() + self.window;
-        self.entries.insert(path, InflightEntry { hash, until });
-    }
-
-    fn consume_if_echo(&mut self, path: &CanonicalPath, hash: &ContentHash) -> bool {
-        let now = Instant::now();
-        self.entries.retain(|_, entry| entry.until > now);
-        if self.entries.get(path).is_some_and(|e| &e.hash == hash) {
-            self.entries.remove(path);
-            return true;
-        }
-        false
-    }
-
-    fn is_armed(&mut self, path: &CanonicalPath) -> bool {
-        let now = Instant::now();
-        self.entries.retain(|_, entry| entry.until > now);
-        self.entries.contains_key(path)
     }
 }
 
@@ -594,7 +540,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         {
             None
         } else {
-            read_host_bytes(&host)?
+            apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))?
         };
         match transfer::reconstruct(header.encoding, body, basis.as_deref()) {
             Ok(bytes) if hash_bytes(&bytes) == header.want_hash => {
@@ -867,7 +813,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                         None
                     } else {
                         let host = canonical_to_host(&self.central_root, &path);
-                        read_host_bytes(&host)?
+                        apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))?
                     };
                     let signature = signature_for(new.kind, live.as_deref());
                     let want_hash = new.content_hash;
@@ -1219,7 +1165,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     }
 
     fn note_changed(&mut self, path: CanonicalPath) -> Result<(), MasterError> {
-        if is_reserved(&path) {
+        if path.has_reserved_root_name() {
             return Ok(());
         }
         let host = canonical_to_host(&self.central_root, &path);
@@ -1233,7 +1179,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     }
 
     fn note_metadata(&mut self, path: CanonicalPath) -> Result<(), MasterError> {
-        if is_reserved(&path) {
+        if path.has_reserved_root_name() {
             return Ok(());
         }
         let host = canonical_to_host(&self.central_root, &path);
@@ -1263,7 +1209,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     }
 
     fn note_renamed(&mut self, from: CanonicalPath, to: CanonicalPath) -> Result<(), MasterError> {
-        if is_reserved(&from) || is_reserved(&to) {
+        if from.has_reserved_root_name() || to.has_reserved_root_name() {
             return Ok(());
         }
         let host_to = canonical_to_host(&self.central_root, &to);
@@ -1342,7 +1288,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             return Ok(Reply::Send(outside_central(&path)));
         }
         let host = canonical_to_host(&self.central_root, &path);
-        let Some(source) = read_host_bytes(&host)? else {
+        let Some(source) = apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))? else {
             return Ok(Reply::Send(missing_hash(&path)));
         };
         match transfer::fulfill(checkout_id, path.clone(), want_hash, &source, &signature) {
@@ -1356,7 +1302,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     }
 
     fn note_removed(&mut self, path: &CanonicalPath) -> Result<(), MasterError> {
-        if is_reserved(path) {
+        if path.has_reserved_root_name() {
             return Ok(());
         }
         if self.inflight.is_armed(path) {
@@ -1412,26 +1358,6 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             }
         }
         Ok(found)
-    }
-}
-
-fn is_reserved(path: &CanonicalPath) -> bool {
-    path.as_str()
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .is_some_and(is_reserved_root_entry)
-}
-
-fn read_host_bytes(host: &Path) -> Result<Option<Vec<u8>>, MasterError> {
-    match fs::symlink_metadata(host) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(MasterError::io(host)(err)),
-        Ok(md) if md.file_type().is_symlink() => {
-            let target = fs::read_link(host).map_err(MasterError::io(host))?;
-            Ok(Some(target.as_os_str().as_bytes().to_vec()))
-        }
-        Ok(_) => Ok(Some(fs::read(host).map_err(MasterError::io(host))?)),
     }
 }
 

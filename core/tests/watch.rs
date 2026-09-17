@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use arborsync_core::master::LocalEvent;
+use arborsync_core::LocalEvent;
 use arborsync_core::test_support::p;
 use arborsync_core::watch::{WatchEvent, WatchKind, to_local_events};
 

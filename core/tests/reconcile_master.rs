@@ -1,7 +1,8 @@
 use arborsync_core::LoadedMaster;
+use arborsync_core::LocalEvent;
 use arborsync_core::config::SlaveAcl;
 use arborsync_core::keys::format_hex_key;
-use arborsync_core::master::{LocalEvent, Master, MemoryContent, Reply};
+use arborsync_core::master::{Master, MemoryContent, Reply};
 use arborsync_core::merkle::{DirChild, dir_node, empty_dir_node, file_node};
 use arborsync_core::meta::{EntryKind, hash_bytes};
 use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};

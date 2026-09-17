@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::apply;
 use crate::config::{ConfigError, LoadedSlave, ReloadError, SlaveReload};
 use crate::hash::{ContentHash, FileNode};
 use crate::index;
+use crate::inflight::Inflight;
 use crate::merkle::{DirChild, file_node};
 use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
 use crate::path::{
@@ -19,9 +20,9 @@ use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
 use crate::reconcile::{WalkAction, decide_child};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
 use crate::transfer::{self, BulkTransfer, signature_for};
+use crate::watch::LocalEvent;
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
-pub use crate::master::LocalEvent;
 
 #[derive(Debug)]
 pub enum Reply {
@@ -156,50 +157,6 @@ pub fn decide_rename(
                 RenameAction::SidecarThenApply
             }
         }
-    }
-}
-
-struct InflightEntry {
-    hash: ContentHash,
-    until: Instant,
-}
-
-struct Inflight {
-    window: Duration,
-    entries: HashMap<CanonicalPath, InflightEntry>,
-}
-
-impl Inflight {
-    fn new(debounce: Duration) -> Self {
-        Self {
-            window: debounce * 2,
-            entries: HashMap::new(),
-        }
-    }
-
-    fn set_window(&mut self, debounce: Duration) {
-        self.window = debounce * 2;
-    }
-
-    fn arm(&mut self, path: CanonicalPath, hash: ContentHash) {
-        let until = Instant::now() + self.window;
-        self.entries.insert(path, InflightEntry { hash, until });
-    }
-
-    fn consume_if_echo(&mut self, path: &CanonicalPath, hash: &ContentHash) -> bool {
-        let now = Instant::now();
-        self.entries.retain(|_, entry| entry.until > now);
-        if self.entries.get(path).is_some_and(|e| &e.hash == hash) {
-            self.entries.remove(path);
-            return true;
-        }
-        false
-    }
-
-    fn is_armed(&mut self, path: &CanonicalPath) -> bool {
-        let now = Instant::now();
-        self.entries.retain(|_, entry| entry.until > now);
-        self.entries.contains_key(path)
     }
 }
 
@@ -453,7 +410,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         {
             None
         } else {
-            read_host_bytes(&host)?
+            apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))?
         };
         match transfer::reconstruct(header.encoding, body, basis.as_deref()) {
             Ok(bytes) if hash_bytes(&bytes) == header.want_hash => {
@@ -784,7 +741,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                         None
                     } else {
                         let host = self.host_for(checkout_id, &path)?;
-                        read_host_bytes(&host)?
+                        apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))?
                     };
                     let signature = signature_for(new.kind, live.as_deref());
                     let want_hash = new.content_hash;
@@ -853,7 +810,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         signature: Vec<u8>,
     ) -> Result<Reply, SlaveError> {
         let host = self.host_for(&checkout_id, &path)?;
-        let Some(source) = read_host_bytes(&host)? else {
+        let Some(source) = apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))? else {
             return Ok(Reply::Send(vec![ProtocolMessage::Error {
                 code: "missing_hash".into(),
                 message: path.as_str().into(),
@@ -1586,26 +1543,6 @@ fn reject_resolved_overlap(checkouts: &HashMap<String, Checkout>) -> Result<(), 
     Ok(())
 }
 
-fn read_host_bytes(host: &Path) -> Result<Option<Vec<u8>>, SlaveError> {
-    match fs::symlink_metadata(host) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(SlaveError::io(host)(err)),
-        Ok(md) if md.file_type().is_symlink() => {
-            let target = fs::read_link(host).map_err(SlaveError::io(host))?;
-            Ok(Some(target.as_os_str().as_bytes().to_vec()))
-        }
-        Ok(_) => Ok(Some(fs::read(host).map_err(SlaveError::io(host))?)),
-    }
-}
-
 fn is_reserved(central: &CanonicalPath, path: &CanonicalPath) -> bool {
-    let Ok(relative) = strip_central(central, path) else {
-        return false;
-    };
-    relative
-        .as_str()
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .is_some_and(is_reserved_root_entry)
+    strip_central(central, path).is_ok_and(|relative| relative.has_reserved_root_name())
 }

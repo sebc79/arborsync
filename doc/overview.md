@@ -142,21 +142,15 @@ Tightening `allowed_prefixes` drops those checkouts from interest and leaves the
 | `copia` signature and patch | `core/src/transfer.rs` |
 | Accept, watch, SIGHUP | `src/master.rs`, `src/slave.rs`, `src/reload.rs`, `src/watch.rs` |
 | Watch kinds to `LocalEvent` | `core/src/watch.rs` |
+| Echo `inflight` | `core/src/inflight.rs` |
 
 `ContentHook` is how tests skip the network. `MemoryContent` returns bytes immediately. `WholeFileLater` always returns `AskSender`, which is what the daemons use.
 
 `Transport` is a live session after handshake. `impl Transport for quinn::Connection` is the QUIC path. `MemoryTransport::pair` is the in-memory test impl. Unit tests still call `Master::handle` and `Slave::handle`.
 
-## What still lags the spec
+## Status
 
-The library and both daemons implement the core loop in `spec.md` §16 items 1 through 7. Version-first control decode and a schema prefix on stored `FileMetadata` are done. `doc/spec.md` §16 lists the remaining gaps.
-
-The ones that change behavior if you run the daemons today:
-
-- Local overlap after symlink resolve is rejected at `Slave::open` (and at load when both locals exist).
-- Unknown-key accepts are dropped by `AttemptLimiter::limited` before XX. After XX, unknown key still records `allow` and closes. `slave_id` mismatch is hangup.
-- An incoming `Error` is answered with `Error { code: "unsupported" }`.
-- `quic_*` and `reconnect_*` are struck in `configuration.md`. Reconnect backoff is hardcoded 1 s, doubling, cap 60 s.
+`spec.md` §16 items 1 through 8 are built. The struck `quic_*` / `reconnect_*` keys are not fields. Reconnect backoff is 1 s, doubling, cap 60 s.
 
 `core/tests/scenarios.rs` names the §16.8 cases and drives them through `handle` and `note_local` on `MemoryStorage`. `src/watch.rs` starts a real `notify-debouncer-full` thread. `tests/sync.rs` starts master and slave over QUIC and asserts a post-connect write crosses.
 

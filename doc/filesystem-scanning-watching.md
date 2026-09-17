@@ -9,7 +9,7 @@ Normative source: `spec.md` §7.
 - Debounce default 200 ms (config `watcher_debounce_ms`, allowed 200–500).
 - Master: one watch on `central_root`.
 - Slave: one watch per checkout `local`.
-- Events under `.arborsync-tmp` and `.arborsync-conflicts` still fire. Core `is_reserved` drops them.
+- Events under `.arborsync-tmp` and `.arborsync-conflicts` still fire. Core drops them when the path's first component after the watch root is a reserved name.
 
 `notify-debouncer-full` keeps event kinds and pairs `RenameMode::From` with `RenameMode::To` in one debounce window when both paths are present. The binary maps `notify::Event` to `WatchEvent` at the process edge. Core `to_local_events` turns those into `LocalEvent`. Core does not import notify.
 

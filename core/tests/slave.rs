@@ -1,6 +1,7 @@
 use std::os::unix::fs::PermissionsExt;
 
 use arborsync_core::LoadedSlave;
+use arborsync_core::LocalEvent;
 use arborsync_core::config::{CheckoutConfig, ReloadError};
 use arborsync_core::hash::ContentHash;
 use arborsync_core::keys::format_hex_key;
@@ -9,8 +10,8 @@ use arborsync_core::meta::{FileMetadata, hash_bytes};
 use arborsync_core::path::{RESERVED_CONFLICTS, conflict_sidecar_path};
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::slave::{
-    DeleteAction, LocalEvent, MemoryContent, ReplicaAction, Reply, Slave, SlaveError,
-    decide_incoming, decide_master_won_delete,
+    DeleteAction, MemoryContent, ReplicaAction, Reply, Slave, SlaveError, decide_incoming,
+    decide_master_won_delete,
 };
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
 

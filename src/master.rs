@@ -316,17 +316,7 @@ fn watch_central(
         }
         match rx.recv_timeout(rescan_every) {
             Ok(Ok(events)) => {
-                let mut need_rescan = false;
-                let mut mapped = Vec::new();
-                for event in events {
-                    if event.need_rescan() {
-                        need_rescan = true;
-                        continue;
-                    }
-                    if let Some(watch) = crate::watch::from_notify(&event) {
-                        mapped.push(watch);
-                    }
-                }
+                let (need_rescan, mapped) = crate::watch::classify(events);
                 if need_rescan {
                     master.lock().expect("master").rescan()?;
                 }
