@@ -188,6 +188,50 @@ fn dir_list_master_only_file_pulls_without_conflict_sidecar() {
 }
 
 #[test]
+fn dir_list_kind_change_file_to_dir_replaces_the_local_file() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    send(
+        slave
+            .handle(ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new,
+                basis: None,
+            })
+            .unwrap(),
+    );
+
+    match &send(
+        slave
+            .handle(ProtocolMessage::DirListResponse {
+                checkout_id: "src".into(),
+                path: p("/src"),
+                entries: vec![DirChild::Directory {
+                    name: name("hello.txt"),
+                    node: empty_dir_node(),
+                }],
+            })
+            .unwrap(),
+    )[..]
+    {
+        [ProtocolMessage::DirListRequest { path, .. }] => {
+            assert_eq!(path, &p("/src/hello.txt"));
+        }
+        other => panic!("expected DirListRequest, got {other:?}"),
+    }
+
+    let host = slave.checkout_local("src").unwrap().join("hello.txt");
+    assert!(host.is_dir(), "kind change must replace the live file");
+    assert!(std::fs::read(&host).is_err());
+}
+
+#[test]
 fn dir_list_slave_only_leftover_announces_create() {
     let sandbox = SyncSandbox::new();
     let mut slave = alice_slave(&sandbox, MemoryContent::new());

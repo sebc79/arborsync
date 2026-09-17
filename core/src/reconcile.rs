@@ -12,9 +12,8 @@ pub enum WalkAction {
     AnnounceCas,
 }
 
-/// `slave` / `master` are that name's DirList entries (None = name absent on that side).
-/// `last_synced` and `local_node` are FileNode for a file/symlink. For directories
-/// `local_node` is unused; dir identity is the DirChild hash.
+/// `slave` and `master` are that name's DirList entries. `None` means the name is absent.
+/// `last_synced` and `local_node` are FileNode for a file or symlink. Directory identity is the DirChild hash.
 pub fn decide_child(
     slave: Option<&DirChild>,
     master: Option<&DirChild>,

@@ -793,12 +793,16 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                     path: child_path,
                 }),
                 WalkAction::Pull => {
-                    self.pending_pulls
-                        .insert((checkout_id.clone(), child_path.clone()));
-                    if slave_child.is_none()
-                        && matches!(master_child, Some(DirChild::Directory { .. }))
-                    {
+                    let master_dir = matches!(master_child, Some(DirChild::Directory { .. }));
+                    let slave_dir = matches!(slave_child, Some(DirChild::Directory { .. }));
+                    if slave_child.is_some() && master_dir != slave_dir {
+                        self.remove_path(&checkout_id, &child_path, local_meta.as_ref())?;
+                    }
+                    if master_dir {
                         self.ensure_local_dir(&checkout_id, &child_path)?;
+                    } else {
+                        self.pending_pulls
+                            .insert((checkout_id.clone(), child_path.clone()));
                     }
                     out.push(ProtocolMessage::DirListRequest {
                         checkout_id: checkout_id.clone(),
@@ -834,16 +838,18 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             .map_err(SlaveError::io(&host))?
             .unwrap_or_else(|| FileMetadata::directory(0, 0o040755));
         apply::mkdir_live(&local, &relative, &found)?;
-        self.index_ancestors(checkout_id, path)?;
         let ck = self.checkout(checkout_id)?.id.clone();
-        index::commit_leaf(
-            &self.store,
-            &ck,
-            path,
-            Some(&found),
-            index::LastSynced::Keep,
-        )
-        .map_err(SlaveError::index)?;
+        if self.meta(checkout_id, path)?.is_none() {
+            self.index_ancestors(checkout_id, path)?;
+            index::commit_leaf(
+                &self.store,
+                &ck,
+                path,
+                Some(&found),
+                index::LastSynced::Keep,
+            )
+            .map_err(SlaveError::index)?;
+        }
         Ok(())
     }
 

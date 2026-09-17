@@ -151,13 +151,6 @@ pub fn collect_for_rescan(
     host: &Path,
     previous: Option<&FileMetadata>,
 ) -> Result<Option<FileMetadata>, io::Error> {
-    collect_from_path_cached(host, previous)
-}
-
-pub fn collect_from_path_cached(
-    host: &Path,
-    previous: Option<&FileMetadata>,
-) -> Result<Option<FileMetadata>, io::Error> {
     let md = match fs::symlink_metadata(host) {
         Ok(md) => md,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
