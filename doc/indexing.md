@@ -54,15 +54,19 @@ key = checkout_id bytes || 0x00 || canonical path UTF-8
 
 `0x00` cannot appear in UTF-8, so prefix ranges stay inside one checkout. Tables:
 
-1. `meta` — key → bincode `FileMetadata`
-2. `dir_nodes` — key → 32 raw bytes
+1. `meta` — key → `u16le META_SCHEMA_VERSION || bincode(FileMetadata)` (`META_SCHEMA_VERSION = 1`)
+2. `dir_nodes` — key → 32 raw bytes (`DirNode`)
 3. `last_synced` — key → 32 raw bytes (`FileNode` of the last CAS-agreed version)
+
+The schema prefix is why a wire change cannot silently reinterpret stored rows. `wire_bincode_config` and `meta_bincode_config` are separate helpers. Both are `bincode::config::standard()` today.
+
+The Rust trait uses `CanonicalPath`, `FileNode`, and `DirNode`, plus `purge_prefix` and `del_entry`. The listing above is the spec sketch. Call the code for the extra methods.
 
 No `slave_subscriptions` table. Active interest is process memory, rebuilt from `Subscribe` after connect. Persisting it would go stale on crash; the slave always resubscribes.
 
 ## Transactions
 
-One batch per debounce window, per accepted CAS, or per reconcile directory. Order inside a batch:
+Specified: one batch per debounce window, per accepted CAS, or per reconcile directory. As built: one `commit_leaf` per changed path. Origin `CasAccept` writes `last_synced` in a following batch. Order inside a `commit_leaf` batch:
 
 1. Apply leaf `meta` / deletes (and descendant prefix deletes for a directory remove).
 2. Recompute and `put_dir_node` for each affected ancestor, root-ward.
@@ -103,4 +107,4 @@ No `db_backend`, no `db_max_readers` requirement. Optional redb cache sizing may
 
 ## Maintenance
 
-Compaction is redb’s. A SIGHUP or a future admin subcommand may call it. Not a second database product.
+Compaction is redb’s. SIGHUP reloads config. It does not compact. A future admin subcommand may call it. Not a second database product.

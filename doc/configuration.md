@@ -32,9 +32,6 @@ rescan_interval_seconds = 60
 max_checkouts_per_slave = 100
 max_connections = 100
 max_connection_attempts_per_minute = 60
-quic_max_concurrent_streams = 256
-quic_idle_timeout_ms = 300000
-quic_initial_mtu = 1200
 
 [[slaves]]
 id = "dev-alice"
@@ -63,8 +60,6 @@ log_level = "info"
 max_checkouts_per_slave = 100         # same name and default as the master
 watcher_debounce_ms = 200
 rescan_interval_seconds = 60
-reconnect_initial_ms = 1000
-reconnect_max_ms = 60000
 
 checkouts = [
     { id = "src",  central = "/src",  local = "/opt/projects/src" },
@@ -76,7 +71,9 @@ A `/` checkout on `dev-alice` is rejected (her ACL is `/src` and `/docs`). Full-
 
 Required: `slave_id`, `master_addr`, `slave_key_path`, `master_public_keys`, `checkouts` (may be empty: the process idles until the config watch adds some).
 
-`local` paths are created if missing (`0o755`) and canonicalized. Local overlap → refuse to start (or refuse the reload of that checkout list). `id` unique. `central` absolute canonical (see `subscriptions.md`).
+`local` paths are created if missing (`0o755`) and canonicalized at `Slave::open`. Local overlap is checked earlier, on the tilde-expanded path, and refuses to start (or refuses the reload of that checkout list). Two locals that overlap only after symlink resolve can pass parse. `id` unique. `central` absolute canonical (see `subscriptions.md`).
+
+Reconnect backoff is hardcoded at 1 s, doubling, cap 60 s. `reconnect_initial_ms`, `reconnect_max_ms`, and the `quic_*` keys from older drafts are not parsed.
 
 `max_checkouts_per_slave` must be the same idea on both sides. A slave config longer than the master’s limit is `SubscribeReject`ed; validate locally against the slave’s own copy of the setting as a first check.
 
@@ -92,9 +89,11 @@ Required: `slave_id`, `master_addr`, `slave_key_path`, `master_public_keys`, `ch
 
 **Applied live:** `log_level`, `max_connection_attempts_per_minute`, `max_connections` (affects new accepts), `[[slaves]]` (add/remove rows, change `allowed_prefixes`, add rotation keys), slave `master_public_keys`, slave `checkouts` (add/remove per `spec.md` §3), debounce/rescan intervals (next window uses the new value).
 
-**Requires restart:** `listen_addr`, `db_path`, `central_root`, `master_addr`, `*_key_path`.
+**Requires restart:** `listen_addr`, `db_path`, `central_root`, `master_addr`, `*_key_path`, and slave `slave_id`.
 
-Removing an ACL row disconnects that `slave_id` if connected. Tightening `allowed_prefixes` disconnects checkouts that no longer qualify (master sends `SubscribeReject` for a forced re-subscribe, or just drops those ids from interest and the slave’s next `RootReport` for them is ignored until they go away).
+SIGHUP reloads this file. It does not start reconcile.
+
+Removing an ACL row disconnects that `slave_id` if connected. Tightening `allowed_prefixes` drops those checkouts from interest and leaves the QUIC session up. The slave is not sent `SubscribeReject`. Later `RootReport`s for those ids return `not_subscribed`.
 
 ## Environment
 
@@ -107,7 +106,7 @@ No `ARBORSYNC_*` for keys or key paths.
 
 ## Permissions
 
-Config and key files: `0600`, owner = the daemon user. The process does not need root if it can read the tree, bind the UDP port, and write `db_path`.
+Specified: config and key files `0600`, owner = the daemon user. As built: `write_static_key` sets `0600`. Config mode is not checked. The process does not need root if it can read the tree, bind the UDP port, and write `db_path`.
 
 ## Examples
 
@@ -165,3 +164,4 @@ checkouts = [
 - Config templating, include files, automatic VCS backup of toml.
 - Separate `max_subscriptions_per_connection` (use `max_checkouts_per_slave`).
 - `ARBORSYNC_MASTER_ADDR` as a silent override (use the file or `--config`).
+- `quic_max_concurrent_streams`, `quic_idle_timeout_ms`, `quic_initial_mtu`, `reconnect_initial_ms`, `reconnect_max_ms` (not parsed).

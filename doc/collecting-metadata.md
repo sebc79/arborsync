@@ -25,24 +25,25 @@ Index keys are **canonical** (`spec.md` §1): `/src/foo.rs`, never `/central/src
 - Master: `canonical = "/" + relative(central_root, os_path)` with `/` for the root itself.
 - Slave: `canonical = checkout.central` joined with `relative(checkout.local, os_path)`.
 
-UTF-8 only. Reject non-UTF-8 names (log, skip). After config load, `central_root` and each `local` are `canonicalize`d (symlinks resolved **there only**).
+UTF-8 only. Reject non-UTF-8 names (log, skip). `central_root` and each `local` are `canonicalize`d at `Master::open` / `Slave::open` (symlinks resolved there only). Overlap is checked earlier on the unresolved path (`subscriptions.md`).
 
 ## Scan
 
 **Initial and rescan:** recursive walk. Skip `.arborsync-tmp` and `.arborsync-conflicts` at the tree root being walked. For each entry:
 
 1. `symlink_metadata` (do not follow).
-2. Classify: file / dir / symlink / other. Other (devices, sockets, FIFOs): log, skip.
+2. Classify: file, dir, symlink, or other. Other (devices, sockets, FIFOs): specified as log and skip. As built: `collect_from_path` returns `None` with no log.
 3. Fill `size`, `mtime_ns` (`modified()` → duration since epoch; if unavailable, skip and log), `mode` (`PermissionsExt::mode()` on Unix).
 4. **Hash decision:**
-   - File: hash if no index row, or stored size/mtime/kind differ, or the caller is a Write/Create watcher event.
+   - File, slave rescan (`collect_for_rescan`): hash if no index row, or stored size, mtime, kind, or mode differ.
+   - File, watcher or master walk (`collect_from_path`): always hash.
    - Symlink: always read the target and hash it (cheap).
    - Dir: no content hash.
 5. Streaming BLAKE3 for files.
 
-Rescan is a **full `stat` walk** of the checkout or `central_root`. It is not limited to “changed subtrees.” Hashing stays lazy via size+mtime.
+Rescan is a **full `stat` walk** of the checkout or `central_root`. It is not limited to “changed subtrees.”
 
-**Watcher:** after debounce, re-read each affected path with the same rules. `Remove` → drop the row (and descendants if a dir). ENOENT during a read that was not a Remove: treat as delete.
+**Watcher:** after debounce, re-read each affected path with `collect_from_path`. The mini debouncer does not emit `Remove`. ENOENT during that read is treated as delete.
 
 ## Unix mode
 
@@ -59,13 +60,14 @@ Do not resolve in-tree links during scan, index, or apply. Resolving duplicates 
 
 ## Errors
 
-- `EACCES`: log, skip that name, continue the walk. The index simply lacks that path; a later successful stat is a create.
-- Transient I/O: retry once; then skip and leave the previous index row (rescan will try again).
-- Partial trees are allowed. Do not abort a scan because one name failed.
+- `EACCES`: specified as log, skip that name, continue the walk. As built: the walk returns the I/O error and stops.
+- Transient I/O: specified as retry once, then skip. As built: the error propagates.
+- Non-UTF-8 names: log and skip (matches spec).
+- Partial trees are allowed only when a name is skipped as `None` (special files).
 
 ## Batching
 
-Rescans buffer metadata and commit per directory (leaf rows + that `DirNode` + ancestors in the same batch as `spec.md` §13). Watcher events for one debounce window are one batch.
+Specified: rescans commit per directory, and one debounce window is one batch. As built: each changed path is its own `commit_leaf` (leaf plus ancestors). `CasAccept` on the origin slave writes `last_synced` in a second batch.
 
 ## Hardlinks
 

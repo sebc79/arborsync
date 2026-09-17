@@ -8,24 +8,30 @@ Normative source: `spec.md` §7.
 - Debounce default 200 ms (config `watcher_debounce_ms`, allowed 200–500).
 - Master: one watch on `central_root`.
 - Slave: one watch per checkout `local`.
-- Ignore events under `.arborsync-tmp` and `.arborsync-conflicts`.
+- Events under `.arborsync-tmp` and `.arborsync-conflicts` still fire. Core `is_reserved` drops them.
+
+`notify-debouncer-mini` delivers `{ path, kind: Any }`. It does not emit Create, Write, Remove, Rename, or `Modify(Metadata)`. A notify rename with `[from, to]` becomes two unpaired path events.
 
 ## Event mapping
 
-| Event | Action |
+The binaries map every path to `LocalEvent::Changed`. Core then `stat`s.
+
+| What is on disk | Action |
 |---|---|
-| Create (file/symlink) | re-read, hash, index, announce create (`basis = None`) if `FileNode != last_synced` |
-| Create (dir) | index empty dir, recompute ancestors; no bulk transfer |
-| Write | re-read, hash if size/mtime changed, announce update with `basis = last_synced` |
-| Metadata (mode/mtime) | re-read, announce if `FileNode` changed (meta-only CAS; no sidecar on conflict) |
-| Remove | if `last_synced` is `Some`, announce `Delete { basis = last_synced }`; drop index rows |
-| Rename | if both sides in this debounce window and the same checkout: `Rename`; else Remove + Create |
+| File or symlink present | re-read, always hash, index, announce if `FileNode != last_synced` (slave) or meta changed (master) |
+| Directory present | index, recompute ancestors, no bulk |
+| Path gone | `note_removed`: announce `Delete` if an index row exists |
+| Same-window rename | two `Changed` events: delete the old name, create the new one. `ProtocolMessage::Rename` is defined and unanswered |
 
 `last_synced` absent and the file exists: treat as create (leftover local file, or first run).
 
+Specified §7 kinds (Write vs metadata, paired `Rename`) need a watcher that keeps event types. Mini cannot do that.
+
 ## Echo
 
-Before applying a remote write, set `inflight[(checkout_id, path)] = incoming content_hash`. On a watcher event, `stat`+hash (or target hash for a symlink). If it equals `inflight`, clear `inflight` and stop. Timeout: 2× debounce, then clear anyway.
+After a successful file or symlink apply, set `inflight[(checkout_id, path)] = incoming content_hash`. On a watcher event, `stat` plus hash (or target hash for a symlink). If it equals `inflight`, clear `inflight` and stop. Timeout: 2× debounce, then clear anyway.
+
+Dirs and meta-only apply do not arm `inflight`. Applied dirs also drop `last_synced`, so a later watcher event on that dir can announce again.
 
 Master uses the same map with `checkout_id = ""` when applying a slave CAS onto `central_root`, so the master watcher does not re-announce the write it just made.
 
@@ -33,12 +39,12 @@ Never announce when `FileNode(local) == last_synced`.
 
 ## Rescan
 
-Every `rescan_interval_seconds` (default 60):
+The interval is `recv_timeout` on the notify channel (default 60 s). A busy tree postpones rescan.
 
 1. Full `stat` walk of `central_root` or the checkout `local` (`collecting-metadata.md`). Not “changed subtrees only.”
-2. Compare to the index: missing on disk → local delete; missing in index → local create; size/mtime/kind differ → rehash and treat as write.
-3. Announce any `FileNode != last_synced` (slave) or apply to the global index (master).
-4. Slave then runs reconcile (`spec.md` §10) so missed *remote* changes are pulled even if the local walk was clean.
+2. Compare to the index: missing on disk → local delete; missing in index → local create; size/mtime/kind differ → treat as write.
+3. Slave hashes again only when size, mtime, kind, or mode disagree with the stored row (`collect_for_rescan`). Master walk always calls `collect_from_path` and rehashes every file.
+4. Slave sends `RootReport` after the walk (`spec.md` §10) so missed remote changes are pulled even if the local walk was clean. It does not announce during rescan. Mismatch on the root starts the `DirList*` walk, which announces or pulls.
 
 Rescan exists because inotify/kqueue/NFS drop events. It cannot know dirty subtrees without walking.
 

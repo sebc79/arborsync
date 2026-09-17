@@ -10,6 +10,8 @@ Normative source: `spec.md` §11 and §12.
 
 **Not in this crate, not in v1:** Noise PSK modifier, a 32-byte cluster `psk` field, QUIC 0-RTT, ALPN (hyphae does not implement ALPN; version is the first Noise payload / preamble: ASCII `arborsync-v1`). Mutating messages are sent only after the handshake completes.
 
+Workspace pin is `quinn-hyphae = "0.1.0-beta.0"`. Quinn is `default-features = false`, `runtime-tokio` only.
+
 ## Endpoints
 
 **Master:** `quinn::Endpoint` + hyphae `HandshakeBuilder` with the master static key. Bind UDP `listen_addr` (default `0.0.0.0:8443`). One task per accepted connection.
@@ -18,8 +20,10 @@ Normative source: `spec.md` §11 and §12.
 
 After XX:
 
-- Slave disconnects if the peer static key ∉ `master_public_keys`.
-- Master looks up the peer static key in `[[slaves]]`. Unknown → disconnect (rate-limited per source IP). Known → that row’s `id` is the only legal `slave_id` on `Subscribe`.
+- Slave disconnects if the peer static key is not in `master_public_keys`.
+- Master looks up the peer static key in `[[slaves]]`. Unknown key: disconnect after XX. `AttemptLimiter` only changes the log line. Known key: that row’s `id` is the only legal `slave_id` on `Subscribe`.
+
+Preamble `arborsync-v1` is the hyphae Noise prologue (`with_prologue`), not an application frame after XX.
 
 ## Streams
 
@@ -28,24 +32,25 @@ After XX:
 | Control (one, slave-opened) | Framed `Envelope` messages |
 | Bulk (on demand, one transfer) | Framed `BulkHeader` + exactly `size` raw bytes |
 
-Quinn gives **byte streams**. “No framing needed” was wrong. Control frame:
+Quinn gives **byte streams**. Control frame:
 
 ```
-u32be length || bincode(Envelope { version: u16 = 1, msg: ProtocolMessage })
+u32be length || bincode(u16 version) || bincode(ProtocolMessage)
 ```
 
-Maximum control frame: 1 MiB. Larger → disconnect (file bodies do not belong here). Bulk header uses the same frame prefix; the body is raw and not length-prefixed again (`size` in the header is authoritative).
+That is the field order of `Envelope`. Maximum control frame: 1 MiB. Larger means disconnect (file bodies do not belong here). Bulk header uses the same length prefix. The body is raw and not length-prefixed again (`size` in the header is authoritative).
 
 One message per bulk stream. Close the stream after the body. Control stream stays open for the session.
 
-Keep-alive: QUIC idle timeout + quinn’s native ping. No `Heartbeat` message.
+Keep-alive: QUIC idle timeout plus quinn’s native ping. No `Heartbeat` message.
 
-## When implementing the control reader
+## Control reader
 
-Both items below land with QUIC. Neither is done in `core` today.
+`decode_control` reads the version first, then the message. Version other than 1 is `FrameError::UnsupportedVersion`, including a future variant index under version 2.
 
-- Decode `Envelope.version` before `ProtocolMessage`. `decode_control` decodes the whole envelope in one step, so bincode rejects an unknown v2 variant index before the version check runs, and the caller sees `FrameError::Bincode` instead of `FrameError::UnsupportedVersion`. Read the version first, then decode the body.
-- Do not share one unversioned `bincode_config` between control frames and on-disk `FileMetadata`. The wire format and the stored format have separate lifetimes, so give each its own config, or add a schema version table.
+Wire frames use `wire_bincode_config`. On-disk `FileMetadata` uses `meta_bincode_config` plus `u16le META_SCHEMA_VERSION` (`indexing.md`). Do not share one unversioned blob between those two lives.
+
+`read_bulk` decodes the header with `bincode::config::standard()` directly. If `wire_bincode_config` ever diverges from `standard()`, streaming bulk reads must follow `decode_bulk`.
 
 ## Message catalog
 
@@ -67,25 +72,28 @@ Direction (normative):
 | bulk `Whole` / `Delta` | the side that has `want_hash` |
 | `Error` / `Disconnect` | either |
 
-`DirListResponse` in v1: when the slave requests a path, the master answers from the global index. When the walk needs the slave’s view, the slave already has it locally and does not need the master to ask — 3-way uses the slave’s index + master’s listing.
+`Rename` is defined and unanswered. Both `handle` methods reply `Error { code: "unsupported" }`.
+
+`DirListResponse` in v1: when the slave requests a path, the master answers from the global index. When the walk needs the slave’s view, the slave already has it locally and does not need the master to ask. 3-way uses the slave’s index plus the master’s listing. A `DirListRequest` on a file path returns `FileAnnounce`.
 
 ## Reconnect
 
-Exponential backoff (1s, 2s, 4s, … cap 60s). Full handshake (no 0-RTT). `Subscribe` + reconcile. Do not replay in-flight announces from the previous connection.
+Exponential backoff (1 s, 2 s, 4 s, cap 60 s). Full handshake (no 0-RTT). `Subscribe` plus reconcile. Do not replay in-flight announces from the previous connection.
 
-A new successful session for the same `slave_id` replaces the old one (master drops the previous connection).
+A new successful session for the same `slave_id` replaces the old one. The binary signals the old accept task. It does not call `close` on the previous `Connection`. Roster interest switches when the new session sends `Subscribe`.
+
+`SubscribeReject` is specified as log-and-wait (`subscriptions.md`). As built, the slave hangs up and the binary reconnects with the same set.
 
 ## Limits
 
 ```toml
-quic_max_concurrent_streams = 256
-quic_idle_timeout_ms = 300000
-quic_initial_mtu = 1200
 max_connections = 100
 max_connection_attempts_per_minute = 60
 ```
 
-Idle timeout closes the QUIC connection; the slave reconnects. Unknown-key and broken-frame disconnects count toward the per-IP attempt limiter.
+`quic_max_concurrent_streams`, `quic_idle_timeout_ms`, `quic_initial_mtu`, `reconnect_initial_ms`, and `reconnect_max_ms` appear in older drafts. They are not parsed. Quinn defaults and the hardcoded backoff apply.
+
+Idle timeout closes the QUIC connection. The slave reconnects. Unknown-key disconnects increment `AttemptLimiter` and still complete XX and `close`. Broken frames do not increment the limiter. ACL misses are `SubscribeReject`, not a rate-limited disconnect.
 
 ## Security
 
@@ -100,14 +108,14 @@ Rotation procedures: `spec.md` §4.
 
 ## Errors
 
-- Handshake / pin / unknown key: disconnect, log at `warn` without printing keys.
-- Protocol version ≠ 1 or preamble ≠ `arborsync-v1`: disconnect.
-- Frame length > cap or bincode fail: disconnect (do not try to resync a corrupted control stream).
-- `Error` on a still-valid session: log; the affected path is retried at the next reconcile.
+- Handshake, pin, or unknown key: disconnect, log at `warn` without printing keys.
+- Protocol version other than 1 or prologue other than `arborsync-v1`: disconnect.
+- Frame length over the cap or bincode fail: disconnect (do not try to resync a corrupted control stream).
+- `Error` on a still-valid session: specified as log, then retry the path at the next reconcile. As built, both `handle` methods reply `Error { code: "unsupported" }` for an unmatched variant, including an incoming `Error`.
 
 ## Tests / in-memory
 
-A `Transport` trait that can be an in-memory pair of control+bulk channels is allowed for unit tests. v1 production path is QUIC only. No TCP fallback.
+There is no `Transport` trait. Unit tests call `Master::handle` and `Slave::handle`. `core/tests/transport.rs` runs one real XX handshake plus Subscribe. v1 production path is QUIC only. No TCP fallback.
 
 ## Struck from earlier drafts
 
@@ -115,4 +123,4 @@ A `Transport` trait that can be an in-memory pair of control+bulk channels is al
 - 0-RTT resumption “with forward secrecy and replay protection.”
 - ALPN `arborsync-v1` as a QUIC-TLS feature.
 - Application heartbeats.
-- “Seamless, no data loss during brief disconnects” via a push queue — replace with reconcile.
+- “Seamless, no data loss during brief disconnects” via a push queue. Replace with reconcile.
