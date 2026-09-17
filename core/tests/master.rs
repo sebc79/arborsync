@@ -1,14 +1,15 @@
-use arborsync_core::LoadedMaster;
 use arborsync_core::config::{ReloadError, SlaveAcl};
 use arborsync_core::hash::{ContentHash, FileNode};
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{
-    CasDecision, LocalEvent, Master, MemoryContent, Reply, WholeFileLater, decide_cas,
+    decide_cas, CasDecision, LocalEvent, Master, MemoryContent, Reply, WholeFileLater,
 };
-use arborsync_core::merkle::{self, DirChild, file_node};
-use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};
+use arborsync_core::merkle::{self, file_node, DirChild};
+use arborsync_core::meta::{hash_bytes, EntryKind, FileMetadata};
+use arborsync_core::path::RESERVED_CONFLICTS;
 use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
-use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
+use arborsync_core::test_support::{name, p, MemoryStorage, SyncSandbox};
+use arborsync_core::LoadedMaster;
 
 const ALICE: [u8; 32] = [0xA1; 32];
 const BACKUP: [u8; 32] = [0xB1; 32];
@@ -189,6 +190,349 @@ fn cas_accepts_a_create_on_absence_or_a_matching_basis() {
 
     for (label, current, basis, new_kind, expected) in cases {
         assert_eq!(decide_cas(current, basis, new_kind), expected, "{label}");
+    }
+}
+
+#[test]
+fn handle_type_change_file_to_dir_accepts_and_fans_out() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut master = two_slave_master(&sandbox, bodies);
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    master
+        .handle(BACKUP, subscribe("backup-1", &[("bak", "/")]))
+        .unwrap();
+
+    let previous = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: previous.clone(),
+                basis: None,
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept { .. }) => {}
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    assert_eq!(master.poll(BACKUP).len(), 1);
+
+    let new = dir();
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: new.clone(),
+                basis: Some(file_node(&previous)),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept {
+            checkout_id,
+            path,
+            file_node: node,
+        }) => {
+            assert_eq!(checkout_id, "src");
+            assert_eq!(path, p("/src/hello.txt"));
+            assert_eq!(node, Some(file_node(&new)));
+        }
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+
+    let host = sandbox.central_root().join("src/hello.txt");
+    assert!(host.is_dir());
+    assert_eq!(master.meta(&p("/src/hello.txt")).unwrap().unwrap(), new);
+
+    let pushed = master.poll(BACKUP);
+    assert_eq!(pushed.len(), 1);
+    match &pushed[0] {
+        ProtocolMessage::FileAnnounce {
+            checkout_id,
+            path,
+            new: announced,
+            basis,
+        } => {
+            assert_eq!(checkout_id, "bak");
+            assert_eq!(path, &p("/src/hello.txt"));
+            assert_eq!(announced, &new);
+            assert_eq!(*basis, Some(file_node(&previous)));
+        }
+        other => panic!("expected FileAnnounce, got {other:?}"),
+    }
+    assert!(master.poll(ALICE).is_empty());
+}
+
+#[test]
+fn handle_type_change_file_to_symlink_and_back() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let file_hash = hash_bytes(hello);
+    let target = b"somewhere";
+    let link_hash = hash_bytes(target);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(file_hash, hello.to_vec());
+    bodies.offer(link_hash, target.to_vec());
+    let mut master = two_slave_master(&sandbox, bodies);
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let previous = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, file_hash);
+    master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: previous.clone(),
+                basis: None,
+            },
+        )
+        .unwrap();
+
+    let link = FileMetadata::symlink(target.len() as u64, MTIME, 0o120777, link_hash);
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: link.clone(),
+                basis: Some(file_node(&previous)),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept {
+            file_node: node, ..
+        }) => {
+            assert_eq!(node, Some(file_node(&link)));
+        }
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    let host = sandbox.central_root().join("src/hello.txt");
+    assert!(std::fs::symlink_metadata(&host)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        std::fs::read_link(&host).unwrap(),
+        std::path::Path::new("somewhere")
+    );
+    assert_eq!(master.meta(&p("/src/hello.txt")).unwrap().unwrap(), link);
+
+    let again = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, file_hash);
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: again.clone(),
+                basis: Some(file_node(&link)),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept {
+            file_node: node, ..
+        }) => {
+            assert_eq!(node, Some(file_node(&again)));
+        }
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&host).unwrap(), hello);
+    assert_eq!(master.meta(&p("/src/hello.txt")).unwrap().unwrap(), again);
+}
+
+#[test]
+fn handle_type_change_dir_to_file_drops_children() {
+    let sandbox = SyncSandbox::new();
+    let kid_bytes = b"kid";
+    let kid_hash = hash_bytes(kid_bytes);
+    let file_bytes = b"now-a-file";
+    let file_hash = hash_bytes(file_bytes);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(kid_hash, kid_bytes.to_vec());
+    bodies.offer(file_hash, file_bytes.to_vec());
+    let mut master = two_slave_master(&sandbox, bodies);
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let nested = dir();
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/nested"),
+                new: nested.clone(),
+                basis: None,
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept { .. }) => {}
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+
+    let kid = FileMetadata::file(kid_bytes.len() as u64, MTIME, 0o100644, kid_hash);
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/nested/kid.txt"),
+                new: kid,
+                basis: None,
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept { .. }) => {}
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    assert!(sandbox.central_root().join("src/nested/kid.txt").is_file());
+
+    let replacement = FileMetadata::file(file_bytes.len() as u64, MTIME, 0o100644, file_hash);
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/nested"),
+                new: replacement.clone(),
+                basis: Some(file_node(&nested)),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept {
+            file_node: node, ..
+        }) => {
+            assert_eq!(node, Some(file_node(&replacement)));
+        }
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+
+    assert!(!sandbox.central_root().join("src/nested/kid.txt").exists());
+    assert_eq!(
+        std::fs::read(sandbox.central_root().join("src/nested")).unwrap(),
+        file_bytes
+    );
+    assert_eq!(master.meta(&p("/src/nested/kid.txt")).unwrap(), None);
+    assert_eq!(
+        master.meta(&p("/src/nested")).unwrap().unwrap(),
+        replacement
+    );
+    assert!(!sandbox.central_root().join(RESERVED_CONFLICTS).exists());
+}
+
+#[test]
+fn handle_type_change_stale_basis_is_cas_reject() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut master = two_slave_master(&sandbox, bodies);
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let previous = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: previous.clone(),
+                basis: None,
+            },
+        )
+        .unwrap();
+
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: dir(),
+                basis: Some(file_node(&file(9))),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasReject { path, current, .. }) => {
+            assert_eq!(path, p("/src/hello.txt"));
+            assert_eq!(current, Some(previous.clone()));
+        }
+        other => panic!("expected CasReject, got {other:?}"),
+    }
+
+    let host = sandbox.central_root().join("src/hello.txt");
+    assert!(host.is_file());
+    assert_eq!(std::fs::read(&host).unwrap(), hello);
+    assert_eq!(
+        master.meta(&p("/src/hello.txt")).unwrap().unwrap(),
+        previous
+    );
+}
+
+#[test]
+fn note_local_type_change_file_to_dir_fans_out_with_previous_basis() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(BACKUP, subscribe("backup-1", &[("bak", "/")]))
+        .unwrap();
+
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("src/hello.txt", b"typed");
+    master
+        .note_local(LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap();
+    let previous = master.meta(&p("/src/hello.txt")).unwrap().unwrap();
+    assert_eq!(master.poll(BACKUP).len(), 1);
+
+    std::fs::remove_file(sandbox.central_root().join("src/hello.txt")).unwrap();
+    std::fs::create_dir(sandbox.central_root().join("src/hello.txt")).unwrap();
+    master
+        .note_local(LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap();
+    let new = master.meta(&p("/src/hello.txt")).unwrap().unwrap();
+    assert_eq!(new.kind, EntryKind::Dir);
+
+    let pushed = master.poll(BACKUP);
+    assert_eq!(pushed.len(), 1);
+    match &pushed[0] {
+        ProtocolMessage::FileAnnounce {
+            path,
+            new: announced,
+            basis,
+            ..
+        } => {
+            assert_eq!(path, &p("/src/hello.txt"));
+            assert_eq!(announced, &new);
+            assert_eq!(*basis, Some(file_node(&previous)));
+        }
+        other => panic!("expected FileAnnounce, got {other:?}"),
     }
 }
 
@@ -612,13 +956,11 @@ fn handle_rename_moves_the_file_accepts_both_paths_and_fans_out() {
 
     let alice = master.poll(ALICE);
     match &alice[..] {
-        [
-            ProtocolMessage::CasAccept {
-                path,
-                file_node: node,
-                ..
-            },
-        ] => {
+        [ProtocolMessage::CasAccept {
+            path,
+            file_node: node,
+            ..
+        }] => {
             assert_eq!(path, &p("/src/old.txt"));
             assert_eq!(*node, None);
         }

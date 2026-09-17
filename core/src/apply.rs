@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use filetime::FileTime;
 
 use crate::hash::ContentHash;
-use crate::meta::{EntryKind, FileMetadata, hash_bytes};
-use crate::path::{CanonicalPath, RESERVED_TMP, canonical_to_host};
+use crate::meta::{hash_bytes, EntryKind, FileMetadata};
+use crate::path::{canonical_to_host, CanonicalPath, RESERVED_TMP};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -201,6 +201,23 @@ pub fn remove_live(central_root: &Path, path: &CanonicalPath) -> Result<(), Appl
         Err(err) => Err(at(&host)(err)),
         Ok(md) if md.is_dir() => remove_dir_children_first(&host),
         Ok(_) => fs::remove_file(&host).map_err(at(&host)),
+    }
+}
+
+pub fn replace_live(
+    root: &Path,
+    path: &CanonicalPath,
+    new: &FileMetadata,
+    body: &[u8],
+    previous: Option<&FileMetadata>,
+) -> Result<(), ApplyError> {
+    if previous.is_some_and(|prev| prev.kind != new.kind) {
+        remove_live(root, path)?;
+    }
+    match new.kind {
+        EntryKind::Dir => mkdir_live(root, path, new),
+        EntryKind::File => atomic_put(root, path, new, body),
+        EntryKind::Symlink => atomic_symlink(root, path, new, body),
     }
 }
 

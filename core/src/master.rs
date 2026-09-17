@@ -15,14 +15,14 @@ use crate::hash::{ContentHash, FileNode, SubtreeRoot};
 use crate::index;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
-use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
+use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
 use crate::path::{
-    CanonicalPath, PathError, canonical_to_host, conflict_sidecar_path, is_reserved_root_entry,
-    join_central,
+    canonical_to_host, conflict_sidecar_path, is_reserved_root_entry, join_central, CanonicalPath,
+    PathError,
 };
 use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
 use crate::storage::{CheckoutId, Storage};
-use crate::transfer::{self, BulkTransfer, signature_for};
+use crate::transfer::{self, signature_for, BulkTransfer};
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
 
@@ -582,7 +582,15 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             }));
         }
         let host = canonical_to_host(&self.central_root, &header.path);
-        let basis = read_host_bytes(&host)?;
+        let basis = if pending
+            .previous
+            .as_ref()
+            .is_some_and(|prev| prev.kind != pending.new.kind)
+        {
+            None
+        } else {
+            read_host_bytes(&host)?
+        };
         match transfer::reconstruct(header.encoding, body, basis.as_deref()) {
             Ok(bytes) if hash_bytes(&bytes) == header.want_hash => {
                 let pending = self.pending.remove(&key).expect("pending");
@@ -846,12 +854,16 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             EntryKind::Dir => {
                 self.inflight.arm(path.clone(), ContentHash::ZERO);
                 self.index_ancestors(&path)?;
-                apply::mkdir_live(&self.central_root, &path, &new)?;
+                apply::replace_live(&self.central_root, &path, &new, &[], current.as_ref())?;
             }
             EntryKind::File | EntryKind::Symlink => match self.bodies.fetch(new.content_hash) {
                 ContentBytes::AskSender => {
-                    let host = canonical_to_host(&self.central_root, &path);
-                    let live = read_host_bytes(&host)?;
+                    let live = if current.as_ref().is_some_and(|live| live.kind != new.kind) {
+                        None
+                    } else {
+                        let host = canonical_to_host(&self.central_root, &path);
+                        read_host_bytes(&host)?
+                    };
                     let signature = signature_for(new.kind, live.as_deref());
                     let want_hash = new.content_hash;
                     self.pending.insert(
@@ -1082,6 +1094,19 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         new: Option<&FileMetadata>,
         previous: Option<&FileMetadata>,
     ) -> Result<(), MasterError> {
+        // commit_leaf(Some) does not purge descendants; a kind change must.
+        if let (Some(new), Some(previous)) = (new, previous) {
+            if previous.kind != new.kind {
+                index::commit_leaf(
+                    &self.store,
+                    &CheckoutId::master(),
+                    path,
+                    None,
+                    index::LastSynced::AdoptLeaf,
+                )
+                .map_err(MasterError::index)?;
+            }
+        }
         index::commit_leaf(
             &self.store,
             &CheckoutId::master(),
@@ -1298,20 +1323,18 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         body: &[u8],
     ) -> Result<(), MasterError> {
         if let Some(previous) = previous {
-            apply::sidecar_if_content_differs(
-                &canonical_to_host(&self.central_root, path),
-                &conflict_sidecar_path(&self.central_root, path, &previous.content_hash),
-                previous,
-                new.content_hash,
-            )?;
+            if previous.kind == new.kind {
+                apply::sidecar_if_content_differs(
+                    &canonical_to_host(&self.central_root, path),
+                    &conflict_sidecar_path(&self.central_root, path, &previous.content_hash),
+                    previous,
+                    new.content_hash,
+                )?;
+            }
         }
         self.inflight.arm(path.clone(), new.content_hash);
         self.index_ancestors(path)?;
-        if new.kind == EntryKind::File {
-            apply::atomic_put(&self.central_root, path, new, body)?;
-        } else {
-            apply::atomic_symlink(&self.central_root, path, new, body)?;
-        }
+        apply::replace_live(&self.central_root, path, new, body, previous)?;
         Ok(())
     }
 
