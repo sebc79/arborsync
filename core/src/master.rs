@@ -11,18 +11,18 @@ use std::time::{Duration, Instant};
 
 use crate::apply;
 use crate::config::LoadedMaster;
-use crate::hash::{ContentHash, FileNode};
+use crate::hash::{ContentHash, FileNode, SubtreeRoot};
 use crate::index;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
-use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
+use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
 use crate::path::{
-    CanonicalPath, PathError, canonical_to_host, conflict_sidecar_path, is_reserved_root_entry,
-    join_central,
+    canonical_to_host, conflict_sidecar_path, is_reserved_root_entry, join_central, CanonicalPath,
+    PathError,
 };
 use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
 use crate::storage::{CheckoutId, Storage};
-use crate::transfer::{self, BulkTransfer, signature_for};
+use crate::transfer::{self, signature_for, BulkTransfer};
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
 
@@ -433,6 +433,19 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 want_hash,
                 signature,
             } => self.on_signature_request(peer, checkout_id, path, want_hash, signature),
+            ProtocolMessage::RootReport {
+                checkout_id,
+                path,
+                root,
+            } => Ok(Reply::Send(self.on_root_report(
+                peer,
+                checkout_id,
+                path,
+                root,
+            )?)),
+            ProtocolMessage::DirListRequest { checkout_id, path } => {
+                Ok(Reply::Send(self.on_dir_list(peer, checkout_id, path)?))
+            }
             other => Ok(Reply::Send(ProtocolMessage::Error {
                 code: "unsupported".into(),
                 message: format!("{other:?}"),
@@ -751,6 +764,65 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             path,
             file_node: None,
         })
+    }
+
+    fn on_root_report(
+        &self,
+        peer: [u8; 32],
+        checkout_id: String,
+        path: CanonicalPath,
+        root: SubtreeRoot,
+    ) -> Result<ProtocolMessage, MasterError> {
+        let checkout = CheckoutName::new(checkout_id.clone());
+        let session = match self.live_checkout(&peer, &checkout) {
+            Ok(session) => session,
+            Err(refusal) => return Ok(refusal.into_error(&checkout)),
+        };
+        if path != session.central {
+            return Ok(outside_central(&path));
+        }
+        let master_root = index::subtree_root(&self.store, &CheckoutId::master(), &path)
+            .map_err(MasterError::index)?;
+        Ok(ProtocolMessage::RootAck {
+            checkout_id,
+            path,
+            matched: root == master_root,
+            master_root,
+        })
+    }
+
+    fn on_dir_list(
+        &self,
+        peer: [u8; 32],
+        checkout_id: String,
+        path: CanonicalPath,
+    ) -> Result<ProtocolMessage, MasterError> {
+        let checkout = CheckoutName::new(checkout_id.clone());
+        let session = match self.live_checkout(&peer, &checkout) {
+            Ok(session) => session,
+            Err(refusal) => return Ok(refusal.into_error(&checkout)),
+        };
+        if !session.central.covers(&path) {
+            return Ok(outside_central(&path));
+        }
+        match self.meta(&path)? {
+            // DirEntry has only node_hash; the slave cannot invert a FileNode into mode/mtime/size/content_hash.
+            Some(meta) if meta.kind != EntryKind::Dir => Ok(ProtocolMessage::FileAnnounce {
+                checkout_id,
+                path,
+                new: meta,
+                basis: None,
+            }),
+            _ => {
+                let entries = index::dir_children(&self.store, &CheckoutId::master(), &path)
+                    .map_err(MasterError::index)?;
+                Ok(ProtocolMessage::DirListResponse {
+                    checkout_id,
+                    path,
+                    entries,
+                })
+            }
+        }
     }
 
     fn live_checkout(
