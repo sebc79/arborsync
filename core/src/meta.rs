@@ -146,3 +146,46 @@ pub fn collect_from_path(host: &Path) -> Result<Option<FileMetadata>, io::Error>
         hash_file(host)?,
     )))
 }
+
+pub fn collect_for_rescan(
+    host: &Path,
+    previous: Option<&FileMetadata>,
+) -> Result<Option<FileMetadata>, io::Error> {
+    collect_from_path_cached(host, previous)
+}
+
+pub fn collect_from_path_cached(
+    host: &Path,
+    previous: Option<&FileMetadata>,
+) -> Result<Option<FileMetadata>, io::Error> {
+    let md = match fs::symlink_metadata(host) {
+        Ok(md) => md,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let mode = md.mode();
+    let mtime_ns = md.mtime() * 1_000_000_000 + md.mtime_nsec();
+    let ft = md.file_type();
+    let (kind, size) = if ft.is_symlink() {
+        (EntryKind::Symlink, md.len())
+    } else if ft.is_dir() {
+        (EntryKind::Dir, 0)
+    } else if ft.is_file() {
+        (EntryKind::File, md.len())
+    } else {
+        return Ok(None);
+    };
+    if let Some(prev) = previous {
+        if prev.kind == kind && prev.size == size && prev.mtime_ns == mtime_ns && prev.mode == mode
+        {
+            return Ok(Some(FileMetadata {
+                kind,
+                size,
+                mtime_ns,
+                mode,
+                content_hash: prev.content_hash,
+            }));
+        }
+    }
+    collect_from_path(host)
+}
