@@ -3,8 +3,8 @@ use std::path::Path;
 use arborsync_core::hash::ContentHash;
 use arborsync_core::path::{
     CanonicalPath, EntryName, PathError, RESERVED_CONFLICTS, RESERVED_TMP, canonical_to_host,
-    conflict_sidecar_path, host_to_canonical, is_interested, is_reserved_root_entry, join_central,
-    local_paths_overlap,
+    checkout_relative, conflict_sidecar_path, host_to_canonical, is_interested,
+    is_reserved_root_entry, join_central, local_paths_overlap, local_to_canonical,
 };
 use arborsync_core::test_support::p;
 
@@ -180,6 +180,45 @@ fn canonical_to_host_round_trips_host_to_canonical() {
     let root = Path::new("/central");
     let host = canonical_to_host(root, &p("/src/foo.rs"));
     assert_eq!(host_to_canonical(root, &host).unwrap(), p("/src/foo.rs"));
+}
+
+#[test]
+fn checkout_relative_strips_central_so_apply_stays_inside_local() {
+    assert_eq!(checkout_relative(&p("/src"), &p("/src")).unwrap(), p("/"));
+    assert_eq!(
+        checkout_relative(&p("/src"), &p("/src/foo.rs")).unwrap(),
+        p("/foo.rs")
+    );
+    assert_eq!(
+        checkout_relative(&p("/"), &p("/src/foo.rs")).unwrap(),
+        p("/src/foo.rs")
+    );
+    assert_eq!(
+        checkout_relative(&p("/src"), &p("/docs/a")).unwrap_err(),
+        PathError::EscapesRoot
+    );
+}
+
+#[test]
+fn local_to_canonical_rejoins_central() {
+    assert_eq!(
+        local_to_canonical(
+            Path::new("/opt/src"),
+            &p("/src"),
+            Path::new("/opt/src/foo.rs")
+        )
+        .unwrap(),
+        p("/src/foo.rs")
+    );
+    assert_eq!(
+        local_to_canonical(
+            Path::new("/backup"),
+            &p("/"),
+            Path::new("/backup/src/foo.rs")
+        )
+        .unwrap(),
+        p("/src/foo.rs")
+    );
 }
 
 #[test]

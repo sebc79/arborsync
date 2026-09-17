@@ -16,7 +16,8 @@ use crate::keys::format_hex_key;
 use crate::merkle::file_node;
 use crate::meta::{self, EntryKind, FileMetadata};
 use crate::path::{
-    CanonicalPath, PathError, canonical_to_host, is_reserved_root_entry, join_central,
+    CanonicalPath, PathError, canonical_to_host, conflict_sidecar_path, is_reserved_root_entry,
+    join_central,
 };
 use crate::protocol::{CheckoutAck, CheckoutRef, ProtocolMessage};
 use crate::storage::{CheckoutId, Storage};
@@ -366,7 +367,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             inflight: Inflight::new(debounce),
             bodies,
         };
-        if index::root_is_dirty(&master.store).map_err(MasterError::index)? {
+        if index::root_is_dirty(&master.store, &CheckoutId::master()).map_err(MasterError::index)? {
             master.rescan()?;
         }
         Ok(master)
@@ -467,6 +468,18 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         &self.central_root
     }
 
+    pub fn authorize_peer(&self, peer: &[u8; 32]) -> Option<&str> {
+        self.cfg.acl_for_public_key(peer).map(|acl| acl.id())
+    }
+
+    pub fn max_connections(&self) -> u32 {
+        self.cfg.max_connections()
+    }
+
+    pub fn max_attempts_per_minute(&self) -> u32 {
+        self.cfg.max_connection_attempts_per_minute()
+    }
+
     pub fn meta(&self, path: &CanonicalPath) -> Result<Option<FileMetadata>, MasterError> {
         self.store
             .get_meta(&CheckoutId::master(), path)
@@ -527,8 +540,12 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         let mut acks = Vec::with_capacity(checkouts.len());
         for checkout in checkouts {
             acks.push(CheckoutAck {
-                master_root: index::subtree_root(&self.store, &checkout.central)
-                    .map_err(MasterError::index)?,
+                master_root: index::subtree_root(
+                    &self.store,
+                    &CheckoutId::master(),
+                    &checkout.central,
+                )
+                .map_err(MasterError::index)?,
                 id: checkout.id,
                 central: checkout.central,
             });
@@ -580,8 +597,12 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 ContentBytes::Whole(body) => {
                     if let Some(previous) = &current {
                         apply::sidecar_if_content_differs(
-                            &self.central_root,
-                            &path,
+                            &canonical_to_host(&self.central_root, &path),
+                            &conflict_sidecar_path(
+                                &self.central_root,
+                                &path,
+                                &previous.content_hash,
+                            ),
                             previous,
                             new.content_hash,
                         )?;
@@ -669,7 +690,14 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         new: Option<&FileMetadata>,
         previous: Option<&FileMetadata>,
     ) -> Result<(), MasterError> {
-        index::commit_leaf(&self.store, path, new).map_err(MasterError::index)?;
+        index::commit_leaf(
+            &self.store,
+            &CheckoutId::master(),
+            path,
+            new,
+            index::LastSynced::AdoptLeaf,
+        )
+        .map_err(MasterError::index)?;
 
         let payload = match (new, previous) {
             (Some(new), previous) => Fanout::Announce {
@@ -717,7 +745,14 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             else {
                 continue;
             };
-            index::commit_leaf(&self.store, &dir, Some(&found)).map_err(MasterError::index)?;
+            index::commit_leaf(
+                &self.store,
+                &CheckoutId::master(),
+                &dir,
+                Some(&found),
+                index::LastSynced::AdoptLeaf,
+            )
+            .map_err(MasterError::index)?;
         }
         Ok(())
     }

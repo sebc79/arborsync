@@ -145,6 +145,19 @@ pub fn is_reserved_root_entry(name: &str) -> bool {
     name == RESERVED_TMP || name == RESERVED_CONFLICTS
 }
 
+/// Host path under a checkout `local` to the canonical path in `central`.
+pub fn local_to_canonical(
+    local: &Path,
+    central: &CanonicalPath,
+    host_path: &Path,
+) -> Result<CanonicalPath, PathError> {
+    let relative = host_to_canonical(local, host_path)?;
+    if relative.as_str() == "/" {
+        return Ok(central.clone());
+    }
+    join_central(central, relative.as_str().trim_start_matches('/'))
+}
+
 /// Convert a host path under `root` (already canonicalized) to a logical
 /// canonical path. `root` is `central_root` on the master, or a checkout
 /// `local` on the slave (then join with that checkout’s `central`).
@@ -178,6 +191,29 @@ pub fn canonical_to_host(central_root: &Path, path: &CanonicalPath) -> PathBuf {
         return central_root.to_path_buf();
     }
     central_root.join(relative)
+}
+
+/// Path under a checkout `local` for a canonical `path` covered by `central`.
+/// `/src` + `/src/foo.rs` is `/foo.rs` so `canonical_to_host(local, …)` lands
+/// in the checkout, not `local/src/foo.rs`.
+pub fn checkout_relative(
+    central: &CanonicalPath,
+    path: &CanonicalPath,
+) -> Result<CanonicalPath, PathError> {
+    if !central.covers(path) {
+        return Err(PathError::EscapesRoot);
+    }
+    if path == central {
+        return Ok(CanonicalPath::root());
+    }
+    if central.as_str() == "/" {
+        return Ok(path.clone());
+    }
+    CanonicalPath::parse(
+        path.as_str()
+            .strip_prefix(central.as_str())
+            .expect("covers"),
+    )
 }
 
 pub fn join_central(central: &CanonicalPath, relative: &str) -> Result<CanonicalPath, PathError> {

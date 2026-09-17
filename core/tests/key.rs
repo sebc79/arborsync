@@ -1,6 +1,8 @@
 use std::fs;
 
-use arborsync_core::{KeyError, format_hex_key, parse_hex_key, read_static_key, write_static_key};
+use arborsync_core::{
+    KeyError, format_hex_key, parse_hex_key, public_from_secret, read_static_key, write_static_key,
+};
 
 const AB_HEX: &str = "hex:abababababababababababababababababababababababababababababababab";
 
@@ -45,6 +47,10 @@ fn write_static_key_is_32_bytes_mode_0600_and_second_call_already_exists() {
     }
 
     assert_eq!(parse_hex_key(&format_hex_key(&public)).unwrap(), public);
+    assert_eq!(
+        public_from_secret(&raw.as_slice().try_into().unwrap()),
+        public
+    );
 
     let err = write_static_key(&path).unwrap_err();
     assert!(matches!(err, KeyError::AlreadyExists { .. }));

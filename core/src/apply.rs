@@ -12,7 +12,7 @@ use filetime::FileTime;
 
 use crate::hash::ContentHash;
 use crate::meta::{EntryKind, FileMetadata, hash_bytes};
-use crate::path::{CanonicalPath, RESERVED_TMP, canonical_to_host, conflict_sidecar_path};
+use crate::path::{CanonicalPath, RESERVED_TMP, canonical_to_host};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -180,28 +180,26 @@ pub fn remove_live(central_root: &Path, path: &CanonicalPath) -> Result<(), Appl
 }
 
 pub fn sidecar_if_content_differs(
-    central_root: &Path,
-    path: &CanonicalPath,
+    live: &Path,
+    sidecar: &Path,
     previous: &FileMetadata,
     incoming: ContentHash,
 ) -> Result<(), ApplyError> {
     if previous.kind == EntryKind::Dir || previous.content_hash == incoming {
         return Ok(());
     }
-    let live = canonical_to_host(central_root, path);
     let bytes = match previous.kind {
-        EntryKind::Symlink => fs::read_link(&live)
-            .map_err(at(&live))?
+        EntryKind::Symlink => fs::read_link(live)
+            .map_err(at(live))?
             .as_os_str()
             .as_bytes()
             .to_vec(),
-        _ => fs::read(&live).map_err(at(&live))?,
+        _ => fs::read(live).map_err(at(live))?,
     };
-    let sidecar = conflict_sidecar_path(central_root, path, &previous.content_hash);
     if let Some(parent) = sidecar.parent() {
         fs::create_dir_all(parent).map_err(at(parent))?;
     }
-    fs::write(&sidecar, bytes).map_err(at(&sidecar))
+    fs::write(sidecar, bytes).map_err(at(sidecar))
 }
 
 pub fn wipe_tmp(central_root: &Path) -> Result<(), ApplyError> {

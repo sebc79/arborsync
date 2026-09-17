@@ -50,6 +50,7 @@ clap.workspace = true
 env_logger.workspace = true
 log.workspace = true
 notify-debouncer-mini.workspace = true
+quinn.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

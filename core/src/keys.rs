@@ -21,6 +21,10 @@ pub enum KeyError {
     BadPin,
 }
 
+pub fn public_from_secret(secret: &[u8; 32]) -> [u8; 32] {
+    *PublicKey::from(&StaticSecret::from(*secret)).as_bytes()
+}
+
 pub fn format_hex_key(bytes: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(4 + 64);
