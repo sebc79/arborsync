@@ -14,9 +14,10 @@ use arborsync_core::transport::{
     accept_bulk, client_endpoint, connect, open_control, peer_static_key, read_control, write_bulk,
     write_control,
 };
+use arborsync_core::watch::to_local_events;
 use arborsync_core::{CanonicalPath, LoadedSlave, RedbStorage, ReloadError, SlaveReload};
-use notify_debouncer_mini::notify::RecursiveMode;
-use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
+use notify::RecursiveMode;
+use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -358,9 +359,8 @@ fn watch_checkout(
         return Ok(WatchStop::Removed);
     }
     let (notify_tx, rx) = mpsc::channel::<DebounceEventResult>();
-    let mut debouncer = new_debouncer(debounce, notify_tx)?;
+    let mut debouncer = new_debouncer(debounce, None, notify_tx)?;
     debouncer
-        .watcher()
         .watch(local, RecursiveMode::Recursive)
         .with_context(|| format!("watch {}", local.display()))?;
 
@@ -373,12 +373,35 @@ fn watch_checkout(
         }
         match rx.recv_timeout(rescan_every) {
             Ok(Ok(events)) => {
+                let mut need_rescan = false;
+                let mut mapped = Vec::new();
                 for event in events {
-                    note(checkout, local, central, &event.path, tx)?;
+                    if event.need_rescan() {
+                        need_rescan = true;
+                        continue;
+                    }
+                    if let Some(watch) = crate::watch::from_notify(&event) {
+                        mapped.push(watch);
+                    }
+                }
+                if need_rescan {
+                    tx.send(Work::Rescan {
+                        checkout: checkout.into(),
+                    })
+                    .context("session dropped")?;
+                }
+                let locals =
+                    to_local_events(mapped, |host| local_to_canonical(local, central, host).ok());
+                for event in locals {
+                    tx.send(Work::Local {
+                        checkout: checkout.into(),
+                        event,
+                    })
+                    .context("session dropped")?;
                 }
             }
-            Ok(Err(err)) => {
-                log::warn!("watch {checkout}: {err}");
+            Ok(Err(errs)) => {
+                log::warn!("watch {checkout}: {errs:?}");
                 tx.send(Work::Rescan {
                     checkout: checkout.into(),
                 })
@@ -406,27 +429,6 @@ fn still_this_checkout(
             id == checkout && watched_local == local && watched_central == central
         },
     )
-}
-
-fn note(
-    checkout: &str,
-    local: &Path,
-    central: &CanonicalPath,
-    host: &Path,
-    tx: &UnboundedSender<Work>,
-) -> anyhow::Result<()> {
-    match local_to_canonical(local, central, host) {
-        Ok(path) => tx
-            .send(Work::Local {
-                checkout: checkout.into(),
-                event: LocalEvent::Changed(path),
-            })
-            .context("session dropped"),
-        Err(err) => {
-            log::warn!("skipping {}: {err}", host.display());
-            Ok(())
-        }
-    }
 }
 
 fn default_config_path() -> PathBuf {
