@@ -18,8 +18,8 @@ pub struct LeafChange<'a> {
     pub last_synced: LastSynced,
 }
 
-/// Direct children of each loaded directory. Survives across `commit_leaf`
-/// calls so ancestor `DirNode`s are not rebuilt from a full `range_meta`.
+/// Direct children of each loaded directory. Lives across `commit_leaf`
+/// calls so later ancestor hashes do not `range_meta` the whole tree.
 #[derive(Clone, Debug, Default)]
 pub struct DirChildren {
     by_parent: HashMap<CanonicalPath, HashMap<CanonicalPath, FileMetadata>>,
@@ -137,7 +137,6 @@ pub fn commit_leaf<S: Storage>(
     )
 }
 
-/// [`commit_leaf`] that reuses loaded directory children.
 pub fn commit_leaf_with<S: Storage>(
     store: &S,
     ck: &CheckoutId,
@@ -167,7 +166,6 @@ pub fn commit_leaves<'a, S: Storage>(
     commit_leaves_with(store, ck, changes, &mut DirChildren::default())
 }
 
-/// [`commit_leaves`] that reuses loaded directory children.
 pub fn commit_leaves_with<'a, S: Storage>(
     store: &S,
     ck: &CheckoutId,
