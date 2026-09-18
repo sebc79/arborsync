@@ -123,6 +123,8 @@ checkouts = [
 ### 4. Identity and prefix ACL
 
 Every node has a persisted X25519 static keypair (`arborsync keygen`).
+`master` and `slave` log the public pin at startup after they read the secret file.
+The pin is `hex:` plus 64 hex digits, the same form `keygen` prints to stdout.
 
 - Slave config: `slave_id`, `slave_key_path`, `master_public_keys` (one or more pins, for master-key rotation).
 - Master config: `master_key_path` and a list of slaves:
@@ -551,8 +553,8 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 
 1. ✅ `core`: `FileMetadata`, path-Merkle encode/hash, `Storage` + redb, frame codec, canonical-path helpers, reserved-name filter, local-overlap check.
 2. ✅ `keygen` + config parse/validate (ACL, pins, checkouts).
-3. ✅ Master: watch `central_root`, index, QUIC XX accept, ACL, Subscribe, CAS apply to disk, fan-out.
-4. ✅ Slave: connect, pin check, Subscribe, per-checkout watch, announce, apply, sidecar.
+3. ✅ Master: watch `central_root`, index, QUIC XX accept, ACL, Subscribe, CAS apply to disk, fan-out, log public pin at startup.
+4. ✅ Slave: connect, pin check, Subscribe, per-checkout watch, announce, apply, sidecar, log public pin at startup.
 5. ✅ Bulk `copia` streams; whole-file fallback. Apply reconstructs in memory, then writes the full buffer through `.arborsync-tmp`.
 6. ✅ Reconcile walk + rescan + reconnect.
 7. ✅ Config watch for checkout add/remove; SIGHUP ACL/log reload.
@@ -565,6 +567,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | | Requirement | As built |
 |---|---|---|
 | ✅ | §3 overlap after symlink-resolved canonicalize | Parse checks tilde-expanded paths and `canonicalize`s a local that already exists. `Slave::open` and checkout-add reload `canonicalize` again and reject `LocalOverlap` on the resolved paths. |
+| ✅ | §4 startup public pin | After `read_static_key`, `master` and `slave` log `hex:` plus 64 hex digits. Same form as `keygen` stdout. |
 | ✅ | §4 / §14 config files `0600` | `LoadedMaster::load` / `LoadedSlave::load` reject a file whose mode is not `0600` (`ConfigError::InsecureMode`). `parse` does not check mode. The NixOS unit copies `services.arborsync.master.configFile` to `/run/arborsync/master.toml` with mode `0600` and passes that path to `--config`. |
 | ✅ | §4 / §12 unknown-key rate limit | `AttemptLimiter::limited` drops the accept before XX. After XX, unknown key records `allow` and closes. `slave_id` mismatch is `Reply::Hangup` (the binary also `allow`s). Prefix deny stays `SubscribeReject`. |
 | ✅ | §6 skip device, socket, FIFO | `collect_from_path` / `collect_for_rescan` return `Ok(None)` and log a warn for device, socket, FIFO, and `PermissionDenied`. The walk continues. |

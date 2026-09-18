@@ -18,6 +18,7 @@ arborsync keygen [--out PATH]
 ```
 
 `keygen` writes a 32-byte X25519 secret (0600) and prints the public key as `hex:` + 64 hex chars to stdout for pasting into the peer’s config.
+`master` and `slave` log that same public pin at startup after they read the secret file.
 
 ## Master
 

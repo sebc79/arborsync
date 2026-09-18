@@ -8,6 +8,7 @@ Master starts from a mode-`600` TOML file, watches `central_root`, and logs the 
 - `master-config-flag` reads `--config PATH`.
 - `master-config-env` reads `ARBORSYNC_CONFIG`.
 - `master-insecure-mode` refuses a world-readable config.
+- `master-public-key` logs the public pin `keygen` printed for the master secret.
 
 ## How to get to it (user POV)
 
@@ -26,6 +27,7 @@ Preconditions:
 - **Config flag.** Confirm the flag path. Run `control-arborsync paths` and check `MASTER_CONFIG`. The process was started with `master --config` that file.
 - **Config env.** After `cleanup`, `launch` a new `--run-id`, `kill` only that run's `MASTER_PID` from `paths`, then start `ARBORSYNC_CONFIG="$MASTER_CONFIG" "$BIN" master` (no `--config`). The new master log contains `listening on `.
 - **Insecure mode.** Copy a valid `master.toml` to a temp path, `chmod 644`, and run `target/debug/arborsync master --config` that copy. The process exits non-zero. Stderr mentions the path and insecure mode.
+- **Public key.** After `launch`, read `master_public_keys` from `SLAVE_CONFIG`. That value is the pin `keygen` printed for `MASTER_KEY`. The master log contains that exact string.
 - **Proof.** Run `control-arborsync capture master`. `master.log` in the artifact dir contains `listening on` and the process was still running at capture time.
 
 ## Gotchas

@@ -18,6 +18,34 @@ fn master_sandbox() -> (SyncSandbox, std::path::PathBuf) {
     (sandbox, config)
 }
 
+fn keygen_stdout(out: &std::path::Path) -> String {
+    let output = bin().args(["keygen", "--out"]).arg(out).output().unwrap();
+    assert!(
+        output.status.success(),
+        "keygen --out {}: {}",
+        out.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("keygen stdout")
+        .trim()
+        .to_string()
+}
+
+fn stderr_after_kill(mut child: std::process::Child) -> String {
+    sleep(Duration::from_millis(1500));
+    if let Some(status) = child.try_wait().unwrap() {
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "daemon exited with {status}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
 #[test]
 fn help_lists_master_slave_and_keygen() {
     let output = bin().arg("--help").output().expect("run");
@@ -193,4 +221,51 @@ fn master_reports_the_missing_key_path_it_could_not_read() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("master.key"), "stderr={stderr}");
+}
+
+#[test]
+fn master_logs_the_public_key_keygen_printed() {
+    let sandbox = SyncSandbox::new();
+    let key = sandbox.path().join("master/master.key");
+    let pin = keygen_stdout(&key);
+    let config = sandbox.write_master_config(Vec::new());
+    let child = bin()
+        .arg("master")
+        .arg("--config")
+        .arg(&config)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn master");
+
+    let stderr = stderr_after_kill(child);
+    assert!(stderr.contains(&pin), "stderr={stderr}");
+    drop(sandbox);
+}
+
+#[test]
+fn slave_logs_the_public_key_keygen_printed() {
+    let sandbox = SyncSandbox::new();
+    let local = sandbox.add_checkout("dev-alice", "src");
+    let key = sandbox.slave_root("dev-alice").join("slave.key");
+    let pin = keygen_stdout(&key);
+    let config = sandbox.write_slave_config(
+        "dev-alice",
+        vec![arborsync_core::config::CheckoutConfig {
+            id: "src".into(),
+            central: "/src".into(),
+            local: local.to_string_lossy().into_owned(),
+        }],
+        vec!["hex:".to_string() + &"11".repeat(32)],
+    );
+    let child = bin()
+        .arg("slave")
+        .arg("--config")
+        .arg(&config)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn slave");
+
+    let stderr = stderr_after_kill(child);
+    assert!(stderr.contains(&pin), "stderr={stderr}");
+    drop(sandbox);
 }

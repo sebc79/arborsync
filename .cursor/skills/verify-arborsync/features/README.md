@@ -43,7 +43,7 @@ Keep implementation details out of the map. Name only user paths, stable handles
 ## Features
 
 - [Generate a static key](./keygen.md) covers `keygen --out`, the printed pin, and the required `--out` flag.
-- [Run the master daemon](./master.md) covers listen, config path flag vs `ARBORSYNC_CONFIG`, and insecure-mode reject.
-- [Connect a slave](./slave-connect.md) covers connect after listen, missing key path, and idle retry while the master is down.
+- [Run the master daemon](./master.md) covers listen, config path flag vs `ARBORSYNC_CONFIG`, insecure-mode reject, and the startup public pin.
+- [Connect a slave](./slave-connect.md) covers connect after listen, missing key path, idle retry while the master is down, and the startup public pin.
 - [Sync a slave write to the master](./sync-from-slave.md) covers a checkout file appearing under `central_root/src`.
 - [Sync a master write to the slave](./sync-from-master.md) covers a central file appearing in the checkout.
