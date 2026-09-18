@@ -180,16 +180,16 @@ fn encode_bulk_rejects_a_body_that_does_not_match_size() {
 #[test]
 fn signature_request_for_an_80mib_basis_fits_a_control_frame() {
     use arborsync_core::meta::EntryKind;
-    use arborsync_core::transfer::signature_for;
+    use arborsync_core::transfer::signature_request;
 
     let bytes = vec![b'B'; 80 << 20];
-    let signature = signature_for(EntryKind::File, Some(&bytes));
-    let msg = ProtocolMessage::SignatureRequest {
-        checkout_id: "src".into(),
-        path: p("/src/big.bin"),
-        want_hash: ContentHash::from_bytes([2; 32]),
-        signature,
-    };
+    let msg = signature_request(
+        "src",
+        p("/src/big.bin"),
+        ContentHash::from_bytes([2; 32]),
+        EntryKind::File,
+        Some(&bytes),
+    );
     let frame = encode_control(&msg).expect("80 MiB basis must still yield a sendable frame");
     assert!(
         frame.len() - 4 <= MAX_CONTROL_FRAME,
@@ -201,20 +201,25 @@ fn signature_request_for_an_80mib_basis_fits_a_control_frame() {
 #[test]
 fn signature_request_for_a_10mib_basis_still_asks_for_a_delta() {
     use arborsync_core::meta::EntryKind;
-    use arborsync_core::transfer::signature_for;
+    use arborsync_core::transfer::signature_request;
 
     let bytes = vec![0u8; 10 << 20];
-    let signature = signature_for(EntryKind::File, Some(&bytes));
-    assert!(
-        !signature.is_empty(),
-        "a 10 MiB basis must keep a copia signature"
+    let msg = signature_request(
+        "src",
+        p("/src/mid.bin"),
+        ContentHash::from_bytes([3; 32]),
+        EntryKind::File,
+        Some(&bytes),
     );
-    let msg = ProtocolMessage::SignatureRequest {
-        checkout_id: "src".into(),
-        path: p("/src/mid.bin"),
-        want_hash: ContentHash::from_bytes([3; 32]),
-        signature,
-    };
+    match &msg {
+        ProtocolMessage::SignatureRequest { signature, .. } => {
+            assert!(
+                !signature.is_empty(),
+                "a 10 MiB basis must keep a copia signature"
+            );
+        }
+        other => panic!("expected SignatureRequest, got {other:?}"),
+    }
     encode_control(&msg).expect("10 MiB signature must fit");
 }
 

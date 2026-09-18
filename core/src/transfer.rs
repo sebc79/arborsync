@@ -104,19 +104,6 @@ pub fn reconstruct(
     }
 }
 
-pub fn signature_for(kind: EntryKind, live: Option<&[u8]>) -> Vec<u8> {
-    match signature_request(
-        "src",
-        CanonicalPath::parse("/src/eighty.bin").expect("static path"),
-        ContentHash::from_bytes([0; 32]),
-        kind,
-        live,
-    ) {
-        ProtocolMessage::SignatureRequest { signature, .. } => signature,
-        _ => Vec::new(),
-    }
-}
-
 pub fn signature_request(
     checkout_id: impl Into<String>,
     path: CanonicalPath,
