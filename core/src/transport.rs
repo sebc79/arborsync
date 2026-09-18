@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig};
+use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig, VarInt};
 use quinn_hyphae::helper::{hyphae_client_endpoint, hyphae_server_endpoint};
 use quinn_hyphae::{HandshakeBuilder, HyphaePeerIdentity, RustCryptoBackend};
 use tokio::sync::mpsc;
@@ -18,13 +18,13 @@ use crate::transfer::BulkTransfer;
 
 pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
-/// Quinn idle timeout stays at the RFC 9308 30 s default. Ping sooner so a
-/// quiet control stream does not die at that timeout.
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_IDLE_MS: u32 = 30_000;
+const KEEP_ALIVE: Duration = Duration::from_secs(10);
 
 fn session_transport_config() -> Arc<TransportConfig> {
     let mut cfg = TransportConfig::default();
-    cfg.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    cfg.max_idle_timeout(Some(VarInt::from_u32(MAX_IDLE_MS).into()));
+    cfg.keep_alive_interval(Some(KEEP_ALIVE));
     Arc::new(cfg)
 }
 
