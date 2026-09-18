@@ -245,9 +245,9 @@ cmd_doctor() {
   [[ -d "$LOCAL" ]] || { echo "FAIL missing checkout $LOCAL"; ok=1; }
 
   local mode
-  mode="$(stat -f '%Lp' "$MASTER_CONFIG")"
+  mode="$(stat -c '%a' "$MASTER_CONFIG" 2>/dev/null || stat -f '%Lp' "$MASTER_CONFIG")"
   [[ "$mode" == "600" ]] || { echo "FAIL master config mode $mode (want 600)"; ok=1; }
-  mode="$(stat -f '%Lp' "$SLAVE_CONFIG")"
+  mode="$(stat -c '%a' "$SLAVE_CONFIG" 2>/dev/null || stat -f '%Lp' "$SLAVE_CONFIG")"
   [[ "$mode" == "600" ]] || { echo "FAIL slave config mode $mode (want 600)"; ok=1; }
 
   if [[ "$ok" -ne 0 ]]; then

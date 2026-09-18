@@ -67,7 +67,7 @@ Do not resolve in-tree links during scan, index, or apply. Resolving duplicates 
 
 ## Batching
 
-Specified: rescans commit per directory, and one debounce window is one batch. As built: each changed path is its own `commit_leaf` (leaf plus ancestors). `CasAccept` on the origin slave writes `last_synced` in a second batch.
+Specified: rescans commit per directory, and one debounce window is one batch. Slave `rescan` writes every changed leaf and recomputes each dirty `DirNode` once in one `commit_leaves` batch. Watcher events still call `commit_leaf` per path. `CasAccept` on the origin slave writes `last_synced` in a second batch.
 
 ## Hardlinks
 
