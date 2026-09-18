@@ -57,7 +57,7 @@ On a changed path `P` (file, symlink, or directory metadata):
 
 1. Re-read metadata; recompute `FileNode` or, for a directory, recompute `DirNode` from current children.
 2. Write `meta` (and new `DirNode` if `P` is a dir).
-3. Walk parents from `dirname(P)` to the tree root (checkout `central` on a slave; `/` on the master). For each parent, reload children from the index (not a full FS walk), recompute `DirNode`, write it.
+3. Walk parents from `dirname(P)` to the tree root (checkout `central` on a slave; `/` on the master). For each parent, reload children from the index (not a full FS walk), recompute `DirNode`, write it. The master keeps those child lists in `DirChildren` after the first load so a long inbound copy does not `range_meta` the whole tree on every file.
 4. Commit one write batch covering the leaf change and every ancestor `DirNode`.
 
 Insert: new `meta` row, then ancestor recompute.  

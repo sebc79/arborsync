@@ -18,6 +18,106 @@ pub struct LeafChange<'a> {
     pub last_synced: LastSynced,
 }
 
+/// Direct children of each loaded directory. Lives across `commit_leaf`
+/// calls so later ancestor hashes do not `range_meta` the whole tree.
+#[derive(Clone, Debug, Default)]
+pub struct DirChildren {
+    by_parent: HashMap<CanonicalPath, HashMap<CanonicalPath, FileMetadata>>,
+}
+
+impl DirChildren {
+    fn ensure_loaded<S: Storage>(
+        &mut self,
+        store: &S,
+        ck: &CheckoutId,
+        dir: &CanonicalPath,
+    ) -> Result<(), S::Error> {
+        if self.by_parent.contains_key(dir) {
+            return Ok(());
+        }
+        let kids = store
+            .range_meta(ck, dir)?
+            .into_iter()
+            .filter(|(path, _)| path.parent().as_ref() == Some(dir))
+            .collect();
+        self.by_parent.insert(dir.clone(), kids);
+        Ok(())
+    }
+
+    fn apply(&mut self, path: &CanonicalPath, meta: Option<&FileMetadata>) {
+        match meta {
+            Some(meta) if meta.kind == EntryKind::Dir => {
+                if let Some(parent) = path.parent() {
+                    if let Some(kids) = self.by_parent.get_mut(&parent) {
+                        kids.insert(path.clone(), meta.clone());
+                    }
+                }
+                self.by_parent.entry(path.clone()).or_default();
+            }
+            Some(meta) => {
+                self.drop_tree(path);
+                if let Some(parent) = path.parent() {
+                    if let Some(kids) = self.by_parent.get_mut(&parent) {
+                        kids.insert(path.clone(), meta.clone());
+                    }
+                }
+            }
+            None => self.drop_tree(path),
+        }
+    }
+
+    fn drop_tree(&mut self, prefix: &CanonicalPath) {
+        self.by_parent.retain(|dir, kids| {
+            if prefix.covers(dir) {
+                return false;
+            }
+            kids.retain(|path, _| !prefix.covers(path));
+            true
+        });
+        if let Some(parent) = prefix.parent() {
+            if let Some(kids) = self.by_parent.get_mut(&parent) {
+                kids.remove(prefix);
+            }
+        }
+    }
+
+    fn children<S: Storage>(
+        &self,
+        store: &S,
+        ck: &CheckoutId,
+        dir: &CanonicalPath,
+        computed: &HashMap<CanonicalPath, DirNode>,
+    ) -> Result<Vec<DirChild>, S::Error> {
+        let Some(kids) = self.by_parent.get(dir) else {
+            return Ok(Vec::new());
+        };
+        let mut entries = Vec::with_capacity(kids.len());
+        for (path, meta) in kids {
+            let Ok(name) = EntryName::parse(path.name()) else {
+                continue;
+            };
+            entries.push(match meta.kind {
+                EntryKind::File => DirChild::File {
+                    name,
+                    node: file_node(meta),
+                },
+                EntryKind::Symlink => DirChild::Symlink {
+                    name,
+                    node: file_node(meta),
+                },
+                EntryKind::Dir => DirChild::Directory {
+                    name,
+                    node: match computed.get(path) {
+                        Some(node) => *node,
+                        None => store.get_dir_node(ck, path)?.unwrap_or_else(empty_dir_node),
+                    },
+                },
+            });
+        }
+        Ok(entries)
+    }
+}
+
 /// Commit one leaf and every directory hash it changes in a single batch.
 /// `leaf` of `None` removes the path and, for a directory, everything under it.
 pub fn commit_leaf<S: Storage>(
@@ -27,7 +127,25 @@ pub fn commit_leaf<S: Storage>(
     leaf: Option<&FileMetadata>,
     last_synced: LastSynced,
 ) -> Result<(), S::Error> {
-    commit_leaves(
+    commit_leaf_with(
+        store,
+        ck,
+        path,
+        leaf,
+        last_synced,
+        &mut DirChildren::default(),
+    )
+}
+
+pub fn commit_leaf_with<S: Storage>(
+    store: &S,
+    ck: &CheckoutId,
+    path: &CanonicalPath,
+    leaf: Option<&FileMetadata>,
+    last_synced: LastSynced,
+    cache: &mut DirChildren,
+) -> Result<(), S::Error> {
+    commit_leaves_with(
         store,
         ck,
         [LeafChange {
@@ -35,6 +153,7 @@ pub fn commit_leaf<S: Storage>(
             meta: leaf,
             last_synced,
         }],
+        cache,
     )
 }
 
@@ -44,20 +163,18 @@ pub fn commit_leaves<'a, S: Storage>(
     ck: &CheckoutId,
     changes: impl IntoIterator<Item = LeafChange<'a>>,
 ) -> Result<(), S::Error> {
+    commit_leaves_with(store, ck, changes, &mut DirChildren::default())
+}
+
+pub fn commit_leaves_with<'a, S: Storage>(
+    store: &S,
+    ck: &CheckoutId,
+    changes: impl IntoIterator<Item = LeafChange<'a>>,
+    cache: &mut DirChildren,
+) -> Result<(), S::Error> {
     let changes: Vec<LeafChange<'a>> = changes.into_iter().collect();
     if changes.is_empty() {
         return Ok(());
-    }
-
-    let overlay: HashMap<CanonicalPath, Option<&FileMetadata>> = changes
-        .iter()
-        .map(|change| (change.path.clone(), change.meta))
-        .collect();
-    let mut computed: HashMap<CanonicalPath, DirNode> = HashMap::new();
-    let mut batch = store.begin_write()?;
-
-    for change in &changes {
-        apply_leaf(store, &mut batch, ck, change)?;
     }
 
     let mut dirty = HashSet::new();
@@ -67,11 +184,23 @@ pub fn commit_leaves<'a, S: Storage>(
         }
         dirty.extend(change.path.ancestors());
     }
+    for dir in &dirty {
+        cache.ensure_loaded(store, ck, dir)?;
+    }
+
+    let mut computed: HashMap<CanonicalPath, DirNode> = HashMap::new();
+    let mut batch = store.begin_write()?;
+
+    for change in &changes {
+        apply_leaf(store, &mut batch, ck, change)?;
+        cache.apply(change.path, change.meta);
+    }
+
     let mut dirty: Vec<CanonicalPath> = dirty.into_iter().collect();
     dirty.sort_by_key(|path| std::cmp::Reverse(depth(path)));
 
     for dir in dirty {
-        let node = recompute(store, ck, &dir, &overlay, &computed)?;
+        let node = dir_node(&cache.children(store, ck, &dir, &computed)?);
         computed.insert(dir.clone(), node);
         batch.put_dir_node(ck, &dir, node)?;
     }
@@ -346,6 +475,103 @@ mod tests {
         assert_ne!(
             sequential.get_dir_node(&ck, &dir).unwrap(),
             Some(empty_dir_node())
+        );
+    }
+
+    #[test]
+    fn cached_commits_match_cold_commits() {
+        let cold = MemoryStorage::new();
+        let hot = MemoryStorage::new();
+        let ck = CheckoutId::new("src");
+        let dir = p("/src");
+        let dir_meta = FileMetadata::directory(0, 0o040755);
+        let files: Vec<(CanonicalPath, FileMetadata)> = (0..8)
+            .map(|i| (p(&format!("/src/f{i:02}")), file(i as u8 + 1)))
+            .collect();
+
+        commit_leaf(&cold, &ck, &dir, Some(&dir_meta), LastSynced::Keep).unwrap();
+        for (path, meta) in &files {
+            commit_leaf(&cold, &ck, path, Some(meta), LastSynced::Keep).unwrap();
+        }
+
+        let mut cache = DirChildren::default();
+        commit_leaf_with(
+            &hot,
+            &ck,
+            &dir,
+            Some(&dir_meta),
+            LastSynced::Keep,
+            &mut cache,
+        )
+        .unwrap();
+        for (path, meta) in &files {
+            commit_leaf_with(&hot, &ck, path, Some(meta), LastSynced::Keep, &mut cache).unwrap();
+        }
+
+        assert_eq!(
+            cold.range_meta(&ck, &p("/")).unwrap(),
+            hot.range_meta(&ck, &p("/")).unwrap()
+        );
+        assert_eq!(
+            cold.get_dir_node(&ck, &dir).unwrap(),
+            hot.get_dir_node(&ck, &dir).unwrap()
+        );
+        assert_eq!(
+            cold.get_dir_node(&ck, &p("/")).unwrap(),
+            hot.get_dir_node(&ck, &p("/")).unwrap()
+        );
+    }
+
+    #[test]
+    fn cached_file_over_a_dir_drops_the_child() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::new("src");
+        let dir_path = p("/src/nested");
+        let child = p("/src/nested/child.txt");
+        let dir = FileMetadata::directory(0, 0o040755);
+        let mut cache = DirChildren::default();
+        commit_leaf_with(
+            &store,
+            &ck,
+            &dir_path,
+            Some(&dir),
+            LastSynced::AdoptLeaf,
+            &mut cache,
+        )
+        .unwrap();
+        commit_leaf_with(
+            &store,
+            &ck,
+            &child,
+            Some(&file(1)),
+            LastSynced::AdoptLeaf,
+            &mut cache,
+        )
+        .unwrap();
+        commit_leaf_with(
+            &store,
+            &ck,
+            &dir_path,
+            Some(&file(2)),
+            LastSynced::AdoptLeaf,
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(store.get_meta(&ck, &child).unwrap(), None);
+        assert_eq!(store.get_meta(&ck, &dir_path).unwrap().unwrap(), file(2));
+        commit_leaf_with(
+            &store,
+            &ck,
+            &p("/src/other.txt"),
+            Some(&file(3)),
+            LastSynced::AdoptLeaf,
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(store.get_meta(&ck, &dir_path).unwrap().unwrap(), file(2));
+        assert_eq!(
+            store.get_meta(&ck, &p("/src/other.txt")).unwrap().unwrap(),
+            file(3)
         );
     }
 }
