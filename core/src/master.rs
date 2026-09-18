@@ -15,9 +15,9 @@ use crate::index;
 use crate::inflight::Inflight;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
-use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
+use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
 use crate::path::{
-    CanonicalPath, PathError, canonical_to_host, is_reserved_root_entry, join_central,
+    canonical_to_host, is_reserved_root_entry, join_central, CanonicalPath, PathError,
 };
 use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
 use crate::storage::{CheckoutId, Storage};
@@ -397,6 +397,7 @@ pub struct Master<S: Storage, C: ContentHook> {
     inflight: Inflight,
     bodies: C,
     pending: HashMap<(String, CanonicalPath), PendingApply>,
+    dirs: index::DirChildren,
 }
 
 impl<S: Storage, C: ContentHook> Master<S, C> {
@@ -415,6 +416,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             inflight: Inflight::new(debounce),
             bodies,
             pending: HashMap::new(),
+            dirs: index::DirChildren::default(),
         };
         if index::root_is_dirty(&master.store, &CheckoutId::master()).map_err(MasterError::index)? {
             master.rescan()?;
@@ -1039,6 +1041,23 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         Ok(Session { slave, central })
     }
 
+    fn write_index(
+        &mut self,
+        path: &CanonicalPath,
+        leaf: Option<&FileMetadata>,
+        last_synced: index::LastSynced,
+    ) -> Result<(), MasterError> {
+        index::commit_leaf_with(
+            &self.store,
+            &CheckoutId::master(),
+            path,
+            leaf,
+            last_synced,
+            &mut self.dirs,
+        )
+        .map_err(MasterError::index)
+    }
+
     fn commit(
         &mut self,
         origin: &Origin,
@@ -1046,14 +1065,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         new: Option<&FileMetadata>,
         previous: Option<&FileMetadata>,
     ) -> Result<(), MasterError> {
-        index::commit_leaf(
-            &self.store,
-            &CheckoutId::master(),
-            path,
-            new,
-            index::LastSynced::AdoptLeaf,
-        )
-        .map_err(MasterError::index)?;
+        self.write_index(path, new, index::LastSynced::AdoptLeaf)?;
 
         let payload = match (new, previous) {
             (Some(new), previous) => Fanout::Announce {
@@ -1084,23 +1096,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         from_previous: &FileMetadata,
         to_new: &FileMetadata,
     ) -> Result<(), MasterError> {
-        index::commit_leaf(
-            &self.store,
-            &CheckoutId::master(),
-            from,
-            None,
-            index::LastSynced::AdoptLeaf,
-        )
-        .map_err(MasterError::index)?;
+        self.write_index(from, None, index::LastSynced::AdoptLeaf)?;
         self.index_ancestors(to)?;
-        index::commit_leaf(
-            &self.store,
-            &CheckoutId::master(),
-            to,
-            Some(to_new),
-            index::LastSynced::AdoptLeaf,
-        )
-        .map_err(MasterError::index)?;
+        self.write_index(to, Some(to_new), index::LastSynced::AdoptLeaf)?;
         if to_new.kind == EntryKind::Dir {
             self.reindex_descendants(to, index::LastSynced::AdoptLeaf)?;
         }
@@ -1153,14 +1151,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             else {
                 continue;
             };
-            index::commit_leaf(
-                &self.store,
-                &CheckoutId::master(),
-                &dir,
-                Some(&found),
-                index::LastSynced::AdoptLeaf,
-            )
-            .map_err(MasterError::index)?;
+            self.write_index(&dir, Some(&found), index::LastSynced::AdoptLeaf)?;
         }
         Ok(())
     }
@@ -1247,14 +1238,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             if current.as_ref() == Some(&found) {
                 continue;
             }
-            index::commit_leaf(
-                &self.store,
-                &CheckoutId::master(),
-                &path,
-                Some(&found),
-                last_synced,
-            )
-            .map_err(MasterError::index)?;
+            self.write_index(&path, Some(&found), last_synced)?;
         }
         Ok(())
     }
