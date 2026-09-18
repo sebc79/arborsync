@@ -11,7 +11,7 @@ use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::path::local_to_canonical;
 use arborsync_core::slave::{Reply, Slave, SlaveError, WholeFileLater};
 use arborsync_core::storage::Storage;
-use arborsync_core::transport::{Transport, client_endpoint, connect};
+use arborsync_core::transport::{Transport, client_endpoint, connect, read_bulk, stream_err};
 use arborsync_core::watch::to_local_events;
 use arborsync_core::{CanonicalPath, LoadedSlave, RedbStorage, ReloadError, SlaveReload};
 use notify::RecursiveMode;
@@ -240,8 +240,9 @@ async fn session(
                 let msg = msg?;
                 dispatch_slave(&conn, &mut send, slave.lock().expect("slave").handle(msg)?).await?;
             }
-            incoming = conn.accept_bulk() => {
-                let (header, body) = incoming?;
+            incoming = conn.accept_uni() => {
+                let mut recv = incoming.map_err(stream_err)?;
+                let (header, body) = read_bulk(&mut recv).await?;
                 dispatch_slave(
                     &conn,
                     &mut send,

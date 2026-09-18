@@ -298,7 +298,7 @@ There is no `latest-wins` / `local-wins` / `manual` policy knob and no `max_upda
 
 Recipient-driven. Never compute a forward delta against a cached snapshot of the other side.
 
-1. After a successful CAS decision (or a pull the slave already knows it wants), the **recipient** of bytes sends `SignatureRequest { checkout_id, path, want_hash, signature }` where `signature` is `copia`’s signature of the local basis, or empty if there is no basis / size < 4 KiB / first create / symlink.
+1. After a successful CAS decision (or a pull the slave already knows it wants), the **recipient** of bytes sends `SignatureRequest { checkout_id, path, want_hash, signature }` where `signature` is `copia`’s signature of the local basis, or empty if there is no basis / size < 4 KiB / first create / symlink / `encode_control` of that request would exceed 1 MiB. An empty signature means the sender must use `encoding = Whole`.
 2. Sender replies on a **bulk stream**: raw file bytes (`Whole`), symlink target bytes (`Whole`), or a `copia` delta (`Delta`). Directories have no bulk transfer.
 3. Recipient verifies BLAKE3 == `want_hash` before rename (`want_hash` is `content_hash`, not `FileNode`).
 
@@ -579,6 +579,8 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §8 sidecar only for the content-hash loser | Slave announce apply, `CasReject`, and incoming `Delete` use `sidecar_if_content_differs`. Delete compares live `content_hash` with the last-synced content hash. Master `publish` does not sidecar a successful replace. |
 | ✅ | §8 children-first directory delete | `remove_live` removes each child, then `remove_dir`. Files and symlinks use `remove_file`. |
 | ✅ | §9 patch from the live file into tmp | Specified as built. Spec §8 says never patch in place. `reconstruct` patches in RAM, then `atomic_put` writes the whole buffer. |
+| ✅ | §9 / §11 signature fits the control frame | `signature_request` omits the `copia` signature when `encode_control` would exceed 1 MiB. The recipient then asks for `Whole`. An oversized `SignatureRequest` used to fail `encode_control` and drop the session. |
+| ✅ | §11 bulk read is not cancelled by `select!` | Master and slave `accept_uni` inside `select!`, then `read_bulk` after that arm wins. Cancelling `accept_bulk` mid-body dropped the `RecvStream` and Quinn sent `STOP_SENDING` 0. |
 | ✅ | §10 `SubscribeReject` | Slave stores `denied_centrals`. `subscribe()` omits those centrals. On `SubscribeReject`, insert, log, and `Reply::Send(vec![subscribe()])` if any checkout remains, else `Reply::Hangup`. Cleared on a checkout or pin reload. Master prefix-deny stays `SubscribeReject`. |
 | ✅ | §12 one live connection per `slave_id` | Replacing a session `close`s the previous `Connection` and signals the old task. |
 | ✅ | §12 `Transport` trait | `Transport` is a live session. It exposes the peer static key, one control stream pair, on-demand bulk, and `close`. `impl Transport for quinn::Connection` is the QUIC path. The master and slave binaries and `core/tests/transport.rs` call the trait. `MemoryTransport::pair` is the in-memory test impl. Most unit tests still call `handle`. |
