@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::hash::{DirNode, SubtreeRoot};
-use crate::merkle::{DirChild, dir_node, empty_dir_node, file_node};
+use crate::merkle::{dir_node, empty_dir_node, file_node, DirChild};
 use crate::meta::{EntryKind, FileMetadata};
 use crate::path::{CanonicalPath, EntryName};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
@@ -12,15 +12,14 @@ pub enum LastSynced {
     Keep,
 }
 
-struct Pending<'a> {
-    path: &'a CanonicalPath,
-    meta: Option<&'a FileMetadata>,
+pub struct LeafChange<'a> {
+    pub path: &'a CanonicalPath,
+    pub meta: Option<&'a FileMetadata>,
+    pub last_synced: LastSynced,
 }
 
 /// Commit one leaf and every directory hash it changes in a single batch.
 /// `leaf` of `None` removes the path and, for a directory, everything under it.
-/// A file or symlink leaf drops the path prefix first so a type change cannot
-/// leave descendants.
 pub fn commit_leaf<S: Storage>(
     store: &S,
     ck: &CheckoutId,
@@ -28,53 +27,53 @@ pub fn commit_leaf<S: Storage>(
     leaf: Option<&FileMetadata>,
     last_synced: LastSynced,
 ) -> Result<(), S::Error> {
-    let pending = Pending { path, meta: leaf };
+    commit_leaves(
+        store,
+        ck,
+        [LeafChange {
+            path,
+            meta: leaf,
+            last_synced,
+        }],
+    )
+}
+
+/// Commit many leaves and recompute each dirty directory once.
+pub fn commit_leaves<'a, S: Storage>(
+    store: &S,
+    ck: &CheckoutId,
+    changes: impl IntoIterator<Item = LeafChange<'a>>,
+) -> Result<(), S::Error> {
+    let changes: Vec<LeafChange<'a>> = changes.into_iter().collect();
+    if changes.is_empty() {
+        return Ok(());
+    }
+
+    let overlay: HashMap<CanonicalPath, Option<&FileMetadata>> = changes
+        .iter()
+        .map(|change| (change.path.clone(), change.meta))
+        .collect();
     let mut computed: HashMap<CanonicalPath, DirNode> = HashMap::new();
     let mut batch = store.begin_write()?;
 
-    match leaf {
-        Some(meta) if meta.kind == EntryKind::Dir => {
-            let node = recompute(store, ck, path, &pending, &computed)?;
-            computed.insert(path.clone(), node);
-            batch.put_meta(ck, path, meta)?;
-            batch.put_dir_node(ck, path, node)?;
-            if last_synced == LastSynced::AdoptLeaf {
-                batch.put_last_synced(ck, path, file_node(meta), Some(meta.content_hash))?;
-            }
-        }
-        Some(meta) => {
-            let kept = match last_synced {
-                LastSynced::Keep => {
-                    let node = store.get_last_synced(ck, path)?;
-                    let content = store.get_last_synced_content(ck, path)?;
-                    node.map(|node| (node, content))
-                }
-                LastSynced::AdoptLeaf => None,
-            };
-            batch.purge_prefix(ck, path)?;
-            batch.put_meta(ck, path, meta)?;
-            match last_synced {
-                LastSynced::AdoptLeaf => {
-                    batch.put_last_synced(ck, path, file_node(meta), Some(meta.content_hash))?;
-                }
-                LastSynced::Keep => {
-                    if let Some((node, content)) = kept {
-                        batch.put_last_synced(ck, path, node, content)?;
-                    }
-                }
-            }
-        }
-        None if last_synced == LastSynced::Keep => {
-            batch.del_meta_prefix(ck, path)?;
-            batch.del_dir_prefix(ck, path)?;
-        }
-        None => batch.purge_prefix(ck, path)?,
+    for change in &changes {
+        apply_leaf(store, &mut batch, ck, change)?;
     }
 
-    for ancestor in path.ancestors() {
-        let node = recompute(store, ck, &ancestor, &pending, &computed)?;
-        computed.insert(ancestor.clone(), node);
-        batch.put_dir_node(ck, &ancestor, node)?;
+    let mut dirty = HashSet::new();
+    for change in &changes {
+        if matches!(change.meta, Some(meta) if meta.kind == EntryKind::Dir) {
+            dirty.insert(change.path.clone());
+        }
+        dirty.extend(change.path.ancestors());
+    }
+    let mut dirty: Vec<CanonicalPath> = dirty.into_iter().collect();
+    dirty.sort_by_key(|path| std::cmp::Reverse(depth(path)));
+
+    for dir in dirty {
+        let node = recompute(store, ck, &dir, &overlay, &computed)?;
+        computed.insert(dir.clone(), node);
+        batch.put_dir_node(ck, &dir, node)?;
     }
     batch.commit()
 }
@@ -97,22 +96,87 @@ pub fn subtree_root<S: Storage>(
 
 pub fn root_is_dirty<S: Storage>(store: &S, ck: &CheckoutId) -> Result<bool, S::Error> {
     let root = CanonicalPath::root();
-    let nothing_pending = Pending {
-        path: &root,
-        meta: None,
-    };
-    let recomputed = recompute(store, ck, &root, &nothing_pending, &HashMap::new())?;
+    let recomputed = recompute(store, ck, &root, &HashMap::new(), &HashMap::new())?;
     Ok(store.get_dir_node(ck, &root)? != Some(recomputed))
+}
+
+fn apply_leaf<S: Storage>(
+    store: &S,
+    batch: &mut S::WriteBatch<'_>,
+    ck: &CheckoutId,
+    change: &LeafChange<'_>,
+) -> Result<(), S::Error> {
+    match change.meta {
+        Some(meta) if meta.kind == EntryKind::Dir => {
+            batch.put_meta(ck, change.path, meta)?;
+            if change.last_synced == LastSynced::AdoptLeaf {
+                batch.put_last_synced(ck, change.path, file_node(meta), Some(meta.content_hash))?;
+            }
+        }
+        Some(meta) => {
+            let kept = match change.last_synced {
+                LastSynced::Keep => {
+                    let node = store.get_last_synced(ck, change.path)?;
+                    let content = store.get_last_synced_content(ck, change.path)?;
+                    node.map(|node| (node, content))
+                }
+                LastSynced::AdoptLeaf => None,
+            };
+            vacate_replaced_dir(store, batch, ck, change.path)?;
+            batch.put_meta(ck, change.path, meta)?;
+            match change.last_synced {
+                LastSynced::AdoptLeaf => {
+                    batch.put_last_synced(
+                        ck,
+                        change.path,
+                        file_node(meta),
+                        Some(meta.content_hash),
+                    )?;
+                }
+                LastSynced::Keep => {
+                    if let Some((node, content)) = kept {
+                        batch.put_last_synced(ck, change.path, node, content)?;
+                    }
+                }
+            }
+        }
+        None if change.last_synced == LastSynced::Keep => {
+            batch.del_meta_prefix(ck, change.path)?;
+            batch.del_dir_prefix(ck, change.path)?;
+        }
+        None => batch.purge_prefix(ck, change.path)?,
+    }
+    Ok(())
+}
+
+fn vacate_replaced_dir<S: Storage>(
+    store: &S,
+    batch: &mut S::WriteBatch<'_>,
+    ck: &CheckoutId,
+    path: &CanonicalPath,
+) -> Result<(), S::Error> {
+    if matches!(store.get_meta(ck, path)?, Some(old) if old.kind == EntryKind::Dir) {
+        batch.purge_prefix(ck, path)?;
+    }
+    Ok(())
+}
+
+fn depth(path: &CanonicalPath) -> usize {
+    if path.as_str() == "/" {
+        0
+    } else {
+        path.as_str().bytes().filter(|&byte| byte == b'/').count()
+    }
 }
 
 fn recompute<S: Storage>(
     store: &S,
     ck: &CheckoutId,
     dir: &CanonicalPath,
-    pending: &Pending<'_>,
+    overlay: &HashMap<CanonicalPath, Option<&FileMetadata>>,
     computed: &HashMap<CanonicalPath, DirNode>,
 ) -> Result<DirNode, S::Error> {
-    Ok(dir_node(&children_of(store, ck, dir, pending, computed)?))
+    Ok(dir_node(&children_of(store, ck, dir, overlay, computed)?))
 }
 
 pub(crate) fn list_children<S: Storage>(
@@ -120,28 +184,26 @@ pub(crate) fn list_children<S: Storage>(
     ck: &CheckoutId,
     dir: &CanonicalPath,
 ) -> Result<Vec<DirChild>, S::Error> {
-    let unused = Pending {
-        path: dir,
-        meta: None,
-    };
-    children_of(store, ck, dir, &unused, &HashMap::new())
+    children_of(store, ck, dir, &HashMap::new(), &HashMap::new())
 }
 
 fn children_of<S: Storage>(
     store: &S,
     ck: &CheckoutId,
     dir: &CanonicalPath,
-    pending: &Pending<'_>,
+    overlay: &HashMap<CanonicalPath, Option<&FileMetadata>>,
     computed: &HashMap<CanonicalPath, DirNode>,
 ) -> Result<Vec<DirChild>, S::Error> {
     let mut children: Vec<(CanonicalPath, FileMetadata)> = store
         .range_meta(ck, dir)?
         .into_iter()
-        .filter(|(path, _)| path.parent().as_ref() == Some(dir) && path != pending.path)
+        .filter(|(path, _)| path.parent().as_ref() == Some(dir) && !overlay.contains_key(path))
         .collect();
-    if let (Some(meta), Some(parent)) = (pending.meta, pending.path.parent()) {
-        if &parent == dir {
-            children.push((pending.path.clone(), meta.clone()));
+    for (path, meta) in overlay {
+        if let (Some(meta), Some(parent)) = (meta, path.parent()) {
+            if &parent == dir {
+                children.push((path.clone(), (*meta).clone()));
+            }
         }
     }
 
@@ -177,7 +239,7 @@ fn children_of<S: Storage>(
 mod tests {
     use super::*;
     use crate::hash::ContentHash;
-    use crate::test_support::{MemoryStorage, p};
+    use crate::test_support::{p, MemoryStorage};
 
     fn file(byte: u8) -> FileMetadata {
         FileMetadata::file(1, 0, 0o100644, ContentHash::from_bytes([byte; 32]))
@@ -239,5 +301,51 @@ mod tests {
         commit_leaf(&store, &ck, &dir_path, Some(&leaf), LastSynced::AdoptLeaf).unwrap();
         assert_eq!(store.get_meta(&ck, &child).unwrap(), None);
         assert_eq!(store.get_meta(&ck, &dir_path).unwrap().unwrap(), leaf);
+    }
+
+    #[test]
+    fn commit_leaves_matches_repeated_commit_leaf() {
+        let sequential = MemoryStorage::new();
+        let batched = MemoryStorage::new();
+        let ck = CheckoutId::new("src");
+        let dir = p("/src");
+        let dir_meta = FileMetadata::directory(0, 0o040755);
+        let files: Vec<(CanonicalPath, FileMetadata)> = (0..8)
+            .map(|i| (p(&format!("/src/f{i:02}")), file(i as u8 + 1)))
+            .collect();
+
+        commit_leaf(&sequential, &ck, &dir, Some(&dir_meta), LastSynced::Keep).unwrap();
+        for (path, meta) in &files {
+            commit_leaf(&sequential, &ck, path, Some(meta), LastSynced::Keep).unwrap();
+        }
+
+        let mut changes = vec![LeafChange {
+            path: &dir,
+            meta: Some(&dir_meta),
+            last_synced: LastSynced::Keep,
+        }];
+        changes.extend(files.iter().map(|(path, meta)| LeafChange {
+            path,
+            meta: Some(meta),
+            last_synced: LastSynced::Keep,
+        }));
+        commit_leaves(&batched, &ck, changes).unwrap();
+
+        assert_eq!(
+            sequential.range_meta(&ck, &p("/")).unwrap(),
+            batched.range_meta(&ck, &p("/")).unwrap()
+        );
+        assert_eq!(
+            sequential.get_dir_node(&ck, &dir).unwrap(),
+            batched.get_dir_node(&ck, &dir).unwrap()
+        );
+        assert_eq!(
+            sequential.get_dir_node(&ck, &p("/")).unwrap(),
+            batched.get_dir_node(&ck, &p("/")).unwrap()
+        );
+        assert_ne!(
+            sequential.get_dir_node(&ck, &dir).unwrap(),
+            Some(empty_dir_node())
+        );
     }
 }

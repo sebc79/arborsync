@@ -10,14 +10,14 @@ use crate::config::{ConfigError, LoadedSlave, ReloadError, SlaveReload};
 use crate::hash::{ContentHash, FileNode};
 use crate::index;
 use crate::inflight::Inflight;
-use crate::merkle::{DirChild, file_node};
-use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
+use crate::merkle::{file_node, DirChild};
+use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
 use crate::path::{
-    CanonicalPath, PathError, canonical_to_host, conflict_sidecar_path, is_reserved_root_entry,
-    join_central, local_paths_overlap, strip_central,
+    canonical_to_host, conflict_sidecar_path, is_reserved_root_entry, join_central,
+    local_paths_overlap, strip_central, CanonicalPath, PathError,
 };
 use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
-use crate::reconcile::{WalkAction, decide_child};
+use crate::reconcile::{decide_child, WalkAction};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
 use crate::transfer::{self, BulkTransfer};
 use crate::watch::LocalEvent;
@@ -489,29 +489,35 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             (checkout.id.clone(), checkout.central.clone())
         };
         let disk = self.walk_checkout(checkout_id)?;
-        let indexed = self
+        let indexed: BTreeMap<_, _> = self
             .store
             .range_meta(&ck, &central)
-            .map_err(SlaveError::index)?;
+            .map_err(SlaveError::index)?
+            .into_iter()
+            .collect();
 
-        for (path, _) in indexed {
-            if disk.contains_key(&path) {
+        let mut changes = Vec::new();
+        for path in indexed.keys() {
+            if disk.contains_key(path) {
                 continue;
             }
-            if self.meta(checkout_id, &path)?.is_none() {
-                continue;
-            }
-            index::commit_leaf(&self.store, &ck, &path, None, index::LastSynced::Keep)
-                .map_err(SlaveError::index)?;
+            changes.push(index::LeafChange {
+                path,
+                meta: None,
+                last_synced: index::LastSynced::Keep,
+            });
         }
         for (path, found) in &disk {
-            let current = self.meta(checkout_id, path)?;
-            if current.as_ref() == Some(found) {
+            if indexed.get(path) == Some(found) {
                 continue;
             }
-            index::commit_leaf(&self.store, &ck, path, Some(found), index::LastSynced::Keep)
-                .map_err(SlaveError::index)?;
+            changes.push(index::LeafChange {
+                path,
+                meta: Some(found),
+                last_synced: index::LastSynced::Keep,
+            });
         }
+        index::commit_leaves(&self.store, &ck, changes).map_err(SlaveError::index)?;
         self.root_reports_for(&[checkout_id.to_string()])
     }
 
@@ -1215,16 +1221,18 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         if last_synced == Some(file_node(&found)) {
             return Ok(Vec::new());
         }
-        let ck = self.checkout(checkout_id)?.id.clone();
-        self.index_ancestors(checkout_id, &path)?;
-        index::commit_leaf(
-            &self.store,
-            &ck,
-            &path,
-            Some(&found),
-            index::LastSynced::Keep,
-        )
-        .map_err(SlaveError::index)?;
+        if previous.as_ref() != Some(&found) {
+            let ck = self.checkout(checkout_id)?.id.clone();
+            self.index_ancestors(checkout_id, &path)?;
+            index::commit_leaf(
+                &self.store,
+                &ck,
+                &path,
+                Some(&found),
+                index::LastSynced::Keep,
+            )
+            .map_err(SlaveError::index)?;
+        }
         Ok(vec![ProtocolMessage::FileAnnounce {
             checkout_id: checkout_id.into(),
             path,
