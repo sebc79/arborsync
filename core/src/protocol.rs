@@ -10,9 +10,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const PROTOCOL_PREAMBLE: &[u8] = b"arborsync-v1";
 /// Maximum control frame (header + bincode body). Larger → disconnect.
 pub const MAX_CONTROL_FRAME: usize = 1024 * 1024;
-/// `DirListResponse` payload budget. Leaves headroom under [`MAX_CONTROL_FRAME`]
-/// so a page of names does not fill the whole control frame.
-pub const MAX_DIR_LIST_PAYLOAD: usize = 256 * 1024;
+pub const MAX_DIR_LIST_PAYLOAD: usize = MAX_CONTROL_FRAME / 4;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FrameError {
@@ -182,10 +180,6 @@ fn dir_entry_name_bytes(entry: &DirEntry) -> &[u8] {
 }
 
 /// One `DirListResponse` that `encode_control` can send.
-///
-/// Children are sorted by raw UTF-8 name, then cut so the payload stays at
-/// or under [`MAX_DIR_LIST_PAYLOAD`]. `more` is true when later names remain.
-/// `after` is echoed so the slave can ignore names it already walked.
 pub fn page_dir_list(
     checkout_id: String,
     path: CanonicalPath,
