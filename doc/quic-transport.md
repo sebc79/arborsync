@@ -38,9 +38,11 @@ Quinn gives **byte streams**. Control frame:
 u32be length || bincode(u16 version) || bincode(ProtocolMessage)
 ```
 
-That is the field order of `Envelope`. Maximum control frame: 1 MiB. Larger means disconnect (file bodies do not belong here). Bulk header uses the same length prefix. The body is raw and not length-prefixed again (`size` in the header is authoritative).
+That is the field order of `Envelope`. Maximum control frame: 1 MiB. Larger means disconnect (file bodies do not belong here). If `encode_control` of a `SignatureRequest` would overflow that cap, the signature is omitted and the transfer falls back to `Whole` (`spec.md` §9). Bulk header uses the same length prefix. The body is raw and not length-prefixed again (`size` in the header is authoritative).
 
 One message per bulk stream. Close the stream after the body. Control stream stays open for the session.
+
+The master and slave binaries wait on `accept_uni` inside `select!`, then read the body after that arm wins. Putting `accept_bulk` (accept plus the body read) in the same `select!` as the 50 ms outbox tick dropped the `RecvStream` mid-body. Quinn then sent `STOP_SENDING` error 0, which the slave logs as `stream: sending stopped by peer: error 0`.
 
 Keep-alive: Quinn idle timeout stays at the RFC 9308 default of 30 s. `listen` and `client_endpoint` set `keep_alive_interval` to 10 s so a quiet control stream does not hit that timeout. No `Heartbeat` message.
 

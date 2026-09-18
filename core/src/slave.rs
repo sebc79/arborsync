@@ -19,7 +19,7 @@ use crate::path::{
 use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
 use crate::reconcile::{WalkAction, decide_child};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
-use crate::transfer::{self, BulkTransfer, signature_for};
+use crate::transfer::{self, BulkTransfer};
 use crate::watch::LocalEvent;
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
@@ -743,7 +743,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                         let host = self.host_for(checkout_id, &path)?;
                         apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))?
                     };
-                    let signature = signature_for(new.kind, live.as_deref());
+                    let kind = new.kind;
                     let want_hash = new.content_hash;
                     self.pending.insert(
                         (checkout_id.to_string(), path.clone()),
@@ -754,12 +754,13 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                             retried: false,
                         },
                     );
-                    return Ok(Reply::Send(vec![ProtocolMessage::SignatureRequest {
-                        checkout_id: checkout_id.into(),
+                    return Ok(Reply::Send(vec![transfer::signature_request(
+                        checkout_id,
                         path,
                         want_hash,
-                        signature,
-                    }]));
+                        kind,
+                        live.as_deref(),
+                    )]));
                 }
                 ContentBytes::Whole(body) => self.finish_apply(checkout_id, path, new, &body),
             },
@@ -810,7 +811,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         signature: Vec<u8>,
     ) -> Result<Reply, SlaveError> {
         let host = self.host_for(&checkout_id, &path)?;
-        let Some(source) = apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))? else {
+        let Some(source) = apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))?
+        else {
             return Ok(Reply::Send(vec![ProtocolMessage::Error {
                 code: "missing_hash".into(),
                 message: path.as_str().into(),

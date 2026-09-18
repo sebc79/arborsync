@@ -5,7 +5,7 @@ use copia::{Sync, SyncBuilder};
 use crate::hash::ContentHash;
 use crate::meta::{EntryKind, hash_bytes};
 use crate::path::CanonicalPath;
-use crate::protocol::{BulkEncoding, BulkHeader};
+use crate::protocol::{BulkEncoding, BulkHeader, ProtocolMessage, encode_control};
 
 pub const MIN_DELTA_BASIS: u64 = 4096;
 
@@ -104,10 +104,33 @@ pub fn reconstruct(
     }
 }
 
-pub fn signature_for(kind: EntryKind, live: Option<&[u8]>) -> Vec<u8> {
-    match (ask_kind(kind, live.map(|b| b.len() as u64)), live) {
+pub fn signature_request(
+    checkout_id: impl Into<String>,
+    path: CanonicalPath,
+    want_hash: ContentHash,
+    kind: EntryKind,
+    live: Option<&[u8]>,
+) -> ProtocolMessage {
+    let checkout_id = checkout_id.into();
+    let signature = match (ask_kind(kind, live.map(|b| b.len() as u64)), live) {
         (AskKind::Delta, Some(bytes)) => signature_bytes(bytes).unwrap_or_default(),
         _ => Vec::new(),
+    };
+    let msg = ProtocolMessage::SignatureRequest {
+        checkout_id: checkout_id.clone(),
+        path: path.clone(),
+        want_hash,
+        signature,
+    };
+    if encode_control(&msg).is_ok() {
+        msg
+    } else {
+        ProtocolMessage::SignatureRequest {
+            checkout_id,
+            path,
+            want_hash,
+            signature: Vec::new(),
+        }
     }
 }
 

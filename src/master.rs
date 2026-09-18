@@ -11,7 +11,7 @@ use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::master::{Master, Reply, WholeFileLater};
 use arborsync_core::path::host_to_canonical;
 use arborsync_core::storage::Storage;
-use arborsync_core::transport::{AttemptLimiter, Transport, listen};
+use arborsync_core::transport::{AttemptLimiter, Transport, listen, read_bulk, stream_err};
 use arborsync_core::watch::to_local_events;
 use arborsync_core::{LoadedMaster, RedbStorage};
 use notify::RecursiveMode;
@@ -228,8 +228,9 @@ async fn accept_session(
                     break;
                 }
             }
-            incoming = conn.accept_bulk() => {
-                let (header, body) = incoming?;
+            incoming = conn.accept_uni() => {
+                let mut recv = incoming.map_err(stream_err)?;
+                let (header, body) = read_bulk(&mut recv).await?;
                 let reply = master.lock().expect("master").apply_bulk(peer, header, &body)?;
                 if dispatch_master(&master, peer, &slave_id, &conn, &mut send, reply, &limiter, ip).await? {
                     break;

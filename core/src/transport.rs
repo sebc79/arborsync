@@ -28,7 +28,7 @@ fn session_transport_config() -> Arc<TransportConfig> {
     Arc::new(cfg)
 }
 
-fn stream_err(err: impl std::error::Error) -> TransportError {
+pub fn stream_err(err: impl std::error::Error) -> TransportError {
     let mut msg = err.to_string();
     let mut cur = err.source();
     while let Some(src) = cur {
@@ -349,7 +349,7 @@ impl Transport for MemoryTransport {
     }
 }
 
-async fn read_bulk(recv: &mut RecvStream) -> Result<(BulkHeader, Vec<u8>), TransportError> {
+pub async fn read_bulk(recv: &mut RecvStream) -> Result<(BulkHeader, Vec<u8>), TransportError> {
     let mut len_bytes = [0u8; 4];
     recv.read_exact(&mut len_bytes).await.map_err(stream_err)?;
     let len = u32::from_be_bytes(len_bytes) as usize;

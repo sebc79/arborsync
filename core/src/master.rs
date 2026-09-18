@@ -21,7 +21,7 @@ use crate::path::{
 };
 use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
 use crate::storage::{CheckoutId, Storage};
-use crate::transfer::{self, BulkTransfer, signature_for};
+use crate::transfer::{self, BulkTransfer};
 use crate::watch::LocalEvent;
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
@@ -815,7 +815,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                         let host = canonical_to_host(&self.central_root, &path);
                         apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))?
                     };
-                    let signature = signature_for(new.kind, live.as_deref());
+                    let kind = new.kind;
                     let want_hash = new.content_hash;
                     self.pending.insert(
                         (checkout_id.clone(), path.clone()),
@@ -832,12 +832,13 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                             retried: false,
                         },
                     );
-                    return Ok(ProtocolMessage::SignatureRequest {
+                    return Ok(transfer::signature_request(
                         checkout_id,
                         path,
                         want_hash,
-                        signature,
-                    });
+                        kind,
+                        live.as_deref(),
+                    ));
                 }
                 ContentBytes::Whole(body) => {
                     self.publish(&path, &new, current.as_ref(), &body)?;
@@ -1288,7 +1289,8 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             return Ok(Reply::Send(outside_central(&path)));
         }
         let host = canonical_to_host(&self.central_root, &path);
-        let Some(source) = apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))? else {
+        let Some(source) = apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))?
+        else {
             return Ok(Reply::Send(missing_hash(&path)));
         };
         match transfer::fulfill(checkout_id, path.clone(), want_hash, &source, &signature) {

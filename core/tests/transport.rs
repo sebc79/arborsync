@@ -189,6 +189,149 @@ async fn memory_control_roundtrip() {
 }
 
 #[tokio::test]
+async fn quic_bulk_roundtrip_two_megabytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let _master_pub = write_key(dir.path(), "master.key");
+    let _slave_pub = write_key(dir.path(), "slave.key");
+    let master_secret = arborsync_core::read_static_key(dir.path().join("master.key")).unwrap();
+    let slave_secret = arborsync_core::read_static_key(dir.path().join("slave.key")).unwrap();
+
+    let server = listen(SocketAddr::from(([127, 0, 0, 1], 0)), &master_secret).unwrap();
+    let addr = server.local_addr().unwrap();
+    let client = client_endpoint(&slave_secret).unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("accept").await.expect("hs");
+        conn.accept_bulk().await.expect("accept bulk")
+    });
+
+    let conn = connect(&client, addr).await.unwrap();
+    let body = vec![0x5a; 2 << 20];
+    let want_hash = hash_bytes(&body);
+    let xfer = BulkTransfer {
+        header: BulkHeader {
+            path: p("/src/two.bin"),
+            checkout_id: "src".into(),
+            want_hash,
+            encoding: BulkEncoding::Whole,
+            size: body.len() as u64,
+        },
+        body,
+    };
+    conn.write_bulk(&xfer).await.expect("write bulk");
+    let (header, got) = server_task.await.unwrap();
+    assert_eq!(header.size, 2 << 20);
+    assert_eq!(got.len(), 2 << 20);
+    assert_eq!(hash_bytes(&got), want_hash);
+}
+
+#[tokio::test]
+async fn quic_bulk_two_megabytes_after_control_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = write_key(dir.path(), "master.key");
+    let _ = write_key(dir.path(), "slave.key");
+    let master_secret = arborsync_core::read_static_key(dir.path().join("master.key")).unwrap();
+    let slave_secret = arborsync_core::read_static_key(dir.path().join("slave.key")).unwrap();
+
+    let server = listen(SocketAddr::from(([127, 0, 0, 1], 0)), &master_secret).unwrap();
+    let addr = server.local_addr().unwrap();
+    let client = client_endpoint(&slave_secret).unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("accept").await.expect("hs");
+        let (mut send, mut recv) = conn.accept_control().await.unwrap();
+        let _ = Connection::read_control(&mut recv).await.unwrap();
+        Connection::write_control(
+            &mut send,
+            &ProtocolMessage::Disconnect {
+                reason: "ack".into(),
+            },
+        )
+        .await
+        .unwrap();
+        conn.accept_bulk().await.expect("accept bulk")
+    });
+
+    let conn = connect(&client, addr).await.unwrap();
+    let (mut send, mut recv) = conn.open_control().await.unwrap();
+    Connection::write_control(
+        &mut send,
+        &ProtocolMessage::Disconnect {
+            reason: "hi".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let _ = Connection::read_control(&mut recv).await.unwrap();
+    let body = vec![0x5a; 2 << 20];
+    let want_hash = hash_bytes(&body);
+    let xfer = BulkTransfer {
+        header: BulkHeader {
+            path: p("/src/two.bin"),
+            checkout_id: "src".into(),
+            want_hash,
+            encoding: BulkEncoding::Whole,
+            size: body.len() as u64,
+        },
+        body,
+    };
+    conn.write_bulk(&xfer)
+        .await
+        .expect("write bulk after control");
+    let (header, got) = server_task.await.unwrap();
+    assert_eq!(header.size, 2 << 20);
+    assert_eq!(hash_bytes(&got), want_hash);
+}
+
+#[tokio::test]
+async fn quic_bulk_survives_a_50ms_select_tick() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = write_key(dir.path(), "master.key");
+    let _ = write_key(dir.path(), "slave.key");
+    let master_secret = arborsync_core::read_static_key(dir.path().join("master.key")).unwrap();
+    let slave_secret = arborsync_core::read_static_key(dir.path().join("slave.key")).unwrap();
+
+    let server = listen(SocketAddr::from(([127, 0, 0, 1], 0)), &master_secret).unwrap();
+    let addr = server.local_addr().unwrap();
+    let client = client_endpoint(&slave_secret).unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("accept").await.expect("hs");
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+        loop {
+            tokio::select! {
+                incoming = conn.accept_uni() => {
+                    let mut recv = incoming.expect("uni");
+                    return arborsync_core::transport::read_bulk(&mut recv)
+                        .await
+                        .expect("read bulk");
+                }
+                _ = tick.tick() => {}
+            }
+        }
+    });
+
+    let conn = connect(&client, addr).await.unwrap();
+    let body = vec![0x5a; 2 << 20];
+    let want_hash = hash_bytes(&body);
+    conn.write_bulk(&BulkTransfer {
+        header: BulkHeader {
+            path: p("/src/two.bin"),
+            checkout_id: "src".into(),
+            want_hash,
+            encoding: BulkEncoding::Whole,
+            size: body.len() as u64,
+        },
+        body,
+    })
+    .await
+    .expect("write bulk under tick");
+    let (header, got) = server_task.await.unwrap();
+    assert_eq!(header.size, 2 << 20);
+    assert_eq!(hash_bytes(&got), want_hash);
+}
+
+#[tokio::test]
 async fn memory_bulk_roundtrip() {
     let (left, right) = MemoryTransport::pair([0x11u8; 32], [0x22u8; 32]);
     let body = b"hello".to_vec();
