@@ -61,7 +61,7 @@ No `conflict_resolution` knob, no `max_conflict_files_per_dir`, no `max_update_a
 
 Never patch in place. Crash between rename and index: rescan sees the new bytes; reconcile sets `last_synced`.
 
-Directory create: `create_dir_all` + mode + mtime, then index.  
+Directory create: `create_dir_all` + mode + mtime, then index. `PermissionDenied` on mode or mtime is a warn. The directory stays and the apply continues. A missing parent or a create failure still fails the apply.  
 Directory delete: children first (index prefix delete + FS remove), then `remove_dir`. Files and symlinks use `remove_file`.  
 File delete: `remove_file` after the CAS check.
 
@@ -71,7 +71,7 @@ Type change deletes the old kind, then creates the new kind, in one master accep
 
 Recipient-driven (`spec.md` §9). After the slave (or master) **decides it will apply** `want_hash`:
 
-1. If no local basis, basis size < 4 KiB, or kind is symlink: `SignatureRequest` with empty `signature` → sender opens a bulk stream `encoding = Whole`.
+1. If no local basis, basis size < 4 KiB, or kind is symlink: `SignatureRequest` with empty `signature` → sender opens a bulk stream `encoding = Whole`. A `SignatureRequest` for a directory replies `missing_hash`. Directories have no bulk body.
 2. Else: `copia` signature of the live file → bulk `encoding = Delta` → `reconstruct` in RAM → whole write through tmp.
 3. Sender that does not have `want_hash` replies `Error` and the recipient waits for the next reconcile.
 

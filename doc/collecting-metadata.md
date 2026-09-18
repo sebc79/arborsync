@@ -60,7 +60,7 @@ Do not resolve in-tree links during scan, index, or apply. Resolving duplicates 
 
 ## Errors
 
-- `EACCES`: log a warn with the host path, return `None`, continue the walk.
+- `EACCES` / `EPERM` (`PermissionDenied`): log a warn with the host path, return `None`, continue the walk.
 - Transient I/O: specified as retry once, then skip. As built: the error propagates.
 - Non-UTF-8 names: log and skip (matches spec).
 - Partial trees are allowed only when a name is skipped as `None` (special files).

@@ -165,8 +165,7 @@ pub fn mkdir_live(
 ) -> Result<(), ApplyError> {
     let dir = canonical_to_host(central_root, path);
     fs::create_dir_all(&dir).map_err(at(&dir))?;
-    fs::set_permissions(&dir, Permissions::from_mode(meta.mode & 0o7777)).map_err(at(&dir))?;
-    filetime::set_file_mtime(&dir, file_time(meta.mtime_ns)).map_err(at(&dir))
+    apply_mode_and_mtime(&dir, meta)
 }
 
 pub fn rename_live(
@@ -186,11 +185,7 @@ pub fn rename_live(
             let mtime = file_time(meta.mtime_ns);
             filetime::set_symlink_file_times(&to_host, mtime, mtime).map_err(at(&to_host))
         }
-        EntryKind::File | EntryKind::Dir => {
-            fs::set_permissions(&to_host, Permissions::from_mode(meta.mode & 0o7777))
-                .map_err(at(&to_host))?;
-            filetime::set_file_mtime(&to_host, file_time(meta.mtime_ns)).map_err(at(&to_host))
-        }
+        EntryKind::File | EntryKind::Dir => apply_mode_and_mtime(&to_host, meta),
     }
 }
 
@@ -265,7 +260,8 @@ pub fn try_read_file_or_link(host: &Path) -> io::Result<Option<Vec<u8>>> {
         Ok(md) if md.file_type().is_symlink() => {
             Ok(Some(fs::read_link(host)?.as_os_str().as_bytes().to_vec()))
         }
-        Ok(_) => Ok(Some(fs::read(host)?)),
+        Ok(md) if md.file_type().is_file() => Ok(Some(fs::read(host)?)),
+        Ok(_) => Ok(None),
     }
 }
 
@@ -276,6 +272,24 @@ pub fn wipe_tmp(central_root: &Path) -> Result<(), ApplyError> {
         Err(err) => Err(at(&dir)(err)),
         Ok(()) => Ok(()),
     }
+}
+
+fn apply_mode_and_mtime(path: &Path, meta: &FileMetadata) -> Result<(), ApplyError> {
+    if let Err(err) = fs::set_permissions(path, Permissions::from_mode(meta.mode & 0o7777)) {
+        if err.kind() == io::ErrorKind::PermissionDenied {
+            log::warn!("skipping mode on {}: permission denied", path.display());
+        } else {
+            return Err(at(path)(err));
+        }
+    }
+    if let Err(err) = filetime::set_file_mtime(path, file_time(meta.mtime_ns)) {
+        if err.kind() == io::ErrorKind::PermissionDenied {
+            log::warn!("skipping mtime on {}: permission denied", path.display());
+        } else {
+            return Err(at(path)(err));
+        }
+    }
+    Ok(())
 }
 
 fn remove_if_present(path: &Path) -> Result<(), ApplyError> {

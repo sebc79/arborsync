@@ -1616,3 +1616,126 @@ fn rescan_reuses_content_hash_when_only_mode_changes() {
     assert_eq!(second.content_hash, hash_bytes(&bytes));
     assert_ne!(second.mode, first.mode);
 }
+
+#[test]
+fn git_object_fanout_dir_is_indexed_as_dir_and_dir_list_does_not_read_it() {
+    let sandbox = SyncSandbox::new();
+    let objects = sandbox
+        .central_root()
+        .join("src/arborsync/.git/objects/39");
+    std::fs::create_dir_all(&objects).unwrap();
+    std::fs::write(objects.join("deadbeef"), b"blob").unwrap();
+
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master.rescan().unwrap();
+    let path = p("/src/arborsync/.git/objects/39");
+    let meta = master.meta(&path).unwrap().unwrap();
+    assert_eq!(meta.kind, EntryKind::Dir);
+
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::DirListRequest {
+                checkout_id: "src".into(),
+                path: path.clone(),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::DirListResponse { entries, .. }) => {
+            assert!(
+                entries
+                    .iter()
+                    .any(|child| child.name().as_str() == "deadbeef")
+            );
+        }
+        other => panic!("expected DirListResponse, got {other:?}"),
+    }
+}
+
+#[test]
+fn signature_request_for_a_git_object_fanout_dir_is_missing_hash() {
+    let sandbox = SyncSandbox::new();
+    let objects = sandbox
+        .central_root()
+        .join("src/arborsync/.git/objects/39");
+    std::fs::create_dir_all(&objects).unwrap();
+    std::fs::write(objects.join("deadbeef"), b"blob").unwrap();
+
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master.rescan().unwrap();
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let path = p("/src/arborsync/.git/objects/39");
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::SignatureRequest {
+                checkout_id: "src".into(),
+                path: path.clone(),
+                want_hash: ContentHash::ZERO,
+                signature: Vec::new(),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::Error { code, message }) => {
+            assert_eq!(code, "missing_hash");
+            assert_eq!(message, path.as_str());
+        }
+        other => panic!("expected missing_hash, got {other:?}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn directory_cas_survives_when_dir_metadata_is_eperm() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let objects = sandbox
+        .central_root()
+        .join("src/arborsync/.git/objects/39");
+    std::fs::create_dir_all(&objects).unwrap();
+    let flagged = std::process::Command::new("chflags")
+        .args(["uchg", objects.to_str().unwrap()])
+        .status()
+        .expect("chflags");
+    if !flagged.success() {
+        let _ = std::process::Command::new("chflags")
+            .args(["nouchg", objects.to_str().unwrap()])
+            .status();
+        panic!("chflags uchg failed; cannot synthesize EPERM on a directory");
+    }
+
+    let announced = FileMetadata::directory(MTIME, 0o040755);
+    let path = p("/src/arborsync/.git/objects/39");
+    let result = master.handle(
+        ALICE,
+        ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: path.clone(),
+            new: announced.clone(),
+            basis: None,
+        },
+    );
+    let _ = std::process::Command::new("chflags")
+        .args(["nouchg", objects.to_str().unwrap()])
+        .status();
+    match result.unwrap() {
+        Reply::Send(ProtocolMessage::CasAccept {
+            file_node: node, ..
+        }) => assert_eq!(node, Some(file_node(&announced))),
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    assert!(objects.is_dir());
+    assert_eq!(master.meta(&path).unwrap().unwrap().kind, EntryKind::Dir);
+}
