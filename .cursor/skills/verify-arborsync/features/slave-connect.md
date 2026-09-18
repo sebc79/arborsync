@@ -4,7 +4,7 @@ A slave with a matching pin and ACL row opens one QUIC session and logs `connect
 
 ## Sub-features
 
-- `slave-connect` reaches a listening master and stays up.
+- `slave-connect` reaches a listening master and stays up through idle (no file writes) for more than 30 s.
 - `slave-missing-key` names the key path it could not read.
 - `slave-master-down` keeps running while the master is absent.
 - `slave-public-key` logs the public pin `keygen` printed for the slave secret.
@@ -21,7 +21,7 @@ Preconditions:
 - `control-arborsync launch` succeeded.
 - `control-arborsync doctor` reports `slave_pid` alive, `slave_id=dev-alice`, and `checkout_id=src`.
 
-- **Connect.** Inspect the live pair. Run `control-arborsync doctor`. Stdout includes `slave_pid` and `master_addr`. The slave log contains `connected to ` and `slave dev-alice ready`.
+- **Connect.** Inspect the live pair. Run `control-arborsync doctor`. Stdout includes `slave_pid` and `master_addr`. The slave log contains `connected to ` and `slave dev-alice ready`. Wait 40 s without writing files. Neither log contains `stream: connection lost` or `stream: timed out`. The helper uses `rescan_interval_seconds = 3600`, so that wait is idle, not a rescan.
 - **Missing key.** Point a slave TOML at a missing `slave_key_path` and run `target/debug/arborsync slave --config` that file. Exit code is non-zero. Stderr contains `slave.key` (or the path you used).
 - **Master down.** Start a slave whose `master_addr` is a closed local port (see `tests/cli.rs` `slave_keeps_running_while_the_master_is_down`). The process stays up for at least a second and does not exit on its own.
 - **Public key.** After `launch`, read `public_keys` from the `dev-alice` row in `MASTER_CONFIG`. That value is the pin `keygen` printed for `SLAVE_KEY`. The slave log contains that exact string. The pin still prints when the master is down.

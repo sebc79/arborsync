@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig, VarInt};
 use quinn_hyphae::helper::{hyphae_client_endpoint, hyphae_server_endpoint};
 use quinn_hyphae::{HandshakeBuilder, HyphaePeerIdentity, RustCryptoBackend};
 use tokio::sync::mpsc;
@@ -17,6 +17,27 @@ use crate::protocol::{
 use crate::transfer::BulkTransfer;
 
 pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+
+const MAX_IDLE_MS: u32 = 30_000;
+const KEEP_ALIVE: Duration = Duration::from_secs(10);
+
+fn session_transport_config() -> Arc<TransportConfig> {
+    let mut cfg = TransportConfig::default();
+    cfg.max_idle_timeout(Some(VarInt::from_u32(MAX_IDLE_MS).into()));
+    cfg.keep_alive_interval(Some(KEEP_ALIVE));
+    Arc::new(cfg)
+}
+
+fn stream_err(err: impl std::error::Error) -> TransportError {
+    let mut msg = err.to_string();
+    let mut cur = err.source();
+    while let Some(src) = cur {
+        msg.push_str(": ");
+        msg.push_str(&src.to_string());
+        cur = src.source();
+    }
+    TransportError::Stream(msg)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -84,7 +105,7 @@ pub fn listen(addr: SocketAddr, secret: &[u8; 32]) -> Result<Endpoint, Transport
         .with_prologue(PROTOCOL_PREAMBLE)
         .build(RustCryptoBackend)
         .map_err(|err| TransportError::Hyphae(err.to_string()))?;
-    hyphae_server_endpoint(config, None, socket)
+    hyphae_server_endpoint(config, Some(session_transport_config()), socket)
         .map_err(|err| TransportError::Hyphae(err.to_string()))
 }
 
@@ -95,7 +116,7 @@ pub fn client_endpoint(secret: &[u8; 32]) -> Result<Endpoint, TransportError> {
         .with_prologue(PROTOCOL_PREAMBLE)
         .build(RustCryptoBackend)
         .map_err(|err| TransportError::Hyphae(err.to_string()))?;
-    hyphae_client_endpoint(config, None, socket)
+    hyphae_client_endpoint(config, Some(session_transport_config()), socket)
         .map_err(|err| TransportError::Hyphae(err.to_string()))
 }
 
@@ -330,25 +351,19 @@ impl Transport for MemoryTransport {
 
 async fn read_bulk(recv: &mut RecvStream) -> Result<(BulkHeader, Vec<u8>), TransportError> {
     let mut len_bytes = [0u8; 4];
-    recv.read_exact(&mut len_bytes)
-        .await
-        .map_err(|err| TransportError::Stream(err.to_string()))?;
+    recv.read_exact(&mut len_bytes).await.map_err(stream_err)?;
     let len = u32::from_be_bytes(len_bytes) as usize;
     if len > MAX_CONTROL_FRAME {
         return Err(TransportError::Frame(FrameError::TooLarge));
     }
     let mut payload = vec![0u8; len];
-    recv.read_exact(&mut payload)
-        .await
-        .map_err(|err| TransportError::Stream(err.to_string()))?;
+    recv.read_exact(&mut payload).await.map_err(stream_err)?;
     let (header, _): (BulkHeader, usize) =
         bincode::serde::decode_from_slice(&payload, bincode::config::standard())
             .map_err(|err| TransportError::Frame(FrameError::Bincode(err.to_string())))?;
     let mut body = vec![0u8; header.size as usize];
     if !body.is_empty() {
-        recv.read_exact(&mut body)
-            .await
-            .map_err(|err| TransportError::Stream(err.to_string()))?;
+        recv.read_exact(&mut body).await.map_err(stream_err)?;
     }
     Ok((header, body))
 }
@@ -375,15 +390,11 @@ impl Transport for Connection {
     }
 
     async fn open_control(&self) -> Result<(Self::ControlSend, Self::ControlRecv), Self::Error> {
-        self.open_bi()
-            .await
-            .map_err(|err| TransportError::Stream(err.to_string()))
+        self.open_bi().await.map_err(stream_err)
     }
 
     async fn accept_control(&self) -> Result<(Self::ControlSend, Self::ControlRecv), Self::Error> {
-        self.accept_bi()
-            .await
-            .map_err(|err| TransportError::Stream(err.to_string()))
+        self.accept_bi().await.map_err(stream_err)
     }
 
     async fn write_control(
@@ -391,24 +402,18 @@ impl Transport for Connection {
         msg: &ProtocolMessage,
     ) -> Result<(), Self::Error> {
         let frame = protocol::encode_control(msg)?;
-        send.write_all(&frame)
-            .await
-            .map_err(|err| TransportError::Stream(err.to_string()))
+        send.write_all(&frame).await.map_err(stream_err)
     }
 
     async fn read_control(recv: &mut Self::ControlRecv) -> Result<ProtocolMessage, Self::Error> {
         let mut header = [0u8; 4];
-        recv.read_exact(&mut header)
-            .await
-            .map_err(|err| TransportError::Stream(err.to_string()))?;
+        recv.read_exact(&mut header).await.map_err(stream_err)?;
         let len = u32::from_be_bytes(header) as usize;
         if len > MAX_CONTROL_FRAME {
             return Err(TransportError::Frame(FrameError::TooLarge));
         }
         let mut payload = vec![0u8; len];
-        recv.read_exact(&mut payload)
-            .await
-            .map_err(|err| TransportError::Stream(err.to_string()))?;
+        recv.read_exact(&mut payload).await.map_err(stream_err)?;
         let mut frame = Vec::with_capacity(4 + len);
         frame.extend_from_slice(&header);
         frame.extend_from_slice(&payload);
@@ -417,23 +422,14 @@ impl Transport for Connection {
 
     async fn write_bulk(&self, xfer: &BulkTransfer) -> Result<(), Self::Error> {
         let frame = protocol::encode_bulk(&xfer.header, &xfer.body)?;
-        let mut send = self
-            .open_uni()
-            .await
-            .map_err(|err| TransportError::Stream(err.to_string()))?;
-        send.write_all(&frame)
-            .await
-            .map_err(|err| TransportError::Stream(err.to_string()))?;
-        send.finish()
-            .map_err(|err| TransportError::Stream(err.to_string()))?;
+        let mut send = self.open_uni().await.map_err(stream_err)?;
+        send.write_all(&frame).await.map_err(stream_err)?;
+        send.finish().map_err(stream_err)?;
         Ok(())
     }
 
     async fn accept_bulk(&self) -> Result<(BulkHeader, Vec<u8>), Self::Error> {
-        let mut recv = self
-            .accept_uni()
-            .await
-            .map_err(|err| TransportError::Stream(err.to_string()))?;
+        let mut recv = self.accept_uni().await.map_err(stream_err)?;
         read_bulk(&mut recv).await
     }
 }
