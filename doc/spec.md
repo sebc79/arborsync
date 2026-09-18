@@ -313,7 +313,7 @@ After `SubscribeAck`, every rescan interval, and on reconnect:
 1. Slave sends `RootReport { checkout_id, path: central, root }` for each checkout.
 2. Master replies `RootAck { matched, master_root }`.
 3. On mismatch (or empty slave), slave walks:
-   - `DirListRequest` / `DirListResponse` for the directory (`name`, `kind`, `node_hash`).
+   - `DirListRequest` / `DirListResponse` for the directory (`name`, `kind`, `node_hash`). A listing that would exceed the 1 MiB control frame is split. `DirListResponse.more` means later names remain. The slave must not treat those unsent names as absent. It continues with `DirListRequest.after` set to the last name on the page.
    - Name only on master → pull create (or `Mkdir`).
    - Name only on slave → if `last_synced` absent, `FileAnnounce` create; if `last_synced` present and local == it, `Delete`; if local differs, announce CAS (slave thinks it changed) or, if master deleted, slave will `CasReject` and follow §8.
    - Both present, hashes differ → recurse if dir; if file, 3-way on `last_synced`:
@@ -351,8 +351,14 @@ pub enum ProtocolMessage {
 
     RootReport { checkout_id: String, path: String, root: [u8; 32] },
     RootAck { checkout_id: String, path: String, matched: bool, master_root: [u8; 32] },
-    DirListRequest { checkout_id: String, path: String },
-    DirListResponse { checkout_id: String, path: String, entries: Vec<DirEntry> },
+    DirListRequest { checkout_id: String, path: String, after: Option<String> },
+    DirListResponse {
+        checkout_id: String,
+        path: String,
+        after: Option<String>,
+        entries: Vec<DirEntry>,
+        more: bool,
+    },
 
     FileAnnounce {
         checkout_id: String,           // origin (slave→master) or target (master→slave)
@@ -580,6 +586,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §8 children-first directory delete | `remove_live` removes each child, then `remove_dir`. Files and symlinks use `remove_file`. |
 | ✅ | §9 patch from the live file into tmp | Specified as built. Spec §8 says never patch in place. `reconstruct` patches in RAM, then `atomic_put` writes the whole buffer. |
 | ✅ | §9 / §11 signature fits the control frame | `signature_request` omits the `copia` signature when `encode_control` would exceed 1 MiB. The recipient then asks for `Whole`. An oversized `SignatureRequest` used to fail `encode_control` and drop the session. |
+| ✅ | §10 / §11 DirList fits the control frame | `page_dir_list` splits a directory listing so each `DirListResponse` encodes at or under 256 KiB (`MAX_DIR_LIST_PAYLOAD`). `more` keeps the slave from treating unsent names as master-absent. An unpaged 50k-file listing used to fail `encode_control` and drop the session. |
 | ✅ | §11 bulk read is not cancelled by `select!` | Master and slave `accept_uni` inside `select!`, then `read_bulk` after that arm wins. Cancelling `accept_bulk` mid-body dropped the `RecvStream` and Quinn sent `STOP_SENDING` 0. |
 | ✅ | §10 `SubscribeReject` | Slave stores `denied_centrals`. `subscribe()` omits those centrals. On `SubscribeReject`, insert, log, and `Reply::Send(vec![subscribe()])` if any checkout remains, else `Reply::Hangup`. Cleared on a checkout or pin reload. Master prefix-deny stays `SubscribeReject`. |
 | ✅ | §12 one live connection per `slave_id` | Replacing a session `close`s the previous `Connection` and signals the old task. |

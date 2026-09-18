@@ -3,13 +3,16 @@ use serde::{Deserialize, Serialize};
 use crate::hash::{ContentHash, FileNode, SubtreeRoot};
 use crate::merkle::DirChild;
 use crate::meta::FileMetadata;
-use crate::path::CanonicalPath;
+use crate::path::{CanonicalPath, EntryName};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 /// First Noise payload / preamble. Hyphae has no ALPN.
 pub const PROTOCOL_PREAMBLE: &[u8] = b"arborsync-v1";
 /// Maximum control frame (header + bincode body). Larger → disconnect.
 pub const MAX_CONTROL_FRAME: usize = 1024 * 1024;
+/// `DirListResponse` payload budget. Leaves headroom under [`MAX_CONTROL_FRAME`]
+/// so a page of names does not fill the whole control frame.
+pub const MAX_DIR_LIST_PAYLOAD: usize = 256 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FrameError {
@@ -110,11 +113,14 @@ pub enum ProtocolMessage {
     DirListRequest {
         checkout_id: String,
         path: CanonicalPath,
+        after: Option<EntryName>,
     },
     DirListResponse {
         checkout_id: String,
         path: CanonicalPath,
+        after: Option<EntryName>,
         entries: Vec<DirEntry>,
+        more: bool,
     },
     FileAnnounce {
         checkout_id: String,
@@ -169,6 +175,69 @@ fn encode_wire<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
 
 fn decode_wire<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<(T, usize), String> {
     bincode::serde::decode_from_slice(bytes, wire_bincode_config()).map_err(|e| e.to_string())
+}
+
+fn dir_entry_name_bytes(entry: &DirEntry) -> &[u8] {
+    entry.name().as_str().as_bytes()
+}
+
+/// One `DirListResponse` that `encode_control` can send.
+///
+/// Children are sorted by raw UTF-8 name, then cut so the payload stays at
+/// or under [`MAX_DIR_LIST_PAYLOAD`]. `more` is true when later names remain.
+/// `after` is echoed so the slave can ignore names it already walked.
+pub fn page_dir_list(
+    checkout_id: String,
+    path: CanonicalPath,
+    after: Option<EntryName>,
+    mut entries: Vec<DirEntry>,
+) -> ProtocolMessage {
+    entries.sort_by(|a, b| dir_entry_name_bytes(a).cmp(dir_entry_name_bytes(b)));
+    if let Some(cursor) = &after {
+        let cursor = cursor.as_str().as_bytes();
+        entries.retain(|entry| dir_entry_name_bytes(entry) > cursor);
+    }
+
+    let fits =
+        |slice: &[DirEntry], more: bool| match encode_control(&ProtocolMessage::DirListResponse {
+            checkout_id: checkout_id.clone(),
+            path: path.clone(),
+            after: after.clone(),
+            entries: slice.to_vec(),
+            more,
+        }) {
+            Ok(frame) => frame.len() - 4 <= MAX_DIR_LIST_PAYLOAD,
+            Err(_) => false,
+        };
+
+    if fits(&entries, false) {
+        return ProtocolMessage::DirListResponse {
+            checkout_id,
+            path,
+            after,
+            entries,
+            more: false,
+        };
+    }
+
+    let mut lo = 0;
+    let mut hi = entries.len();
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if fits(&entries[..mid], true) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let n = if lo > 0 { lo } else { 1.min(entries.len()) };
+    ProtocolMessage::DirListResponse {
+        checkout_id,
+        path,
+        after,
+        entries: entries[..n].to_vec(),
+        more: true,
+    }
 }
 
 /// `u32be length || bincode(version) || bincode(msg)`, the byte layout of
