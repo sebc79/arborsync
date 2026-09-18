@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use arborsync_core::LocalEvent;
-use arborsync_core::keys::read_static_key;
+use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::path::local_to_canonical;
 use arborsync_core::slave::{Reply, Slave, SlaveError, WholeFileLater};
 use arborsync_core::storage::Storage;
@@ -46,6 +46,8 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
 
     let secret = read_static_key(cfg.slave_key_path())
         .with_context(|| format!("read {}", cfg.slave_key_path().display()))?;
+    let pin = format_hex_key(&public_from_secret(&secret));
+    log::info!("slave public key {pin}");
 
     if let Some(parent) = cfg.db_path().parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
