@@ -12,7 +12,6 @@ pub enum LastSynced {
     Keep,
 }
 
-/// One leaf in a [`commit_leaves`] batch.
 pub struct LeafChange<'a> {
     pub path: &'a CanonicalPath,
     pub meta: Option<&'a FileMetadata>,
@@ -21,8 +20,6 @@ pub struct LeafChange<'a> {
 
 /// Commit one leaf and every directory hash it changes in a single batch.
 /// `leaf` of `None` removes the path and, for a directory, everything under it.
-/// A file or symlink leaf drops the path prefix first so a type change cannot
-/// leave descendants.
 pub fn commit_leaf<S: Storage>(
     store: &S,
     ck: &CheckoutId,
@@ -125,9 +122,7 @@ fn apply_leaf<S: Storage>(
                 }
                 LastSynced::AdoptLeaf => None,
             };
-            if matches!(store.get_meta(ck, change.path)?, Some(old) if old.kind == EntryKind::Dir) {
-                batch.purge_prefix(ck, change.path)?;
-            }
+            vacate_replaced_dir(store, batch, ck, change.path)?;
             batch.put_meta(ck, change.path, meta)?;
             match change.last_synced {
                 LastSynced::AdoptLeaf => {
@@ -150,6 +145,18 @@ fn apply_leaf<S: Storage>(
             batch.del_dir_prefix(ck, change.path)?;
         }
         None => batch.purge_prefix(ck, change.path)?,
+    }
+    Ok(())
+}
+
+fn vacate_replaced_dir<S: Storage>(
+    store: &S,
+    batch: &mut S::WriteBatch<'_>,
+    ck: &CheckoutId,
+    path: &CanonicalPath,
+) -> Result<(), S::Error> {
+    if matches!(store.get_meta(ck, path)?, Some(old) if old.kind == EntryKind::Dir) {
+        batch.purge_prefix(ck, path)?;
     }
     Ok(())
 }
