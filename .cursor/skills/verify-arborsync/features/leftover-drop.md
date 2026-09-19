@@ -35,4 +35,5 @@ Preconditions:
 - Do not treat a master `health=stuck` line during a large file as a hang if the next window shows `bulk_in` or a lower `pending`.
 - A slave that stops emitting `status ` while master `pending` stays high and `bulk_in` stays 0 is the old write-all stall.
 - A slave `status` line with `pending` stuck and `apply_ok=0` / `bulk_in=0` while `dir_list` or `bulk_out` still move is a buried pull. The master's copy of an overlapping path should still change on the slave before the leftover walk finishes.
+- `last_error=unknown_transfer` on a path that already exists under `central_root` with the announced bytes is a late duplicate bulk. It should not raise `apply_fail` after this fix. A new leftover path still copies.
 - Prefill the checkout before the slave process starts. A live watcher write is a different path.

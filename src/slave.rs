@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use arborsync_core::LocalEvent;
+use arborsync_core::hash::ContentHash;
 use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::path::local_to_canonical;
 use arborsync_core::protocol::ProtocolMessage;
@@ -380,6 +381,7 @@ struct Outbound {
     urgent_tx: UnboundedSender<ProtocolMessage>,
     walk_tx: UnboundedSender<ProtocolMessage>,
     parked: VecDeque<ProtocolMessage>,
+    seen_sr: HashSet<(String, CanonicalPath, ContentHash)>,
     bulk_tx: UnboundedSender<anyhow::Result<()>>,
     bulk_busy: bool,
 }
@@ -394,6 +396,7 @@ impl Outbound {
             urgent_tx,
             walk_tx,
             parked: VecDeque::new(),
+            seen_sr: HashSet::new(),
             bulk_tx,
             bulk_busy: false,
         }
@@ -405,9 +408,19 @@ impl Outbound {
         conn: &Connection,
         msg: ProtocolMessage,
     ) -> anyhow::Result<()> {
-        if self.bulk_busy && matches!(msg, ProtocolMessage::SignatureRequest { .. }) {
-            self.parked.push_back(msg);
-            return Ok(());
+        if let Some(key) = signature_request_key(&msg) {
+            if self.seen_sr.contains(&key)
+                || self
+                    .parked
+                    .iter()
+                    .any(|queued| signature_request_key(queued).as_ref() == Some(&key))
+            {
+                return Ok(());
+            }
+            if self.bulk_busy {
+                self.parked.push_back(msg);
+                return Ok(());
+            }
         }
         let reply = slave.lock().expect("slave").handle(msg)?;
         self.push_reply(conn, reply)
@@ -438,6 +451,11 @@ impl Outbound {
     }
 
     fn spawn_bulk(&mut self, conn: &Connection, xfer: BulkTransfer) {
+        self.seen_sr.insert((
+            xfer.header.checkout_id.clone(),
+            xfer.header.path.clone(),
+            xfer.header.want_hash,
+        ));
         self.bulk_busy = true;
         let conn = conn.clone();
         let tx = self.bulk_tx.clone();
@@ -470,6 +488,18 @@ impl Outbound {
             self.push_reply(conn, reply)?;
         }
         Ok(())
+    }
+}
+
+fn signature_request_key(msg: &ProtocolMessage) -> Option<(String, CanonicalPath, ContentHash)> {
+    match msg {
+        ProtocolMessage::SignatureRequest {
+            checkout_id,
+            path,
+            want_hash,
+            ..
+        } => Some((checkout_id.clone(), path.clone(), *want_hash)),
+        _ => None,
     }
 }
 
