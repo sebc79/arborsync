@@ -77,13 +77,14 @@ Disconnect drops interest. The 1000-update queue in earlier drafts is gone. Catc
 
 ## Observability
 
-Log at `info`: connect/disconnect, Subscribe accept/reject, CAS accept/reject counts, reconcile starts, apply failures. No metrics port in v1.
+Log at `info`: connect/disconnect, Subscribe accept/reject, CAS accept/reject counts, reconcile starts, apply failures. Each `status_interval_seconds` (default 5, `0` disables, max 3600) the daemons also log a `status ` summary. The master logs one aggregate line plus one line per slave. Each line names health (`idle`, `busy`, `stuck`, `failed`), interval counters, queue depths, and `last_error`. No metrics port in v1.
 
 ## Config knobs that remain
 
 ```toml
 watcher_debounce_ms = 200
 rescan_interval_seconds = 60
+status_interval_seconds = 5
 ```
 
 Removed: `push_debounce_ms` as a second debounce (the watcher debounce is enough), `max_queued_updates_per_slave`, `max_push_attempts`, `enable_delta_caching`, `max_delta_cache_size_mb`, `push_batch_size` as a correctness parameter. A sender may coalesce multiple control messages in one syscall; that is not a specified batch protocol.

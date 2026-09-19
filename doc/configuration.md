@@ -30,6 +30,7 @@ db_path = "/var/lib/arborsync/index.redb"
 log_level = "info"                    # error | warn | info | debug | trace
 watcher_debounce_ms = 200             # 200–500
 rescan_interval_seconds = 60
+status_interval_seconds = 5           # 0 disables, max 3600
 max_checkouts_per_slave = 100
 max_connections = 100
 max_connection_attempts_per_minute = 60
@@ -61,6 +62,7 @@ log_level = "info"
 max_checkouts_per_slave = 100         # same name and default as the master
 watcher_debounce_ms = 200
 rescan_interval_seconds = 60
+status_interval_seconds = 5           # 0 disables, max 3600
 
 checkouts = [
     { id = "src",  central = "/src",  local = "/opt/projects/src" },
@@ -80,7 +82,7 @@ Reconnect backoff is hardcoded at 1 s, doubling, cap 60 s. `reconnect_initial_ms
 
 ## Validation
 
-- TOML types and ranges (`watcher_debounce_ms` in 200–500, `log_level` enum, ports).
+- TOML types and ranges (`watcher_debounce_ms` in 200–500, `status_interval_seconds` in 0–3600, `log_level` enum, ports).
 - Keys: each `hex:` value decodes to exactly 32 bytes. Secret key files are 32 raw bytes or the same `hex:` form.
 - Prefixes: absolute, normalized, no `..`.
 - Slave `slave_id` is a non-empty UTF-8 string matching `[A-Za-z0-9._:-]+`.
@@ -88,7 +90,7 @@ Reconnect backoff is hardcoded at 1 s, doubling, cap 60 s. `reconnect_initial_ms
 
 ## Reload (SIGHUP)
 
-**Applied live:** `log_level`, `max_connection_attempts_per_minute`, `max_connections` (affects new accepts), `[[slaves]]` (add/remove rows, change `allowed_prefixes`, add rotation keys), slave `master_public_keys`, slave `checkouts` (add/remove per `spec.md` §3), debounce/rescan intervals (next window uses the new value).
+**Applied live:** `log_level`, `max_connection_attempts_per_minute`, `max_connections` (affects new accepts), `[[slaves]]` (add/remove rows, change `allowed_prefixes`, add rotation keys), slave `master_public_keys`, slave `checkouts` (add/remove per `spec.md` §3), debounce, rescan, and status intervals (the next window uses the new value). Watcher restart is only for debounce or rescan. A status interval change is read on the next tick.
 
 **Requires restart:** `listen_addr`, `db_path`, `central_root`, `master_addr`, `*_key_path`, and slave `slave_id`.
 

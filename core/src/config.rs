@@ -31,6 +31,8 @@ pub struct MasterConfig {
     pub watcher_debounce_ms: u64,
     #[serde(default = "default_rescan_seconds")]
     pub rescan_interval_seconds: u64,
+    #[serde(default = "default_status_seconds")]
+    pub status_interval_seconds: u64,
     #[serde(default = "default_max_checkouts")]
     pub max_checkouts_per_slave: u32,
     #[serde(default = "default_max_connections")]
@@ -63,6 +65,8 @@ pub struct SlaveConfig {
     pub watcher_debounce_ms: u64,
     #[serde(default = "default_rescan_seconds")]
     pub rescan_interval_seconds: u64,
+    #[serde(default = "default_status_seconds")]
+    pub status_interval_seconds: u64,
     #[serde(default)]
     pub checkouts: Vec<CheckoutConfig>,
 }
@@ -77,6 +81,10 @@ fn default_debounce_ms() -> u64 {
 
 fn default_rescan_seconds() -> u64 {
     60
+}
+
+fn default_status_seconds() -> u64 {
+    5
 }
 
 fn default_max_checkouts() -> u32 {
@@ -129,6 +137,8 @@ pub enum ConfigError {
     DebounceOutOfRange { value: u64 },
     #[error("unknown log_level {value}")]
     BadLogLevel { value: String },
+    #[error("status_interval_seconds {value} exceeds 3600")]
+    StatusIntervalOutOfRange { value: u64 },
     #[error("invalid pin at {field}")]
     BadPin { field: String },
     #[error("invalid prefix at {field}: {source}")]
@@ -176,6 +186,7 @@ pub struct MasterReload {
     pub log_level: String,
     pub watcher_debounce_ms: u64,
     pub rescan_interval_seconds: u64,
+    pub status_interval_seconds: u64,
     pub max_checkouts_per_slave: u32,
     pub max_connections: u32,
     pub max_connection_attempts_per_minute: u32,
@@ -188,6 +199,7 @@ pub struct SlaveReload {
     pub log_level: String,
     pub watcher_debounce_ms: u64,
     pub rescan_interval_seconds: u64,
+    pub status_interval_seconds: u64,
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub resubscribe: bool,
@@ -204,6 +216,7 @@ pub struct LoadedMaster {
     log_level: String,
     watcher_debounce_ms: u64,
     rescan_interval_seconds: u64,
+    status_interval_seconds: u64,
     max_checkouts_per_slave: u32,
     max_connections: u32,
     max_connection_attempts_per_minute: u32,
@@ -227,6 +240,7 @@ pub struct LoadedSlave {
     log_level: String,
     watcher_debounce_ms: u64,
     rescan_interval_seconds: u64,
+    status_interval_seconds: u64,
     max_checkouts_per_slave: u32,
 }
 
@@ -303,6 +317,10 @@ impl LoadedMaster {
         self.rescan_interval_seconds
     }
 
+    pub fn status_interval_seconds(&self) -> u64 {
+        self.status_interval_seconds
+    }
+
     pub fn max_checkouts_per_slave(&self) -> u32 {
         self.max_checkouts_per_slave
     }
@@ -351,6 +369,7 @@ impl LoadedMaster {
             log_level: next.log_level.clone(),
             watcher_debounce_ms: next.watcher_debounce_ms,
             rescan_interval_seconds: next.rescan_interval_seconds,
+            status_interval_seconds: next.status_interval_seconds,
             max_checkouts_per_slave: next.max_checkouts_per_slave,
             max_connections: next.max_connections,
             max_connection_attempts_per_minute: next.max_connection_attempts_per_minute,
@@ -454,6 +473,10 @@ impl LoadedSlave {
         self.rescan_interval_seconds
     }
 
+    pub fn status_interval_seconds(&self) -> u64 {
+        self.status_interval_seconds
+    }
+
     pub fn max_checkouts_per_slave(&self) -> u32 {
         self.max_checkouts_per_slave
     }
@@ -511,6 +534,7 @@ impl LoadedSlave {
             log_level: next.log_level.clone(),
             watcher_debounce_ms: next.watcher_debounce_ms,
             rescan_interval_seconds: next.rescan_interval_seconds,
+            status_interval_seconds: next.status_interval_seconds,
             added,
             removed,
             resubscribe,
@@ -534,6 +558,7 @@ impl LoadedCheckout {
 
 fn project_master(config: MasterConfig) -> Result<LoadedMaster, ConfigError> {
     check_debounce(config.watcher_debounce_ms)?;
+    check_status_interval(config.status_interval_seconds)?;
     check_log_level(&config.log_level)?;
     let listen_addr =
         config
@@ -596,6 +621,7 @@ fn project_master(config: MasterConfig) -> Result<LoadedMaster, ConfigError> {
         log_level: config.log_level,
         watcher_debounce_ms: config.watcher_debounce_ms,
         rescan_interval_seconds: config.rescan_interval_seconds,
+        status_interval_seconds: config.status_interval_seconds,
         max_checkouts_per_slave: config.max_checkouts_per_slave,
         max_connections: config.max_connections,
         max_connection_attempts_per_minute: config.max_connection_attempts_per_minute,
@@ -624,6 +650,7 @@ fn project_slave(config: SlaveConfig) -> Result<LoadedSlave, ConfigError> {
     let db_path = expand_host_path("db_path", &config.db_path)?;
     check_log_level(&config.log_level)?;
     check_debounce(config.watcher_debounce_ms)?;
+    check_status_interval(config.status_interval_seconds)?;
 
     if config.checkouts.len() > config.max_checkouts_per_slave as usize {
         return Err(ConfigError::TooManyCheckouts {
@@ -676,6 +703,7 @@ fn project_slave(config: SlaveConfig) -> Result<LoadedSlave, ConfigError> {
         log_level: config.log_level,
         watcher_debounce_ms: config.watcher_debounce_ms,
         rescan_interval_seconds: config.rescan_interval_seconds,
+        status_interval_seconds: config.status_interval_seconds,
         max_checkouts_per_slave: config.max_checkouts_per_slave,
     })
 }
@@ -770,6 +798,14 @@ fn check_debounce(ms: u64) -> Result<(), ConfigError> {
         Ok(())
     } else {
         Err(ConfigError::DebounceOutOfRange { value: ms })
+    }
+}
+
+fn check_status_interval(seconds: u64) -> Result<(), ConfigError> {
+    if seconds <= 3600 {
+        Ok(())
+    } else {
+        Err(ConfigError::StatusIntervalOutOfRange { value: seconds })
     }
 }
 

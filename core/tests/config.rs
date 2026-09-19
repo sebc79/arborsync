@@ -128,6 +128,58 @@ fn debounce_200_and_500_pass() {
 }
 
 #[test]
+fn omitted_status_interval_defaults_to_5() {
+    let master = LoadedMaster::parse(&valid_master()).unwrap();
+    assert_eq!(master.status_interval_seconds(), 5);
+    let slave = LoadedSlave::parse(&slave_toml("checkouts = []")).unwrap();
+    assert_eq!(slave.status_interval_seconds(), 5);
+}
+
+#[test]
+fn status_interval_0_is_ok() {
+    let master = valid_master().replace(
+        "watcher_debounce_ms = 200",
+        "watcher_debounce_ms = 200\nstatus_interval_seconds = 0",
+    );
+    assert_eq!(
+        LoadedMaster::parse(&master)
+            .unwrap()
+            .status_interval_seconds(),
+        0
+    );
+    let slave = slave_toml("checkouts = []").replace(
+        "watcher_debounce_ms = 200",
+        "watcher_debounce_ms = 200\nstatus_interval_seconds = 0",
+    );
+    assert_eq!(
+        LoadedSlave::parse(&slave)
+            .unwrap()
+            .status_interval_seconds(),
+        0
+    );
+}
+
+#[test]
+fn status_interval_3601_is_out_of_range() {
+    let master = valid_master().replace(
+        "watcher_debounce_ms = 200",
+        "watcher_debounce_ms = 200\nstatus_interval_seconds = 3601",
+    );
+    match LoadedMaster::parse(&master) {
+        Err(ConfigError::StatusIntervalOutOfRange { value: 3601 }) => {}
+        other => panic!("expected StatusIntervalOutOfRange, got {other:?}"),
+    }
+    let slave = slave_toml("checkouts = []").replace(
+        "watcher_debounce_ms = 200",
+        "watcher_debounce_ms = 200\nstatus_interval_seconds = 3601",
+    );
+    match LoadedSlave::parse(&slave) {
+        Err(ConfigError::StatusIntervalOutOfRange { value: 3601 }) => {}
+        other => panic!("expected StatusIntervalOutOfRange, got {other:?}"),
+    }
+}
+
+#[test]
 fn bad_log_level_fails() {
     let toml = valid_master().replace(r#"log_level = "info""#, r#"log_level = "verbose""#);
     assert!(LoadedMaster::parse(&toml).is_err());

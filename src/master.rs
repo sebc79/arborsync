@@ -93,8 +93,10 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
     let mut hangup = signal(SignalKind::hangup())?;
     let (cfg_tx, mut cfg_rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_config_watch(config_path.clone(), cfg_tx);
+    let mut status_clock = crate::status::Clock::new();
 
     loop {
+        let status_every = master.lock().expect("master").status_interval_seconds();
         tokio::select! {
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else {
@@ -104,8 +106,12 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
                 let limiter = limiter.clone();
                 let sessions = sessions.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = accept_session(incoming, master, limiter, sessions).await {
+                    if let Err(err) = accept_session(incoming, master.clone(), limiter, sessions).await {
                         log::warn!("{err:#}");
+                        master
+                            .lock()
+                            .expect("master")
+                            .note_status_error(None, format!("{err:#}"));
                     }
                 });
             }
@@ -114,6 +120,9 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
             }
             Some(()) = cfg_rx.recv() => {
                 reload_master_from_disk(&config_path, &master, &limiter, &sessions, &watch_gen);
+            }
+            _ = status_clock.wait(status_every) => {
+                emit_master_status(&master);
             }
         }
     }
@@ -160,6 +169,17 @@ fn reload_master_from_disk(
         Err(ReloadError::RestartRequired { fields }) => {
             log::warn!("reload requires restart: {}", fields.join(", "));
         }
+    }
+}
+
+fn emit_master_status(master: &SharedMaster) {
+    let mut guard = master.lock().expect("master");
+    let period = guard.status_interval_seconds();
+    if period == 0 {
+        return;
+    }
+    for line in guard.take_status().lines(period) {
+        log::info!("{line}");
     }
 }
 

@@ -488,6 +488,7 @@ impl SyncSandbox {
             log_level: "debug".into(),
             watcher_debounce_ms: 200,
             rescan_interval_seconds: 60,
+            status_interval_seconds: 0,
             max_checkouts_per_slave: 100,
             max_connections: 100,
             max_connection_attempts_per_minute: 60,
@@ -517,6 +518,7 @@ impl SyncSandbox {
             max_checkouts_per_slave: 100,
             watcher_debounce_ms: 200,
             rescan_interval_seconds: 60,
+            status_interval_seconds: 0,
             checkouts,
         };
         let path = root.join("slave.toml");

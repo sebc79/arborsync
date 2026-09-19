@@ -150,6 +150,7 @@ impl DaemonPair {
             log_level: "info".into(),
             watcher_debounce_ms: 200,
             rescan_interval_seconds: 3600,
+            status_interval_seconds: 0,
             max_checkouts_per_slave: 100,
             max_connections: 100,
             max_connection_attempts_per_minute: 60,
@@ -193,6 +194,7 @@ impl DaemonPair {
             max_checkouts_per_slave: 100,
             watcher_debounce_ms: 200,
             rescan_interval_seconds: 3600,
+            status_interval_seconds: 0,
             checkouts: vec![CheckoutConfig {
                 id: "src".into(),
                 central: "/src".into(),
