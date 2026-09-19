@@ -63,7 +63,11 @@ fn measure(n: usize) {
     let first = Instant::now();
     let first_msgs = slave.rescan("src").unwrap();
     let first_ms = first.elapsed().as_millis();
-    assert_eq!(first_msgs.len(), 1);
+    assert!(
+        first_msgs
+            .iter()
+            .any(|msg| matches!(msg, ProtocolMessage::RootReport { .. }))
+    );
 
     let second = Instant::now();
     let second_msgs = slave.rescan("src").unwrap();

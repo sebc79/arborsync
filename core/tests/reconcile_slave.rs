@@ -74,13 +74,22 @@ fn subscribe_ack_rescans_leftover_disk_file_into_meta() {
     let local = slave.checkout_local("src").unwrap().to_path_buf();
     sandbox.tree(&local).file("leftover.txt", b"mine");
 
-    match &send(slave.handle(subscribe_ack()).unwrap())[..] {
-        [ProtocolMessage::RootReport { path, root, .. }] => {
-            assert_eq!(path, &p("/src"));
-            assert_ne!(*root, empty_dir_node().into());
-        }
-        other => panic!("expected RootReport, got {other:?}"),
-    }
+    let first = send(slave.handle(subscribe_ack()).unwrap());
+    assert!(
+        first.iter().any(|msg| matches!(
+            msg,
+            ProtocolMessage::RootReport { path, root, .. }
+                if path == &p("/src") && *root != empty_dir_node().into()
+        )),
+        "expected RootReport, got {first:?}"
+    );
+    assert!(
+        first.iter().any(|msg| matches!(
+            msg,
+            ProtocolMessage::FileAnnounce { path, .. } if path == &p("/src/leftover.txt")
+        )),
+        "expected leftover FileAnnounce, got {first:?}"
+    );
     assert_eq!(
         slave
             .meta("src", &p("/src/leftover.txt"))
@@ -525,7 +534,7 @@ fn dir_list_page_with_more_does_not_delete_later_names() {
 }
 
 #[test]
-fn subscribe_ack_crawl_yields_before_root_report() {
+fn subscribe_ack_reports_and_announces_before_walk_finishes() {
     let sandbox = SyncSandbox::new();
     let mut slave = alice_slave(&sandbox, MemoryContent::new());
     let local = slave.checkout_local("src").unwrap().to_path_buf();
@@ -536,20 +545,29 @@ fn subscribe_ack_crawl_yields_before_root_report() {
     }
 
     let first = send(slave.handle(subscribe_ack()).unwrap());
-    assert!(
-        first.is_empty(),
-        "one crawl step must not finish 80 files, got {first:?}"
-    );
     assert!(slave.crawl_pending());
+    assert!(
+        first
+            .iter()
+            .any(|msg| matches!(msg, ProtocolMessage::RootReport { .. })),
+        "SubscribeAck must RootReport before the walk finishes, got {first:?}"
+    );
+    assert!(
+        first
+            .iter()
+            .any(|msg| matches!(msg, ProtocolMessage::FileAnnounce { .. })),
+        "one crawl step must announce leftover files before the walk finishes, got {first:?}"
+    );
 
     let rest = slave.finish_crawl().unwrap();
-    match &rest[..] {
-        [ProtocolMessage::RootReport { path, root, .. }] => {
-            assert_eq!(path, &p("/src"));
-            assert_ne!(*root, empty_dir_node().into());
-        }
-        other => panic!("expected RootReport after finish_crawl, got {other:?}"),
-    }
+    assert!(
+        rest.iter().any(|msg| matches!(
+            msg,
+            ProtocolMessage::RootReport { path, root, .. }
+                if path == &p("/src") && *root != empty_dir_node().into()
+        )),
+        "expected RootReport after finish_crawl, got {rest:?}"
+    );
     assert!(!slave.crawl_pending());
     assert!(slave.meta("src", &p("/src/f79.txt")).unwrap().is_some());
 }
