@@ -69,7 +69,7 @@ Specified: if a slave’s control stream is blocked, stop sending it more announ
 
 As built: `Master::set_writable` exists and the binary never calls it. A connected slow slave can grow `outbox`. `quic_max_concurrent_streams` is not parsed. Slow apply on the slave is the slave’s problem. The master does not snapshot file contents for it.
 
-`Master::pending` (in-flight bulk after the master asked for bytes) is not cleared on `disconnect`. The key is `(checkout_id, path)`. Checkout ids are per slave.
+`Master::pending` holds in-flight bulk after the master asked for bytes. `disconnect` drops rows whose `peer` is the disconnected peer. The key is `(checkout_id, path)`. Checkout ids are per slave.
 
 ## Offline
 
