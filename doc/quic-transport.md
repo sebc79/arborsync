@@ -44,6 +44,8 @@ One message per bulk stream. Close the stream after the body. Control stream sta
 
 The master and slave binaries wait on `accept_uni` inside `select!`, then read the body after that arm wins. Putting `accept_bulk` (accept plus the body read) in the same `select!` as the 50 ms outbox tick dropped the `RecvStream` mid-body. Quinn then sent `STOP_SENDING` error 0, which the slave logs as `stream: sending stopped by peer: error 0`.
 
+`read_control` is also a `select!` arm. Quinn `read_exact` is not cancel-safe. A ready `accept_uni` or tick drops that future and discards bytes already copied into the caller's buffer. The next read then treats leftover payload as a length prefix. The master logs `incoming control length ... exceeds 1 MiB (header 70 69 63 6f)` when those bytes are ASCII `pico`. `ControlReader` stores copied bytes in `pending` and fills with cancel-safe `read`.
+
 Keep-alive: Quinn idle timeout stays at the RFC 9308 default of 30 s. `listen` and `client_endpoint` set `keep_alive_interval` to 10 s so a quiet control stream does not hit that timeout. No `Heartbeat` message.
 
 ## Control reader
