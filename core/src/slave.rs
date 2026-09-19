@@ -311,6 +311,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         Ok(msgs)
     }
 
+    pub fn request_rescan(&mut self, checkout_id: &str) -> Result<(), SlaveError> {
+        self.start_rescan(checkout_id)
+    }
+
     pub fn finish_crawl(&mut self) -> Result<Vec<ProtocolMessage>, SlaveError> {
         let mut out = Vec::new();
         while self.crawl.pending() {
@@ -1070,10 +1074,16 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.pending_pulls.clear();
         let mut ids: Vec<String> = self.checkouts.keys().cloned().collect();
         ids.sort();
-        for id in ids {
-            self.start_rescan(&id)?;
+        for id in &ids {
+            self.start_rescan(id)?;
         }
-        Ok(Reply::Send(self.step_crawl(STEP_BUDGET)?))
+        let mut out = self.step_crawl(STEP_BUDGET)?;
+        if self.crawl.has_rescan() {
+            let mut reports = self.root_reports_for(&ids)?;
+            reports.extend(out);
+            out = reports;
+        }
+        Ok(Reply::Send(out))
     }
 
     fn root_reports_for(&self, ids: &[String]) -> Result<Vec<ProtocolMessage>, SlaveError> {
@@ -1211,10 +1221,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     }
 
     fn step_crawl(&mut self, budget: usize) -> Result<Vec<ProtocolMessage>, SlaveError> {
-        if self.crawl.has_rescan() {
-            return self.step_rescan(budget);
+        if self.crawl.has_pages() {
+            return self.step_dir_list(budget);
         }
-        self.step_dir_list(budget)
+        self.step_rescan(budget)
     }
 
     fn step_rescan(&mut self, budget: usize) -> Result<Vec<ProtocolMessage>, SlaveError> {
@@ -1222,14 +1232,20 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             return Ok(Vec::new());
         };
         let ck = walk.ck.clone();
-        walk.collect(budget, |path| self.store.get_meta(&ck, path))
+        let checkout_id = walk.checkout_id.clone();
+        let newly = walk
+            .collect(budget, |path| self.store.get_meta(&ck, path))
             .map_err(into_slave_walk_err)?;
+        let mut out = Vec::new();
+        for (path, found) in newly {
+            out.extend(self.announce_new_to_index(&checkout_id, path, found)?);
+        }
         let Some(walk) = self.crawl.take_finished_rescan() else {
-            return Ok(Vec::new());
+            return Ok(out);
         };
-        let msgs = self.commit_rescan(walk)?;
+        out.extend(self.commit_rescan(walk)?);
         self.status.rescan(None);
-        Ok(msgs)
+        Ok(out)
     }
 
     fn commit_rescan(&mut self, walk: RescanWalk) -> Result<Vec<ProtocolMessage>, SlaveError> {
@@ -1442,6 +1458,31 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         else {
             return self.note_removed(checkout_id, &path);
         };
+        self.announce_live(checkout_id, path, found)
+    }
+
+    fn announce_new_to_index(
+        &mut self,
+        checkout_id: &str,
+        path: CanonicalPath,
+        found: FileMetadata,
+    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        if self.meta(checkout_id, &path)?.as_ref() == Some(&found) {
+            return Ok(Vec::new());
+        }
+        self.announce_live(checkout_id, path, found)
+    }
+
+    fn announce_live(
+        &mut self,
+        checkout_id: &str,
+        path: CanonicalPath,
+        found: FileMetadata,
+    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        let central = self.checkout(checkout_id)?.central.clone();
+        if is_reserved(&central, &path) {
+            return Ok(Vec::new());
+        }
         if self
             .checkout_mut(checkout_id)?
             .inflight
@@ -1453,7 +1494,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         if last_synced == Some(file_node(&found)) {
             return Ok(Vec::new());
         }
-        if previous.as_ref() != Some(&found) {
+        if self.meta(checkout_id, &path)?.as_ref() != Some(&found) {
             let ck = self.checkout(checkout_id)?.id.clone();
             self.index_ancestors(checkout_id, &path)?;
             index::commit_leaf(

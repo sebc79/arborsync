@@ -52,7 +52,7 @@ Missed watchers, offline periods, apply failures:
 
 Master never walks a slave unsolicited. Master never stores a per-slave update queue, “max_queued_updates,” or retry buffer of file contents.
 
-Reconnect = new connection + `Subscribe` + this slow path. “Resume interrupted transfer” = the next walk notices the path still differs and transfers again. There is no byte-range resume. A leftover directory that exists only on the slave is announced, then the slave sends `DirListRequest` for that path so nested files are announced before the next rescan.
+Reconnect = new connection + `Subscribe` + this slow path. `RootReport` on `SubscribeAck` uses the current index and does not wait for the subscribe rescan to finish. New index rows from that walk are announced as they are found. “Resume interrupted transfer” = the next walk notices the path still differs and transfers again. There is no byte-range resume. A leftover directory that exists only on the slave is announced, then the slave sends `DirListRequest` for that path so nested files are announced before the next rescan.
 
 ## What is not a push trigger
 
