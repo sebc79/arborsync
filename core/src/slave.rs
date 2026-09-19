@@ -1098,7 +1098,19 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                     });
                 }
                 WalkAction::AnnounceCreate | WalkAction::AnnounceCas => {
-                    out.extend(self.note_changed(&checkout_id, child_path)?);
+                    let walk_dir = local_meta
+                        .as_ref()
+                        .is_some_and(|meta| meta.kind == EntryKind::Dir);
+                    if walk_dir {
+                        out.extend(self.note_changed(&checkout_id, child_path.clone())?);
+                        out.push(ProtocolMessage::DirListRequest {
+                            checkout_id: checkout_id.clone(),
+                            path: child_path,
+                            after: None,
+                        });
+                    } else {
+                        out.extend(self.note_changed(&checkout_id, child_path)?);
+                    }
                 }
                 WalkAction::AnnounceDelete => {
                     out.extend(self.note_removed(&checkout_id, &child_path)?);
