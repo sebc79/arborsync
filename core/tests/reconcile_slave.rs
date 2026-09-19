@@ -275,6 +275,90 @@ fn dir_list_slave_only_leftover_announces_create() {
 }
 
 #[test]
+fn dir_list_slave_only_nested_dir_announces_the_nested_file() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("photos/album/shot.jpg", b"img");
+    send(slave.handle(subscribe_ack()).unwrap());
+
+    match &send(
+        slave
+            .handle(ProtocolMessage::DirListResponse {
+                checkout_id: "src".into(),
+                path: p("/src"),
+                after: None,
+                entries: vec![],
+                more: false,
+            })
+            .unwrap(),
+    )[..]
+    {
+        [ProtocolMessage::FileAnnounce { path, basis, .. }, ProtocolMessage::DirListRequest {
+            path: walk,
+            after,
+            ..
+        }] => {
+            assert_eq!(path, &p("/src/photos"));
+            assert_eq!(*basis, None);
+            assert_eq!(walk, &p("/src/photos"));
+            assert_eq!(*after, None);
+        }
+        other => panic!("expected photos announce and walk, got {other:?}"),
+    }
+
+    match &send(
+        slave
+            .handle(ProtocolMessage::DirListResponse {
+                checkout_id: "src".into(),
+                path: p("/src/photos"),
+                after: None,
+                entries: vec![],
+                more: false,
+            })
+            .unwrap(),
+    )[..]
+    {
+        [ProtocolMessage::FileAnnounce { path, basis, .. }, ProtocolMessage::DirListRequest {
+            path: walk,
+            after,
+            ..
+        }] => {
+            assert_eq!(path, &p("/src/photos/album"));
+            assert_eq!(*basis, None);
+            assert_eq!(walk, &p("/src/photos/album"));
+            assert_eq!(*after, None);
+        }
+        other => panic!("expected album announce and walk, got {other:?}"),
+    }
+
+    match &send(
+        slave
+            .handle(ProtocolMessage::DirListResponse {
+                checkout_id: "src".into(),
+                path: p("/src/photos/album"),
+                after: None,
+                entries: vec![],
+                more: false,
+            })
+            .unwrap(),
+    )[..]
+    {
+        [ProtocolMessage::FileAnnounce {
+            path,
+            new,
+            basis,
+            ..
+        }] => {
+            assert_eq!(path, &p("/src/photos/album/shot.jpg"));
+            assert_eq!(new.content_hash, hash_bytes(b"img"));
+            assert_eq!(*basis, None);
+        }
+        other => panic!("expected shot.jpg FileAnnounce, got {other:?}"),
+    }
+}
+
+#[test]
 fn dir_list_slave_only_with_last_synced_equal_local_deletes() {
     let sandbox = SyncSandbox::new();
     let hello = b"hello";
