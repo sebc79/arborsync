@@ -55,7 +55,7 @@ The interval is `recv_timeout` on the notify channel (default 60 s). A busy tree
 1. Full `stat` walk of `central_root` or the checkout `local` (`collecting-metadata.md`). Not "changed subtrees only."
 2. Compare to the index: missing on disk → local delete; missing in index → local create; size/mtime/kind differ → treat as write.
 3. Slave hashes again only when size, mtime, or kind disagree with the stored row (`collect_for_rescan`). Mode is not a miss. Master `walk_central` also uses `collect_for_rescan`.
-4. Slave writes every index change from that walk in one `commit_leaves` batch, then sends `RootReport` (`spec.md` §10) so missed remote changes are pulled even if the local walk was clean. It does not announce during rescan. Mismatch on the root starts the `DirList*` walk, which announces or pulls. An announce after rescan does not call `commit_leaf` again when the index row already matches disk.
+4. Slave writes every index change from that walk in one `commit_leaves` batch, then sends `RootReport` (`spec.md` §10) so missed remote changes are pulled even if the local walk was clean. It does not announce during rescan. The session task walks at most 64 names per `select!` turn so `status` and `read_control` stay live. `Slave::rescan` still drains the walk for tests. Mismatch on the root starts the `DirList*` walk, which announces or pulls. An announce after rescan does not call `commit_leaf` again when the index row already matches disk. A leftover `DirListResponse` page uses the same 64-name budget.
 
 Rescan exists because inotify/kqueue/NFS drop events. It cannot know dirty subtrees without walking.
 

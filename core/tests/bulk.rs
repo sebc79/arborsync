@@ -1,15 +1,15 @@
+use arborsync_core::LoadedMaster;
 use arborsync_core::config::{CheckoutConfig, SlaveAcl};
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{Master, MemoryContent, Reply};
 use arborsync_core::merkle::file_node;
-use arborsync_core::meta::{hash_bytes, EntryKind, FileMetadata};
+use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};
 use arborsync_core::protocol::{BulkEncoding, ProtocolMessage};
 use arborsync_core::slave::Slave;
-use arborsync_core::test_support::{p, MemoryStorage, SyncSandbox};
+use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
 use arborsync_core::transfer::{
-    ask_kind, delta_bytes, fulfill, patch_bytes, signature_bytes, MIN_DELTA_BASIS,
+    MIN_DELTA_BASIS, ask_kind, delta_bytes, fulfill, patch_bytes, signature_bytes,
 };
-use arborsync_core::LoadedMaster;
 
 const ALICE: [u8; 32] = [0xA1; 32];
 const MTIME: i64 = 1_700_000_000_000;
@@ -394,11 +394,13 @@ fn slave_asks_then_applies_a_whole_bulk_stream() {
         .unwrap()
     {
         arborsync_core::slave::Reply::Send(msgs) => match &msgs[..] {
-            [ProtocolMessage::SignatureRequest {
-                want_hash,
-                signature,
-                ..
-            }] => {
+            [
+                ProtocolMessage::SignatureRequest {
+                    want_hash,
+                    signature,
+                    ..
+                },
+            ] => {
                 assert_eq!(*want_hash, hash);
                 assert!(signature.is_empty());
             }

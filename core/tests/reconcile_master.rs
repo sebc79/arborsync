@@ -1,12 +1,12 @@
+use arborsync_core::LoadedMaster;
+use arborsync_core::LocalEvent;
 use arborsync_core::config::SlaveAcl;
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{Master, MemoryContent, Reply};
-use arborsync_core::merkle::{dir_node, empty_dir_node, file_node, DirChild};
-use arborsync_core::meta::{hash_bytes, EntryKind};
+use arborsync_core::merkle::{DirChild, dir_node, empty_dir_node, file_node};
+use arborsync_core::meta::{EntryKind, hash_bytes};
 use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
-use arborsync_core::test_support::{name, p, MemoryStorage, SyncSandbox};
-use arborsync_core::LoadedMaster;
-use arborsync_core::LocalEvent;
+use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
 
 const ALICE: [u8; 32] = [0xA1; 32];
 

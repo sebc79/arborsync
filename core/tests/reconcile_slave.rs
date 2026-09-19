@@ -1,13 +1,13 @@
-use arborsync_core::config::CheckoutConfig;
-use arborsync_core::keys::format_hex_key;
-use arborsync_core::merkle::{empty_dir_node, file_node, DirChild};
-use arborsync_core::meta::{hash_bytes, FileMetadata};
-use arborsync_core::path::{conflict_sidecar_path, RESERVED_TMP};
-use arborsync_core::protocol::{CheckoutAck, ProtocolMessage};
-use arborsync_core::slave::{MemoryContent, Reply, Slave};
-use arborsync_core::test_support::{name, p, MemoryStorage, SyncSandbox};
 use arborsync_core::LoadedSlave;
 use arborsync_core::LocalEvent;
+use arborsync_core::config::CheckoutConfig;
+use arborsync_core::keys::format_hex_key;
+use arborsync_core::merkle::{DirChild, empty_dir_node, file_node};
+use arborsync_core::meta::{FileMetadata, hash_bytes};
+use arborsync_core::path::{RESERVED_TMP, conflict_sidecar_path};
+use arborsync_core::protocol::{CheckoutAck, ProtocolMessage};
+use arborsync_core::slave::{MemoryContent, Reply, Slave};
+use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
 
 const MASTER_PIN: [u8; 32] = [0x11; 32];
 const MTIME: i64 = 1_700_000_000_000;
@@ -52,11 +52,13 @@ fn subscribe_ack_on_empty_checkout_reports_empty_dir() {
     let sandbox = SyncSandbox::new();
     let mut slave = alice_slave(&sandbox, MemoryContent::new());
     match &send(slave.handle(subscribe_ack()).unwrap())[..] {
-        [ProtocolMessage::RootReport {
-            checkout_id,
-            path,
-            root,
-        }] => {
+        [
+            ProtocolMessage::RootReport {
+                checkout_id,
+                path,
+                root,
+            },
+        ] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src"));
             assert_eq!(*root, empty_dir_node().into());
@@ -125,9 +127,11 @@ fn root_ack_matched_false_requests_central_listing() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::DirListRequest {
-            checkout_id, path, ..
-        }] => {
+        [
+            ProtocolMessage::DirListRequest {
+                checkout_id, path, ..
+            },
+        ] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src"));
         }
@@ -161,9 +165,11 @@ fn dir_list_master_only_file_pulls_without_conflict_sidecar() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::DirListRequest {
-            checkout_id, path, ..
-        }] => {
+        [
+            ProtocolMessage::DirListRequest {
+                checkout_id, path, ..
+            },
+        ] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src/hello.txt"));
         }
@@ -259,12 +265,14 @@ fn dir_list_slave_only_leftover_announces_create() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::FileAnnounce {
-            checkout_id,
-            path,
-            new,
-            basis,
-        }] => {
+        [
+            ProtocolMessage::FileAnnounce {
+                checkout_id,
+                path,
+                new,
+                basis,
+            },
+        ] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src/leftover.txt"));
             assert_eq!(new.content_hash, hash_bytes(b"mine"));
@@ -294,11 +302,12 @@ fn dir_list_slave_only_nested_dir_announces_the_nested_file() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::FileAnnounce { path, basis, .. }, ProtocolMessage::DirListRequest {
-            path: walk,
-            after,
-            ..
-        }] => {
+        [
+            ProtocolMessage::FileAnnounce { path, basis, .. },
+            ProtocolMessage::DirListRequest {
+                path: walk, after, ..
+            },
+        ] => {
             assert_eq!(path, &p("/src/photos"));
             assert_eq!(*basis, None);
             assert_eq!(walk, &p("/src/photos"));
@@ -319,11 +328,12 @@ fn dir_list_slave_only_nested_dir_announces_the_nested_file() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::FileAnnounce { path, basis, .. }, ProtocolMessage::DirListRequest {
-            path: walk,
-            after,
-            ..
-        }] => {
+        [
+            ProtocolMessage::FileAnnounce { path, basis, .. },
+            ProtocolMessage::DirListRequest {
+                path: walk, after, ..
+            },
+        ] => {
             assert_eq!(path, &p("/src/photos/album"));
             assert_eq!(*basis, None);
             assert_eq!(walk, &p("/src/photos/album"));
@@ -344,12 +354,11 @@ fn dir_list_slave_only_nested_dir_announces_the_nested_file() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::FileAnnounce {
-            path,
-            new,
-            basis,
-            ..
-        }] => {
+        [
+            ProtocolMessage::FileAnnounce {
+                path, new, basis, ..
+            },
+        ] => {
             assert_eq!(path, &p("/src/photos/album/shot.jpg"));
             assert_eq!(new.content_hash, hash_bytes(b"img"));
             assert_eq!(*basis, None);
@@ -394,11 +403,13 @@ fn dir_list_slave_only_with_last_synced_equal_local_deletes() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::Delete {
-            checkout_id,
-            path,
-            basis,
-        }] => {
+        [
+            ProtocolMessage::Delete {
+                checkout_id,
+                path,
+                basis,
+            },
+        ] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src/hello.txt"));
             assert_eq!(*basis, file_node(&new));
@@ -439,11 +450,13 @@ fn dir_list_slave_only_dir_with_last_synced_equal_local_deletes() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::Delete {
-            checkout_id,
-            path,
-            basis,
-        }] => {
+        [
+            ProtocolMessage::Delete {
+                checkout_id,
+                path,
+                basis,
+            },
+        ] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src/nested"));
             assert_eq!(*basis, file_node(&dir));
@@ -487,15 +500,18 @@ fn dir_list_page_with_more_does_not_delete_later_names() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::DirListRequest {
-            path: pull,
-            after: None,
-            ..
-        }, ProtocolMessage::DirListRequest {
-            path: again,
-            after: Some(cursor),
-            ..
-        }] => {
+        [
+            ProtocolMessage::DirListRequest {
+                path: pull,
+                after: None,
+                ..
+            },
+            ProtocolMessage::DirListRequest {
+                path: again,
+                after: Some(cursor),
+                ..
+            },
+        ] => {
             assert_eq!(pull, &p("/src/aaa"));
             assert_eq!(again, &p("/src"));
             assert_eq!(cursor.as_str(), "aaa");
@@ -506,6 +522,36 @@ fn dir_list_page_with_more_does_not_delete_later_names() {
         slave.last_synced("src", &p("/src/hello.txt")).unwrap(),
         Some(file_node(&new))
     );
+}
+
+#[test]
+fn subscribe_ack_crawl_yields_before_root_report() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    for i in 0..80 {
+        sandbox
+            .tree(&local)
+            .file(&format!("f{i:02}.txt"), format!("b{i}").as_bytes());
+    }
+
+    let first = send(slave.handle(subscribe_ack()).unwrap());
+    assert!(
+        first.is_empty(),
+        "one crawl step must not finish 80 files, got {first:?}"
+    );
+    assert!(slave.crawl_pending());
+
+    let rest = slave.finish_crawl().unwrap();
+    match &rest[..] {
+        [ProtocolMessage::RootReport { path, root, .. }] => {
+            assert_eq!(path, &p("/src"));
+            assert_ne!(*root, empty_dir_node().into());
+        }
+        other => panic!("expected RootReport after finish_crawl, got {other:?}"),
+    }
+    assert!(!slave.crawl_pending());
+    assert!(slave.meta("src", &p("/src/f79.txt")).unwrap().is_some());
 }
 
 #[test]
@@ -536,10 +582,12 @@ fn rescan_skips_arborsync_tmp_under_checkout_local() {
     tree.file("keep.txt", b"keep");
     slave.rescan("src").unwrap();
     assert!(slave.meta("src", &p("/src/keep.txt")).unwrap().is_some());
-    assert!(slave
-        .meta("src", &p("/src/.arborsync-tmp/scratch"))
-        .unwrap()
-        .is_none());
+    assert!(
+        slave
+            .meta("src", &p("/src/.arborsync-tmp/scratch"))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

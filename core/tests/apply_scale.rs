@@ -5,7 +5,7 @@ use arborsync_core::hash::ContentHash;
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{Master, Reply, WholeFileLater};
 use arborsync_core::merkle::file_node;
-use arborsync_core::meta::{hash_bytes, FileMetadata};
+use arborsync_core::meta::{FileMetadata, hash_bytes};
 use arborsync_core::path::CanonicalPath;
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::storage::CheckoutId;

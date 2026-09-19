@@ -1,15 +1,15 @@
+use arborsync_core::LoadedMaster;
+use arborsync_core::LoadedSlave;
+use arborsync_core::LocalEvent;
 use arborsync_core::config::{CheckoutConfig, SlaveAcl};
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{Master, MemoryContent, Reply as MasterReply};
 use arborsync_core::merkle::{empty_dir_node, file_node};
-use arborsync_core::meta::{collect_from_path, hash_bytes, EntryKind, FileMetadata};
-use arborsync_core::path::{conflict_sidecar_path, RESERVED_CONFLICTS, RESERVED_TMP};
+use arborsync_core::meta::{EntryKind, FileMetadata, collect_from_path, hash_bytes};
+use arborsync_core::path::{RESERVED_CONFLICTS, RESERVED_TMP, conflict_sidecar_path};
 use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
 use arborsync_core::slave::{Reply as SlaveReply, Slave};
-use arborsync_core::test_support::{p, MemoryStorage, SyncSandbox};
-use arborsync_core::LoadedMaster;
-use arborsync_core::LoadedSlave;
-use arborsync_core::LocalEvent;
+use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
 
 const ALICE: [u8; 32] = [0xA1; 32];
 const BACKUP: [u8; 32] = [0xB1; 32];
@@ -183,22 +183,26 @@ fn reserved_sidecar_dirs_stay_off_the_index() {
         .note_local(LocalEvent::Changed(p("/.arborsync-tmp/scratch")))
         .unwrap();
     assert!(master.poll(BACKUP).is_empty());
-    assert!(slave
-        .note_local("src", LocalEvent::Changed(p("/src/.arborsync-tmp/scratch")))
-        .unwrap()
-        .is_empty());
-
-    assert!(slave_msgs(
+    assert!(
         slave
-            .handle(ProtocolMessage::FileAnnounce {
-                checkout_id: "src".into(),
-                path: p("/src/hello.txt"),
-                new: file_meta(hello, 0o100644),
-                basis: None,
-            })
+            .note_local("src", LocalEvent::Changed(p("/src/.arborsync-tmp/scratch")))
             .unwrap()
-    )
-    .is_empty());
+            .is_empty()
+    );
+
+    assert!(
+        slave_msgs(
+            slave
+                .handle(ProtocolMessage::FileAnnounce {
+                    checkout_id: "src".into(),
+                    path: p("/src/hello.txt"),
+                    new: file_meta(hello, 0o100644),
+                    basis: None,
+                })
+                .unwrap()
+        )
+        .is_empty()
+    );
     assert_eq!(std::fs::read(local.join("hello.txt")).unwrap(), hello);
     assert!(!tmp_contains_body(&local.join(RESERVED_TMP), hello));
 }
@@ -362,16 +366,18 @@ fn cas_reject_sidecars_loser_then_live_path_is_the_winner() {
     }
 
     let winner_meta = master.meta(&p("/src/hello.txt")).unwrap().unwrap();
-    assert!(slave_msgs(
-        slave
-            .handle(ProtocolMessage::CasReject {
-                checkout_id: "src".into(),
-                path: p("/src/hello.txt"),
-                current: Some(winner_meta),
-            })
-            .unwrap()
-    )
-    .is_empty());
+    assert!(
+        slave_msgs(
+            slave
+                .handle(ProtocolMessage::CasReject {
+                    checkout_id: "src".into(),
+                    path: p("/src/hello.txt"),
+                    current: Some(winner_meta),
+                })
+                .unwrap()
+        )
+        .is_empty()
+    );
 
     let local_hash = hash_bytes(b"local");
     let sidecar = conflict_sidecar_path(&local, &p("/src/hello.txt"), &local_hash);
@@ -398,17 +404,19 @@ fn incoming_announce_sidecars_when_content_differs_and_meta_only_does_not() {
         .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
         .unwrap();
 
-    assert!(slave_msgs(
-        slave
-            .handle(ProtocolMessage::FileAnnounce {
-                checkout_id: "src".into(),
-                path: p("/src/hello.txt"),
-                new: file_meta(remote, 0o100644),
-                basis: None,
-            })
-            .unwrap()
-    )
-    .is_empty());
+    assert!(
+        slave_msgs(
+            slave
+                .handle(ProtocolMessage::FileAnnounce {
+                    checkout_id: "src".into(),
+                    path: p("/src/hello.txt"),
+                    new: file_meta(remote, 0o100644),
+                    basis: None,
+                })
+                .unwrap()
+        )
+        .is_empty()
+    );
     let local_hash = hash_bytes(b"local");
     let sidecar = conflict_sidecar_path(&local, &p("/src/hello.txt"), &local_hash);
     assert_eq!(std::fs::read(&sidecar).unwrap(), b"local");
@@ -417,17 +425,19 @@ fn incoming_announce_sidecars_when_content_differs_and_meta_only_does_not() {
     let live = slave.meta("src", &p("/src/hello.txt")).unwrap().unwrap();
     let mut incoming = live.clone();
     incoming.mode = 0o100755;
-    assert!(slave_msgs(
-        slave
-            .handle(ProtocolMessage::FileAnnounce {
-                checkout_id: "src".into(),
-                path: p("/src/hello.txt"),
-                new: incoming,
-                basis: None,
-            })
-            .unwrap()
-    )
-    .is_empty());
+    assert!(
+        slave_msgs(
+            slave
+                .handle(ProtocolMessage::FileAnnounce {
+                    checkout_id: "src".into(),
+                    path: p("/src/hello.txt"),
+                    new: incoming,
+                    basis: None,
+                })
+                .unwrap()
+        )
+        .is_empty()
+    );
     assert!(!conflict_sidecar_path(&local, &p("/src/hello.txt"), &remote_hash).exists());
     assert_eq!(std::fs::read(local.join("hello.txt")).unwrap(), remote);
     assert_eq!(
@@ -450,17 +460,19 @@ fn inflight_echo_survives_mtime_only_then_a_real_edit_announces() {
     let mut slave = alice_slave(&sandbox, bodies);
     let applied = file_meta(hello, 0o100644);
     let applied_node = file_node(&applied);
-    assert!(slave_msgs(
-        slave
-            .handle(ProtocolMessage::FileAnnounce {
-                checkout_id: "src".into(),
-                path: p("/src/hello.txt"),
-                new: applied.clone(),
-                basis: None,
-            })
-            .unwrap()
-    )
-    .is_empty());
+    assert!(
+        slave_msgs(
+            slave
+                .handle(ProtocolMessage::FileAnnounce {
+                    checkout_id: "src".into(),
+                    path: p("/src/hello.txt"),
+                    new: applied.clone(),
+                    basis: None,
+                })
+                .unwrap()
+        )
+        .is_empty()
+    );
 
     let local = slave.checkout_local("src").unwrap().to_path_buf();
     sandbox
@@ -471,19 +483,23 @@ fn inflight_echo_survives_mtime_only_then_a_real_edit_announces() {
         .unwrap();
     assert_eq!(disk.content_hash, hash);
     assert_ne!(file_node(&disk), applied_node);
-    assert!(slave
-        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
-        .unwrap()
-        .is_empty());
+    assert!(
+        slave
+            .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+            .unwrap()
+            .is_empty()
+    );
 
     sandbox.tree(&local).file("hello.txt", b"edited");
     match &slave
         .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
         .unwrap()[..]
     {
-        [ProtocolMessage::FileAnnounce {
-            path, new, basis, ..
-        }] => {
+        [
+            ProtocolMessage::FileAnnounce {
+                path, new, basis, ..
+            },
+        ] => {
             assert_eq!(path, &p("/src/hello.txt"));
             assert_eq!(new.content_hash, hash_bytes(b"edited"));
             assert_eq!(*basis, Some(applied_node));
@@ -672,9 +688,11 @@ fn slave_rescan_then_reconcile_announces_a_file_the_watcher_never_saw() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::DirListRequest {
-            checkout_id, path, ..
-        }] => {
+        [
+            ProtocolMessage::DirListRequest {
+                checkout_id, path, ..
+            },
+        ] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src"));
         }
@@ -693,12 +711,14 @@ fn slave_rescan_then_reconcile_announces_a_file_the_watcher_never_saw() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::FileAnnounce {
-            checkout_id,
-            path,
-            new,
-            basis,
-        }] => {
+        [
+            ProtocolMessage::FileAnnounce {
+                checkout_id,
+                path,
+                new,
+                basis,
+            },
+        ] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src/leftover.txt"));
             assert_eq!(new.content_hash, hash_bytes(b"mine"));

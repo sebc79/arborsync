@@ -33,7 +33,7 @@ Preconditions:
 ## Gotchas
 
 - Do not treat a master `health=stuck` line during a large file as a hang if the next window shows `bulk_in` or a lower `pending`.
-- A slave that stops emitting `status ` while master `pending` stays high and `bulk_in` stays 0 is the old write-all stall.
+- A slave that stops emitting `status ` while master `pending` stays high and `bulk_in` stays 0 is the old write-all stall. Rescan and leftover pages now yield every 64 names. Master `write_control` is off the session `select!`. A live 300k-file copy into an armed checkout can still overflow inotify. That is not leftover-at-connect.
 - A slave `status` line with `pending` stuck and `apply_ok=0` / `bulk_in=0` while `dir_list` or `bulk_out` still move is a buried pull. The master's copy of an overlapping path should still change on the slave before the leftover walk finishes.
 - A leftover walk plus a watcher used to send the same file twice. The second bulk was `unknown_transfer` and held later leftover asks. The slave now drops a second ask for the same path and hash. A late bulk whose pending row is gone is still `CasAccept` when the live file already matches. A new leftover path still copies.
 - Prefill the checkout before the slave process starts. A live watcher write is a different path.

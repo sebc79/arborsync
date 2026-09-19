@@ -3,12 +3,12 @@ use std::time::Instant;
 
 use arborsync_core::LoadedMaster;
 use arborsync_core::config::SlaveAcl;
+use arborsync_core::hash::ContentHash;
 use arborsync_core::keys::{format_hex_key, public_from_secret, write_static_key};
 use arborsync_core::master::{Master, MemoryContent, Reply};
-use arborsync_core::meta::hash_bytes;
-use arborsync_core::hash::ContentHash;
 use arborsync_core::meta::FileMetadata;
-use arborsync_core::protocol::{encode_control, BulkEncoding, BulkHeader, ProtocolMessage};
+use arborsync_core::meta::hash_bytes;
+use arborsync_core::protocol::{BulkEncoding, BulkHeader, ProtocolMessage, encode_control};
 use arborsync_core::slave::Slave;
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
 use arborsync_core::transfer::BulkTransfer;

@@ -2,6 +2,7 @@
 //! procedures and must not contradict that file.
 
 mod apply;
+mod crawl;
 mod index;
 mod inflight;
 

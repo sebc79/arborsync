@@ -15,11 +15,11 @@ use crate::index;
 use crate::inflight::Inflight;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
-use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
+use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
 use crate::path::{
-    canonical_to_host, is_reserved_root_entry, join_central, CanonicalPath, EntryName, PathError,
+    CanonicalPath, EntryName, PathError, canonical_to_host, is_reserved_root_entry, join_central,
 };
-use crate::protocol::{page_dir_list, BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
+use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage, page_dir_list};
 use crate::status::{MasterStatus, PeerLive, Queues, StatusLedger};
 use crate::storage::{CheckoutId, Storage};
 use crate::transfer::{self, BulkTransfer};
