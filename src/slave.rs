@@ -244,18 +244,19 @@ async fn session(
 
     let (mut send, mut recv) = conn.open_control().await?;
     Connection::write_control(&mut send, &subscribe).await?;
-    let (write_tx, mut write_rx) = unbounded_channel::<ProtocolMessage>();
+    let (urgent_tx, mut urgent_rx) = unbounded_channel::<ProtocolMessage>();
+    let (walk_tx, mut walk_rx) = unbounded_channel::<ProtocolMessage>();
     let (write_err_tx, mut write_err_rx) = unbounded_channel();
     tokio::spawn(async move {
-        while let Some(msg) = write_rx.recv().await {
+        while let Some(msg) = next_outbound(&mut urgent_rx, &mut walk_rx).await {
             if let Err(err) = Connection::write_control(&mut send, &msg).await {
                 let _ = write_err_tx.send(err);
-                break;
+                return;
             }
         }
     });
     let (bulk_tx, mut bulk_rx) = unbounded_channel();
-    let mut outbound = Outbound::new(write_tx.clone(), bulk_tx);
+    let mut outbound = Outbound::new(urgent_tx, walk_tx.clone(), bulk_tx);
     outbound.ingest(slave, &conn, Connection::read_control(&mut recv).await?)?;
     log::info!("connected to {addr_text}");
 
@@ -306,7 +307,7 @@ async fn session(
                     work_tx,
                     watch_gen,
                     peer,
-                    &outbound.write_tx,
+                    &outbound.walk_tx,
                 )?;
             }
             Some(()) = config_rx.recv() => {
@@ -316,13 +317,30 @@ async fn session(
                     work_tx,
                     watch_gen,
                     peer,
-                    &outbound.write_tx,
+                    &outbound.walk_tx,
                 )?;
             }
             _ = status_clock.wait(status_every) => {
                 emit_slave_status(slave, true);
             }
         }
+    }
+}
+
+async fn next_outbound(
+    urgent: &mut tokio::sync::mpsc::UnboundedReceiver<ProtocolMessage>,
+    walk: &mut tokio::sync::mpsc::UnboundedReceiver<ProtocolMessage>,
+) -> Option<ProtocolMessage> {
+    tokio::select! {
+        biased;
+        msg = urgent.recv() => match msg {
+            Some(msg) => Some(msg),
+            None => walk.recv().await,
+        },
+        msg = walk.recv() => match msg {
+            Some(msg) => Some(msg),
+            None => urgent.recv().await,
+        },
     }
 }
 
@@ -359,7 +377,8 @@ fn apply_live_slave_reload(
 }
 
 struct Outbound {
-    write_tx: UnboundedSender<ProtocolMessage>,
+    urgent_tx: UnboundedSender<ProtocolMessage>,
+    walk_tx: UnboundedSender<ProtocolMessage>,
     parked: VecDeque<ProtocolMessage>,
     bulk_tx: UnboundedSender<anyhow::Result<()>>,
     bulk_busy: bool,
@@ -367,11 +386,13 @@ struct Outbound {
 
 impl Outbound {
     fn new(
-        write_tx: UnboundedSender<ProtocolMessage>,
+        urgent_tx: UnboundedSender<ProtocolMessage>,
+        walk_tx: UnboundedSender<ProtocolMessage>,
         bulk_tx: UnboundedSender<anyhow::Result<()>>,
     ) -> Self {
         Self {
-            write_tx,
+            urgent_tx,
+            walk_tx,
             parked: VecDeque::new(),
             bulk_tx,
             bulk_busy: false,
@@ -394,8 +415,12 @@ impl Outbound {
 
     fn enqueue(&mut self, msgs: Vec<ProtocolMessage>) -> anyhow::Result<()> {
         for msg in msgs {
-            self.write_tx
-                .send(msg)
+            let tx = if matches!(msg, ProtocolMessage::SignatureRequest { .. }) {
+                &self.urgent_tx
+            } else {
+                &self.walk_tx
+            };
+            tx.send(msg)
                 .map_err(|_| anyhow::anyhow!("control writer closed"))?;
         }
         Ok(())
