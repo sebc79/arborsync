@@ -467,10 +467,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     fn apply_bulk_message(&mut self, header: BulkHeader, body: &[u8]) -> Result<Reply, SlaveError> {
         let key = (header.checkout_id.clone(), header.path.clone());
         let Some(pending) = self.pending.get(&key) else {
-            return self.already_applied_bulk(&header);
+            return self.accept_if_live_matches(&header);
         };
         if pending.new.content_hash != header.want_hash {
-            return self.already_applied_bulk(&header);
+            return self.accept_if_live_matches(&header);
         }
         let host = self.host_for(&header.checkout_id, &header.path)?;
         let previous = self.meta(&header.checkout_id, &header.path)?;
@@ -507,7 +507,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         }
     }
 
-    fn already_applied_bulk(&self, header: &BulkHeader) -> Result<Reply, SlaveError> {
+    fn accept_if_live_matches(&self, header: &BulkHeader) -> Result<Reply, SlaveError> {
         let host = self.host_for(&header.checkout_id, &header.path)?;
         let live = apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))?;
         if live

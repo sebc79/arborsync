@@ -19,7 +19,7 @@ A tree already on the slave checkout at connect is announced and copied to `cent
 Preconditions:
 
 - ArborSync is healthy from `control-arborsync doctor`.
-- `LOCAL` and `CENTRAL_ROOT` come from `control-arborsync paths`.
+- `LOCAL` and `CENTRAL_ROOT` come from `control-arborsync paths`. Source that file with `set -a` so the values are exported. A bare `source` sets them in the shell only; a child process will not see `LOCAL`.
 - The helper pair is the one this run launched.
 
 - **Stop the slave.** Kill only `SLAVE_PID` from `control-arborsync paths`. Leave the master running.
@@ -35,5 +35,5 @@ Preconditions:
 - Do not treat a master `health=stuck` line during a large file as a hang if the next window shows `bulk_in` or a lower `pending`.
 - A slave that stops emitting `status ` while master `pending` stays high and `bulk_in` stays 0 is the old write-all stall.
 - A slave `status` line with `pending` stuck and `apply_ok=0` / `bulk_in=0` while `dir_list` or `bulk_out` still move is a buried pull. The master's copy of an overlapping path should still change on the slave before the leftover walk finishes.
-- `last_error=unknown_transfer` on a path that already exists under `central_root` with the announced bytes is a late duplicate bulk. It should not raise `apply_fail` after this fix. A new leftover path still copies.
+- A leftover walk plus a watcher used to send the same file twice. The second bulk was `unknown_transfer` and held later leftover asks. The slave now drops a second ask for the same path and hash. A late bulk whose pending row is gone is still `CasAccept` when the live file already matches. A new leftover path still copies.
 - Prefill the checkout before the slave process starts. A live watcher write is a different path.

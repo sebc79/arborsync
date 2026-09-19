@@ -567,10 +567,10 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     ) -> Result<Reply, MasterError> {
         let key = (header.checkout_id.clone(), header.path.clone());
         let Some(pending) = self.pending.get(&key) else {
-            return self.already_applied_bulk(&header);
+            return self.accept_if_live_matches(&header);
         };
         if pending.peer != peer || pending.new.content_hash != header.want_hash {
-            return self.already_applied_bulk(&header);
+            return self.accept_if_live_matches(&header);
         }
         let host = canonical_to_host(&self.central_root, &header.path);
         let basis = if pending
@@ -623,7 +623,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         }
     }
 
-    fn already_applied_bulk(&self, header: &BulkHeader) -> Result<Reply, MasterError> {
+    fn accept_if_live_matches(&self, header: &BulkHeader) -> Result<Reply, MasterError> {
         let host = canonical_to_host(&self.central_root, &header.path);
         let live = apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))?;
         if live

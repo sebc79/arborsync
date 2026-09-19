@@ -381,7 +381,7 @@ struct Outbound {
     urgent_tx: UnboundedSender<ProtocolMessage>,
     walk_tx: UnboundedSender<ProtocolMessage>,
     parked: VecDeque<ProtocolMessage>,
-    seen_sr: HashSet<(String, CanonicalPath, ContentHash)>,
+    fulfilled_asks: HashSet<(String, CanonicalPath, ContentHash)>,
     bulk_tx: UnboundedSender<anyhow::Result<()>>,
     bulk_busy: bool,
 }
@@ -396,7 +396,7 @@ impl Outbound {
             urgent_tx,
             walk_tx,
             parked: VecDeque::new(),
-            seen_sr: HashSet::new(),
+            fulfilled_asks: HashSet::new(),
             bulk_tx,
             bulk_busy: false,
         }
@@ -409,7 +409,7 @@ impl Outbound {
         msg: ProtocolMessage,
     ) -> anyhow::Result<()> {
         if let Some(key) = signature_request_key(&msg) {
-            if self.seen_sr.contains(&key)
+            if self.fulfilled_asks.contains(&key)
                 || self
                     .parked
                     .iter()
@@ -451,7 +451,7 @@ impl Outbound {
     }
 
     fn spawn_bulk(&mut self, conn: &Connection, xfer: BulkTransfer) {
-        self.seen_sr.insert((
+        self.fulfilled_asks.insert((
             xfer.header.checkout_id.clone(),
             xfer.header.path.clone(),
             xfer.header.want_hash,
