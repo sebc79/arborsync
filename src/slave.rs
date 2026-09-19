@@ -280,6 +280,13 @@ async fn session(
                 outbound.on_bulk_done(slave, &conn, result)?;
             }
             Some(err) = write_err_rx.recv() => return Err(err.into()),
+            _ = wait_if_crawl_pending(slave) => {
+                match slave.lock().expect("slave").crawl_step() {
+                    Ok(outs) => outbound.enqueue(outs)?,
+                    Err(SlaveError::UnknownCheckout(_)) => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
             work = work.recv() => {
                 let Some(work) = work else {
                     anyhow::bail!("watch channel closed");
@@ -326,6 +333,13 @@ async fn session(
             }
         }
     }
+}
+
+async fn wait_if_crawl_pending(slave: &SharedSlave) {
+    if slave.lock().expect("slave").crawl_pending() {
+        return;
+    }
+    std::future::pending::<()>().await;
 }
 
 async fn next_outbound(

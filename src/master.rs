@@ -10,6 +10,7 @@ use arborsync_core::ReloadError;
 use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::master::{Master, Reply, WholeFileLater};
 use arborsync_core::path::host_to_canonical;
+use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::storage::Storage;
 use arborsync_core::transport::{AttemptLimiter, Transport, listen, read_bulk, stream_err};
 use arborsync_core::watch::to_local_events;
@@ -18,6 +19,7 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use quinn::{Connection, Incoming};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::reload::{apply_file_log_level, spawn_config_watch};
 
@@ -233,6 +235,26 @@ async fn accept_session(
     }
 
     let (mut send, mut recv) = conn.accept_control().await?;
+    let (write_tx, mut write_rx) = unbounded_channel::<Vec<ProtocolMessage>>();
+    let (write_err_tx, mut write_err_rx) = unbounded_channel();
+    let writer_master = master.clone();
+    tokio::spawn(async move {
+        while let Some(batch) = write_rx.recv().await {
+            let large = batch.len() > OUTBOX_BACKPRESSURE;
+            for msg in &batch {
+                if let Err(err) = Connection::write_control(&mut send, msg).await {
+                    let _ = write_err_tx.send(err);
+                    return;
+                }
+            }
+            if large {
+                writer_master
+                    .lock()
+                    .expect("master")
+                    .set_writable(peer, true);
+            }
+        }
+    });
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     loop {
         tokio::select! {
@@ -244,7 +266,7 @@ async fn accept_session(
             msg = Connection::read_control(&mut recv) => {
                 let msg = msg?;
                 let reply = master.lock().expect("master").handle(peer, msg)?;
-                if dispatch_master(&master, peer, &slave_id, &conn, &mut send, reply, &limiter, ip).await? {
+                if dispatch_master(&master, peer, &slave_id, &conn, &write_tx, reply, &limiter, ip)? {
                     break;
                 }
             }
@@ -252,11 +274,12 @@ async fn accept_session(
                 let mut recv = incoming.map_err(stream_err)?;
                 let (header, body) = read_bulk(&mut recv).await?;
                 let reply = master.lock().expect("master").apply_bulk(peer, header, &body)?;
-                if dispatch_master(&master, peer, &slave_id, &conn, &mut send, reply, &limiter, ip).await? {
+                if dispatch_master(&master, peer, &slave_id, &conn, &write_tx, reply, &limiter, ip)? {
                     break;
                 }
             }
-            _ = tick.tick() => flush_outbox(&master, peer, &mut send).await?,
+            Some(err) = write_err_rx.recv() => return Err(err.into()),
+            _ = tick.tick() => flush_outbox(&master, peer, &write_tx)?,
         }
     }
 
@@ -267,12 +290,12 @@ async fn accept_session(
     Ok(())
 }
 
-async fn dispatch_master(
+fn dispatch_master(
     master: &SharedMaster,
     peer: [u8; 32],
     slave_id: &str,
     conn: &quinn::Connection,
-    send: &mut quinn::SendStream,
+    write_tx: &UnboundedSender<Vec<ProtocolMessage>>,
     reply: Reply,
     limiter: &Mutex<AttemptLimiter>,
     ip: std::net::IpAddr,
@@ -287,32 +310,48 @@ async fn dispatch_master(
             Ok(true)
         }
         Reply::Send(out) => {
-            Connection::write_control(send, &out).await?;
-            flush_outbox(master, peer, send).await?;
+            enqueue_control(write_tx, vec![out])?;
+            flush_outbox(master, peer, write_tx)?;
             Ok(false)
         }
         Reply::Bulk(xfer) => {
-            conn.write_bulk(&xfer).await?;
-            flush_outbox(master, peer, send).await?;
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                if let Err(err) = conn.write_bulk(&xfer).await {
+                    log::warn!("master bulk send: {err:#}");
+                }
+            });
+            flush_outbox(master, peer, write_tx)?;
             Ok(false)
         }
     }
 }
 
-async fn flush_outbox(
+fn flush_outbox(
     master: &SharedMaster,
     peer: [u8; 32],
-    send: &mut quinn::SendStream,
+    write_tx: &UnboundedSender<Vec<ProtocolMessage>>,
 ) -> anyhow::Result<()> {
     let pending = master.lock().expect("master").poll(peer);
+    if pending.is_empty() {
+        return Ok(());
+    }
     if pending.len() > OUTBOX_BACKPRESSURE {
         master.lock().expect("master").set_writable(peer, false);
     }
-    for msg in &pending {
-        Connection::write_control(send, msg).await?;
+    enqueue_control(write_tx, pending)
+}
+
+fn enqueue_control(
+    write_tx: &UnboundedSender<Vec<ProtocolMessage>>,
+    msgs: Vec<ProtocolMessage>,
+) -> anyhow::Result<()> {
+    if msgs.is_empty() {
+        return Ok(());
     }
-    master.lock().expect("master").set_writable(peer, true);
-    Ok(())
+    write_tx
+        .send(msgs)
+        .map_err(|_| anyhow::anyhow!("control writer closed"))
 }
 
 fn watch_central(

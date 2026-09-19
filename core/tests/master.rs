@@ -1,16 +1,16 @@
+use arborsync_core::LoadedMaster;
+use arborsync_core::LocalEvent;
 use arborsync_core::config::{ReloadError, SlaveAcl};
 use arborsync_core::hash::{ContentHash, FileNode};
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{
-    decide_cas, CasDecision, Master, MemoryContent, Reply, WholeFileLater,
+    CasDecision, Master, MemoryContent, Reply, WholeFileLater, decide_cas,
 };
-use arborsync_core::merkle::{self, file_node, DirChild};
-use arborsync_core::meta::{hash_bytes, EntryKind, FileMetadata};
+use arborsync_core::merkle::{self, DirChild, file_node};
+use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};
 use arborsync_core::path::RESERVED_CONFLICTS;
 use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
-use arborsync_core::test_support::{name, p, MemoryStorage, SyncSandbox};
-use arborsync_core::LoadedMaster;
-use arborsync_core::LocalEvent;
+use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
 
 const ALICE: [u8; 32] = [0xA1; 32];
 const BACKUP: [u8; 32] = [0xB1; 32];
@@ -390,10 +390,12 @@ fn handle_type_change_file_to_symlink_and_back() {
         other => panic!("expected CasAccept, got {other:?}"),
     }
     let host = sandbox.central_root().join("src/hello.txt");
-    assert!(std::fs::symlink_metadata(&host)
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    assert!(
+        std::fs::symlink_metadata(&host)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(
         std::fs::read_link(&host).unwrap(),
         std::path::Path::new("somewhere")
@@ -1023,11 +1025,13 @@ fn handle_rename_moves_the_file_accepts_both_paths_and_fans_out() {
 
     let alice = master.poll(ALICE);
     match &alice[..] {
-        [ProtocolMessage::CasAccept {
-            path,
-            file_node: node,
-            ..
-        }] => {
+        [
+            ProtocolMessage::CasAccept {
+                path,
+                file_node: node,
+                ..
+            },
+        ] => {
             assert_eq!(path, &p("/src/old.txt"));
             assert_eq!(*node, None);
         }
@@ -1641,9 +1645,11 @@ fn git_object_fanout_dir_is_indexed_as_dir_and_dir_list_does_not_read_it() {
         .unwrap()
     {
         Reply::Send(ProtocolMessage::DirListResponse { entries, .. }) => {
-            assert!(entries
-                .iter()
-                .any(|child| child.name().as_str() == "deadbeef"));
+            assert!(
+                entries
+                    .iter()
+                    .any(|child| child.name().as_str() == "deadbeef")
+            );
         }
         other => panic!("expected DirListResponse, got {other:?}"),
     }

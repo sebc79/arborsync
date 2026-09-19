@@ -2,9 +2,9 @@ use arborsync_core::hash::{ContentHash, DirNode, FileNode};
 use arborsync_core::meta::FileMetadata;
 use arborsync_core::path::{CanonicalPath, EntryName};
 use arborsync_core::protocol::{
-    decode_bulk, decode_control, encode_bulk, encode_control, page_dir_list, BulkEncoding,
-    BulkHeader, DirEntry, Envelope, FrameError, ProtocolMessage, MAX_CONTROL_FRAME,
-    PROTOCOL_PREAMBLE, PROTOCOL_VERSION,
+    BulkEncoding, BulkHeader, DirEntry, Envelope, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE,
+    PROTOCOL_VERSION, ProtocolMessage, decode_bulk, decode_control, encode_bulk, encode_control,
+    page_dir_list,
 };
 use arborsync_core::test_support::{name, p};
 
