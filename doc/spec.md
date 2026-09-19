@@ -315,7 +315,7 @@ After `SubscribeAck`, every rescan interval, and on reconnect:
 3. On mismatch (or empty slave), slave walks:
    - `DirListRequest` / `DirListResponse` for the directory (`name`, `kind`, `node_hash`). A listing that would exceed the 1 MiB control frame is split. `DirListResponse.more` means later names remain. The slave must not treat those unsent names as absent. It continues with `DirListRequest.after` set to the last name on the page.
    - Name only on master → pull create (or `Mkdir`).
-   - Name only on slave → if `last_synced` absent, `FileAnnounce` create; if `last_synced` present and local == it, `Delete`; if local differs, announce CAS (slave thinks it changed) or, if master deleted, slave will `CasReject` and follow §8.
+   - Name only on slave → if `last_synced` absent, `FileAnnounce` create; if `last_synced` present and local == it, `Delete`; if local differs, announce CAS (slave thinks it changed) or, if master deleted, slave will `CasReject` and follow §8. After a create or CAS announce of a directory, the slave also sends `DirListRequest` for that path. The master lists the directory after it applies the announce. That walk covers nested leftover files in the same session.
    - Both present, hashes differ → recurse if dir; if file, 3-way on `last_synced`:
      - local == last_synced, master != last_synced → pull;
      - local != last_synced, master == last_synced → announce CAS;
@@ -590,6 +590,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §11 bulk read is not cancelled by `select!` | Master and slave `accept_uni` inside `select!`, then `read_bulk` after that arm wins. Cancelling `accept_bulk` mid-body dropped the `RecvStream` and Quinn sent `STOP_SENDING` 0. |
 | ✅ | §11 control read keeps bytes across `select!` | `ControlReader.pending` retains bytes that a cancelled `read_control` already copied. Quinn `read` is cancel-safe. A cancelled `read_exact` used to treat leftover path bytes as the next length prefix. |
 | ✅ | §10 `SubscribeReject` | Slave stores `denied_centrals`. `subscribe()` omits those centrals. On `SubscribeReject`, insert, log, and `Reply::Send(vec![subscribe()])` if any checkout remains, else `Reply::Hangup`. Cleared on a checkout or pin reload. Master prefix-deny stays `SubscribeReject`. |
+| ✅ | §10 slave-only directory walk | `on_dir_list` follows `AnnounceCreate` / `AnnounceCas` of a directory with `DirListRequest` for that path. Nested leftover files are announced in the same session. A walk that only announced the directory used to stall resume of a tree dropped into the checkout. |
 | ✅ | §12 one live connection per `slave_id` | Replacing a session `close`s the previous `Connection` and signals the old task. |
 | ✅ | §12 `Transport` trait | `Transport` is a live session. It exposes the peer static key, one control stream pair, on-demand bulk, and `close`. `impl Transport for quinn::Connection` is the QUIC path. The master and slave binaries and `core/tests/transport.rs` call the trait. `MemoryTransport::pair` is the in-memory test impl. Most unit tests still call `handle`. |
 | ➖ | §14 `quic_*` / `reconnect_*` | Struck in `doc/configuration.md`. Not struct fields. Reconnect is 1 s, doubling, cap 60 s. |

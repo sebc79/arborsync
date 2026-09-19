@@ -104,7 +104,7 @@ After `SubscribeAck`, after every rescan, and after reconnect, the slave sends `
 - Master equals last-synced and local differs: announce.
 - Both differ: announce, then expect `CasAccept` or `CasReject`.
 
-Initial populate is the same walk with `last_synced` empty.
+Initial populate is the same walk with `last_synced` empty. A directory that exists only on the slave is announced, then the slave sends `DirListRequest` for that path so nested leftover files are in the same session.
 
 Rescan is a full `stat` walk, not a dirty-subtree walk. `collect_for_rescan` hashes again only when kind, size, or mtime disagree with the index. Mode is not a miss. Create, Write, Metadata, Rename, and master `walk_central` use that path too. The 60 s timer is `recv_timeout` on the notify channel, so a busy tree delays rescan.
 
