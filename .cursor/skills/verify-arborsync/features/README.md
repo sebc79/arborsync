@@ -47,3 +47,4 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Connect a slave](./slave-connect.md) covers connect after listen, missing key path, idle retry while the master is down, and the startup public pin.
 - [Sync a slave write to the master](./sync-from-slave.md) covers a checkout file appearing under `central_root/src`.
 - [Sync a master write to the slave](./sync-from-master.md) covers a central file appearing in the checkout.
+- [Read interval status lines](./interval-status.md) covers the 5 s master and slave summaries.

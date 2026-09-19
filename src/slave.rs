@@ -92,13 +92,31 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
             Ok(()) => backoff = Duration::from_secs(1),
             Err(err) => {
                 log::warn!("{err:#}");
-                tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {}
-                    _ = hangup.recv() => {
-                        reload_slave_from_disk(&config_path, &slave, &work_tx, &watch_gen);
+                slave
+                    .lock()
+                    .expect("slave")
+                    .note_status_error(None, format!("{err:#}"));
+                let deadline = std::time::Instant::now() + backoff;
+                let mut status_clock = crate::status::Clock::new();
+                loop {
+                    let remain = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remain.is_zero() {
+                        break;
                     }
-                    Some(()) = cfg_rx.recv() => {
-                        reload_slave_from_disk(&config_path, &slave, &work_tx, &watch_gen);
+                    let status_every = slave.lock().expect("slave").status_interval_seconds();
+                    tokio::select! {
+                        _ = tokio::time::sleep(remain) => break,
+                        _ = status_clock.wait(status_every) => {
+                            emit_slave_status(&slave, false);
+                        }
+                        _ = hangup.recv() => {
+                            reload_slave_from_disk(&config_path, &slave, &work_tx, &watch_gen);
+                            break;
+                        }
+                        Some(()) = cfg_rx.recv() => {
+                            reload_slave_from_disk(&config_path, &slave, &work_tx, &watch_gen);
+                            break;
+                        }
                     }
                 }
                 backoff = (backoff * 2).min(Duration::from_secs(60));
@@ -205,7 +223,7 @@ async fn session(
     watch_gen: &Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     let (addr_text, subscribe) = {
-        let guard = slave.lock().expect("slave");
+        let mut guard = slave.lock().expect("slave");
         (guard.master_addr().to_string(), guard.subscribe())
     };
     let addr = addr_text
@@ -234,7 +252,9 @@ async fn session(
     .await?;
     log::info!("connected to {addr_text}");
 
+    let mut status_clock = crate::status::Clock::new();
     loop {
+        let status_every = slave.lock().expect("slave").status_interval_seconds();
         tokio::select! {
             msg = Connection::read_control(&mut recv) => {
                 let msg = msg?;
@@ -301,8 +321,20 @@ async fn session(
                 )
                 .await?;
             }
+            _ = status_clock.wait(status_every) => {
+                emit_slave_status(slave, true);
+            }
         }
     }
+}
+
+fn emit_slave_status(slave: &SharedSlave, connected: bool) {
+    let mut guard = slave.lock().expect("slave");
+    let period = guard.status_interval_seconds();
+    if period == 0 {
+        return;
+    }
+    log::info!("{}", guard.take_status(connected).line(period));
 }
 
 async fn apply_live_slave_reload(

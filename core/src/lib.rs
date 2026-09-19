@@ -15,6 +15,7 @@ pub mod path;
 pub mod protocol;
 pub mod reconcile;
 pub mod slave;
+pub mod status;
 pub mod storage;
 pub mod transfer;
 pub mod transport;

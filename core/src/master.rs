@@ -15,11 +15,12 @@ use crate::index;
 use crate::inflight::Inflight;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
-use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
+use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
 use crate::path::{
-    canonical_to_host, is_reserved_root_entry, join_central, CanonicalPath, EntryName, PathError,
+    CanonicalPath, EntryName, PathError, canonical_to_host, is_reserved_root_entry, join_central,
 };
-use crate::protocol::{page_dir_list, BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
+use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage, page_dir_list};
+use crate::status::{MasterStatus, PeerLive, Queues, StatusLedger};
 use crate::storage::{CheckoutId, Storage};
 use crate::transfer::{self, BulkTransfer};
 use crate::watch::LocalEvent;
@@ -398,6 +399,7 @@ pub struct Master<S: Storage, C: ContentHook> {
     bodies: C,
     pending: HashMap<(String, CanonicalPath), PendingApply>,
     dirs: index::DirChildren,
+    status: StatusLedger,
 }
 
 impl<S: Storage, C: ContentHook> Master<S, C> {
@@ -417,6 +419,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             bodies,
             pending: HashMap::new(),
             dirs: index::DirChildren::default(),
+            status: StatusLedger::default(),
         };
         if index::root_is_dirty(&master.store, &CheckoutId::master()).map_err(MasterError::index)? {
             master.rescan()?;
@@ -425,6 +428,18 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     }
 
     pub fn handle(&mut self, peer: [u8; 32], msg: ProtocolMessage) -> Result<Reply, MasterError> {
+        let slave = self.status_slave(&peer);
+        self.status.inbound(slave.as_deref(), &msg);
+        let reply = self.handle_message(peer, msg)?;
+        self.record_reply(slave.as_deref(), &reply);
+        Ok(reply)
+    }
+
+    fn handle_message(
+        &mut self,
+        peer: [u8; 32],
+        msg: ProtocolMessage,
+    ) -> Result<Reply, MasterError> {
         if self.cfg.acl_for_public_key(&peer).is_none() {
             return Ok(Reply::Hangup {
                 reason: "unknown static key".into(),
@@ -528,6 +543,28 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         header: BulkHeader,
         body: &[u8],
     ) -> Result<Reply, MasterError> {
+        let slave = self.status_slave(&peer);
+        self.status.bulk_in(slave.as_deref(), body.len() as u64);
+        let reply = self.apply_bulk_message(peer, header, body)?;
+        match &reply {
+            Reply::Send(ProtocolMessage::CasAccept { .. }) => {
+                self.status.apply_ok(slave.as_deref());
+            }
+            Reply::Send(ProtocolMessage::Error { .. }) => {
+                self.status.apply_fail(slave.as_deref());
+            }
+            _ => {}
+        }
+        self.record_reply(slave.as_deref(), &reply);
+        Ok(reply)
+    }
+
+    fn apply_bulk_message(
+        &mut self,
+        peer: [u8; 32],
+        header: BulkHeader,
+        body: &[u8],
+    ) -> Result<Reply, MasterError> {
         let key = (header.checkout_id.clone(), header.path.clone());
         let Some(pending) = self.pending.get(&key) else {
             return Ok(Reply::Send(ProtocolMessage::Error {
@@ -593,12 +630,16 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     }
 
     pub fn note_local(&mut self, event: LocalEvent) -> Result<(), MasterError> {
-        match event {
+        let result = match event {
             LocalEvent::Changed(path) => self.note_changed(path),
             LocalEvent::Metadata(path) => self.note_metadata(path),
             LocalEvent::Removed(path) => self.note_removed(&path),
             LocalEvent::Renamed { from, to } => self.note_renamed(from, to),
+        };
+        if result.is_ok() {
+            self.status.local(None);
         }
+        result
     }
 
     pub fn rescan(&mut self) -> Result<(), MasterError> {
@@ -624,6 +665,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             }
             self.commit(&Origin::Local, path, Some(found), current.as_ref())?;
         }
+        self.status.rescan(None);
         Ok(())
     }
 
@@ -633,7 +675,10 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     }
 
     pub fn poll(&mut self, peer: [u8; 32]) -> Vec<ProtocolMessage> {
-        self.roster.take_outbox(&peer)
+        let msgs = self.roster.take_outbox(&peer);
+        let slave = self.status_slave(&peer);
+        self.status.flushed(slave.as_deref(), msgs.len() as u64);
+        msgs
     }
 
     pub fn set_writable(&mut self, peer: [u8; 32], writable: bool) {
@@ -654,6 +699,58 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
 
     pub fn rescan_interval_seconds(&self) -> u64 {
         self.cfg.rescan_interval_seconds()
+    }
+
+    pub fn status_interval_seconds(&self) -> u64 {
+        self.cfg.status_interval_seconds()
+    }
+
+    pub fn take_status(&mut self) -> MasterStatus {
+        let live = self
+            .roster
+            .by_slave
+            .iter()
+            .map(|(id, session)| {
+                let pending = self
+                    .pending
+                    .values()
+                    .filter(|row| row.peer == session.peer)
+                    .count();
+                PeerLive {
+                    slave_id: id.as_str().to_string(),
+                    checkouts: session.checkouts.len(),
+                    queues: Queues {
+                        outbox: session.outbox.len(),
+                        pending,
+                        pending_pulls: 0,
+                        pending_renames: 0,
+                        writable: session.writable,
+                    },
+                }
+            })
+            .collect();
+        self.status.take_master(live)
+    }
+
+    pub fn note_status_error(&mut self, slave: Option<&str>, reason: impl Into<String>) {
+        self.status.error(slave, reason);
+    }
+
+    fn status_slave(&self, peer: &[u8; 32]) -> Option<String> {
+        self.cfg
+            .acl_for_public_key(peer)
+            .map(|acl| acl.id().to_string())
+            .or_else(|| self.roster.slave_of(peer).map(|id| id.as_str().to_string()))
+    }
+
+    fn record_reply(&mut self, slave: Option<&str>, reply: &Reply) {
+        match reply {
+            Reply::Send(msg) => self.status.outbound(slave, msg),
+            Reply::Hangup { reason, .. } => {
+                self.status.error(slave, format!("hangup:{reason}"));
+            }
+            Reply::Bulk(xfer) => self.status.bulk_out(slave, xfer.body.len() as u64),
+        }
     }
 
     pub fn log_level(&self) -> &str {

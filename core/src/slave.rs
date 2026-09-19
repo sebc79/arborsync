@@ -10,14 +10,15 @@ use crate::config::{ConfigError, LoadedSlave, ReloadError, SlaveReload};
 use crate::hash::{ContentHash, FileNode};
 use crate::index;
 use crate::inflight::Inflight;
-use crate::merkle::{file_node, DirChild};
-use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
+use crate::merkle::{DirChild, file_node};
+use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
 use crate::path::{
-    canonical_to_host, conflict_sidecar_path, is_reserved_root_entry, join_central,
-    local_paths_overlap, strip_central, CanonicalPath, EntryName, PathError,
+    CanonicalPath, EntryName, PathError, canonical_to_host, conflict_sidecar_path,
+    is_reserved_root_entry, join_central, local_paths_overlap, strip_central,
 };
 use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
-use crate::reconcile::{decide_child, WalkAction};
+use crate::reconcile::{WalkAction, decide_child};
+use crate::status::{Queues, SlaveStatus, StatusLedger};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
 use crate::transfer::{self, BulkTransfer};
 use crate::watch::LocalEvent;
@@ -183,6 +184,7 @@ pub struct Slave<S: Storage, C: ContentHook> {
     pending_pulls: HashSet<(String, CanonicalPath)>,
     pending_renames: HashMap<(String, CanonicalPath), CanonicalPath>,
     denied_centrals: HashSet<CanonicalPath>,
+    status: StatusLedger,
 }
 
 impl<S: Storage, C: ContentHook> Slave<S, C> {
@@ -214,6 +216,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             pending_pulls: HashSet::new(),
             pending_renames: HashMap::new(),
             denied_centrals: HashSet::new(),
+            status: StatusLedger::default(),
         })
     }
 
@@ -227,7 +230,13 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         }
     }
 
-    pub fn subscribe(&self) -> ProtocolMessage {
+    pub fn subscribe(&mut self) -> ProtocolMessage {
+        let msg = self.subscribe_message();
+        self.status.outbound(None, &msg);
+        msg
+    }
+
+    fn subscribe_message(&self) -> ProtocolMessage {
         ProtocolMessage::Subscribe {
             slave_id: self.cfg.slave_id().into(),
             checkouts: self
@@ -268,6 +277,41 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
 
     pub fn rescan_interval_seconds(&self) -> u64 {
         self.cfg.rescan_interval_seconds()
+    }
+
+    pub fn status_interval_seconds(&self) -> u64 {
+        self.cfg.status_interval_seconds()
+    }
+
+    pub fn take_status(&mut self, connected: bool) -> SlaveStatus {
+        self.status.take_slave(
+            connected,
+            Queues {
+                outbox: 0,
+                pending: self.pending.len(),
+                pending_pulls: self.pending_pulls.len(),
+                pending_renames: self.pending_renames.len(),
+                writable: true,
+            },
+        )
+    }
+
+    pub fn note_status_error(&mut self, slave: Option<&str>, reason: impl Into<String>) {
+        self.status.error(slave, reason);
+    }
+
+    fn record_reply(&mut self, reply: &Reply) {
+        match reply {
+            Reply::Send(msgs) => {
+                for msg in msgs {
+                    self.status.outbound(None, msg);
+                }
+            }
+            Reply::Hangup { reason } => {
+                self.status.error(None, format!("hangup:{reason}"));
+            }
+            Reply::Bulk(xfer) => self.status.bulk_out(None, xfer.body.len() as u64),
+        }
     }
 
     pub fn log_level(&self) -> &str {
@@ -326,6 +370,13 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     }
 
     pub fn handle(&mut self, msg: ProtocolMessage) -> Result<Reply, SlaveError> {
+        self.status.inbound(None, &msg);
+        let reply = self.handle_message(msg)?;
+        self.record_reply(&reply);
+        Ok(reply)
+    }
+
+    fn handle_message(&mut self, msg: ProtocolMessage) -> Result<Reply, SlaveError> {
         match msg {
             ProtocolMessage::SubscribeAck { .. } => self.on_subscribe_ack(),
             ProtocolMessage::SubscribeReject {
@@ -391,6 +442,25 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     }
 
     pub fn apply_bulk(&mut self, header: BulkHeader, body: &[u8]) -> Result<Reply, SlaveError> {
+        self.status.bulk_in(None, body.len() as u64);
+        let reply = self.apply_bulk_message(header, body)?;
+        match &reply {
+            Reply::Send(msgs) if msgs.is_empty() => self.status.apply_ok(None),
+            Reply::Send(msgs) => {
+                if msgs
+                    .iter()
+                    .any(|msg| matches!(msg, ProtocolMessage::Error { .. }))
+                {
+                    self.status.apply_fail(None);
+                }
+            }
+            _ => {}
+        }
+        self.record_reply(&reply);
+        Ok(reply)
+    }
+
+    fn apply_bulk_message(&mut self, header: BulkHeader, body: &[u8]) -> Result<Reply, SlaveError> {
         let key = (header.checkout_id.clone(), header.path.clone());
         let Some(pending) = self.pending.get(&key) else {
             return Ok(Reply::Send(vec![ProtocolMessage::Error {
@@ -444,12 +514,17 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         checkout_id: &str,
         event: LocalEvent,
     ) -> Result<Vec<ProtocolMessage>, SlaveError> {
-        match event {
+        let msgs = match event {
             LocalEvent::Changed(path) => self.note_changed(checkout_id, path),
             LocalEvent::Metadata(path) => self.note_metadata(checkout_id, path),
             LocalEvent::Removed(path) => self.note_removed(checkout_id, &path),
             LocalEvent::Renamed { from, to } => self.note_renamed(checkout_id, from, to),
+        }?;
+        self.status.local(None);
+        for msg in &msgs {
+            self.status.outbound(None, msg);
         }
+        Ok(msgs)
     }
 
     pub fn meta(
@@ -486,6 +561,15 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     }
 
     pub fn rescan(&mut self, checkout_id: &str) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        let msgs = self.rescan_checkout(checkout_id)?;
+        self.status.rescan(None);
+        for msg in &msgs {
+            self.status.outbound(None, msg);
+        }
+        Ok(msgs)
+    }
+
+    fn rescan_checkout(&mut self, checkout_id: &str) -> Result<Vec<ProtocolMessage>, SlaveError> {
         let (ck, central) = {
             let checkout = self.checkout(checkout_id)?;
             (checkout.id.clone(), checkout.central.clone())
@@ -969,7 +1053,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             .iter()
             .any(|checkout| !self.denied_centrals.contains(checkout.central()))
         {
-            Ok(Reply::Send(vec![self.subscribe()]))
+            Ok(Reply::Send(vec![self.subscribe_message()]))
         } else {
             Ok(Reply::Hangup { reason })
         }
@@ -982,7 +1066,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         ids.sort();
         let mut out = Vec::new();
         for id in ids {
-            out.extend(self.rescan(&id)?);
+            self.status.rescan(None);
+            out.extend(self.rescan_checkout(&id)?);
         }
         Ok(Reply::Send(out))
     }

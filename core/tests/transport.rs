@@ -95,7 +95,7 @@ async fn subscribe_over_xx_acks_a_pinned_slave() {
         }],
         vec![format_hex_key(&master_pub)],
     );
-    let slave = Slave::open(
+    let mut slave = Slave::open(
         arborsync_core::LoadedSlave::load(&slave_cfg).unwrap(),
         MemoryStorage::new(),
         MemoryContent::new(),
@@ -472,7 +472,7 @@ async fn subscribe_over_memory_acks_a_pinned_slave() {
         }],
         vec![format_hex_key(&master_pub)],
     );
-    let slave = Slave::open(
+    let mut slave = Slave::open(
         arborsync_core::LoadedSlave::load(&slave_cfg).unwrap(),
         MemoryStorage::new(),
         MemoryContent::new(),

@@ -3,6 +3,7 @@ mod keygen;
 mod master;
 mod reload;
 mod slave;
+mod status;
 mod watch;
 
 use clap::Parser;

@@ -470,6 +470,7 @@ db_path = "/var/lib/arborsync/index.redb"
 log_level = "info"
 watcher_debounce_ms = 200
 rescan_interval_seconds = 60
+status_interval_seconds = 5
 max_checkouts_per_slave = 100
 max_connections = 100
 max_connection_attempts_per_minute = 60
@@ -497,6 +498,7 @@ log_level = "info"
 max_checkouts_per_slave = 100
 watcher_debounce_ms = 200
 rescan_interval_seconds = 60
+status_interval_seconds = 5
 
 checkouts = [
     { id = "src",  central = "/src",  local = "/opt/projects/src" },
@@ -563,7 +565,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 4. ✅ Slave: connect, pin check, Subscribe, per-checkout watch, announce, apply, sidecar, log public pin at startup.
 5. ✅ Bulk `copia` streams; whole-file fallback. Apply reconstructs in memory, then writes the full buffer through `.arborsync-tmp`.
 6. ✅ Reconcile walk + rescan + reconnect.
-7. ✅ Config watch for checkout add/remove; SIGHUP ACL/log reload.
+7. ✅ Config watch for checkout add/remove; SIGHUP ACL/log/status-interval reload.
 8. ✅ Tests: `core/tests/scenarios.rs` covers reserved dirs, two checkouts on one slave (`/src` and `/`), CAS conflict, echo suppression, ACL deny, and rescan-as-missed-watcher. Those tests call `handle`, `note_local`, and `rescan` on `MemoryStorage`. `src/watch.rs` starts a real `notify-debouncer-full` thread and asserts a FileAnnounce after a post-arm write. `tests/sync.rs` starts master and slave over QUIC and asserts a post-connect write crosses.
 
 **✅ Framing and storage.** `decode_control` reads `Envelope.version`, then `ProtocolMessage`. An unknown version is `FrameError::UnsupportedVersion`, including a v2 variant index under version 2. On-disk `FileMetadata` is `u16le META_SCHEMA_VERSION || bincode` with its own `meta_bincode_config`. Wire frames use `wire_bincode_config`. Both configs are `bincode::config::standard()` today. The schema prefix is what stops a wire change from silently reinterpreting stored rows.
@@ -597,6 +599,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §11 / §12 keep-alive | Idle timeout stays at the Quinn 30 s default. `listen` and `client_endpoint` set `keep_alive_interval` to 10 s. No application `Heartbeat`. |
 | ✅ | Backpressure (`set_writable`) | `flush_outbox` polls the batch, `set_writable(peer, false)` when `pending.len() > 32` before writing, then `set_writable(peer, true)`. `set_writable(false)` still clears the leftover outbox. |
 | ✅ | In-flight bulk after disconnect | `Master::disconnect` drops pending rows whose `peer` is the disconnected peer. |
+| ✅ | Interval status reports | Master and slave log a `status ` summary each `status_interval_seconds` (default 5, `0` disables, max 3600). Health is `idle`, `busy`, `stuck`, or `failed`. The master adds one line per slave. Reload applies the interval live. No metrics port. |
 
 Topic documents:
 

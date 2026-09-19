@@ -121,7 +121,7 @@ fn master_won_delete_sidecars_divergent_content() {
 #[test]
 fn pin_miss_hangs_up_before_subscribe() {
     let sandbox = SyncSandbox::new();
-    let slave = alice_slave(&sandbox, MemoryContent::new());
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
     match slave.pin_check([0x00; 32]) {
         Err(Reply::Hangup { reason }) => assert_eq!(reason, "master pin miss"),
         other => panic!("expected hangup, got {other:?}"),
