@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::apply;
@@ -913,26 +913,35 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         signature: Vec<u8>,
     ) -> Result<Reply, SlaveError> {
         let host = self.host_for(&checkout_id, &path)?;
-        let Some(source) = apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))?
-        else {
-            return Ok(Reply::Send(vec![ProtocolMessage::Error {
-                code: "missing_hash".into(),
-                message: path.as_str().into(),
-            }]));
-        };
-        match transfer::fulfill(checkout_id, path.clone(), want_hash, &source, &signature) {
-            Ok(xfer) => Ok(Reply::Bulk(xfer)),
-            Err(transfer::TransferError::HashMismatch) => {
-                Ok(Reply::Send(vec![ProtocolMessage::Error {
-                    code: "missing_hash".into(),
-                    message: path.as_str().into(),
-                }]))
-            }
-            Err(err) => Ok(Reply::Send(vec![ProtocolMessage::Error {
-                code: "transfer".into(),
-                message: err.to_string(),
-            }])),
-        }
+        fulfill_from_host(checkout_id, path, want_hash, &signature, &host)
+    }
+
+    pub fn bulk_host(
+        &self,
+        checkout_id: &str,
+        path: &CanonicalPath,
+    ) -> Result<PathBuf, SlaveError> {
+        self.host_for(checkout_id, path)
+    }
+
+    pub fn announced_size(
+        &self,
+        checkout_id: &str,
+        path: &CanonicalPath,
+    ) -> Result<Option<u64>, SlaveError> {
+        Ok(self.meta(checkout_id, path)?.map(|meta| meta.size))
+    }
+
+    pub fn note_inbound(&mut self, msg: &ProtocolMessage) {
+        self.status.inbound(None, msg);
+    }
+
+    pub fn note_outbound(&mut self, msg: &ProtocolMessage) {
+        self.status.outbound(None, msg);
+    }
+
+    pub fn note_bulk_out(&mut self, bytes: u64) {
+        self.status.bulk_out(None, bytes);
     }
 
     fn host_for(&self, checkout_id: &str, path: &CanonicalPath) -> Result<PathBuf, SlaveError> {
@@ -1809,6 +1818,34 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.checkouts
             .get_mut(id)
             .ok_or_else(|| SlaveError::UnknownCheckout(id.into()))
+    }
+}
+
+pub fn fulfill_from_host(
+    checkout_id: String,
+    path: CanonicalPath,
+    want_hash: ContentHash,
+    signature: &[u8],
+    host: &Path,
+) -> Result<Reply, SlaveError> {
+    let Some(source) = apply::try_read_file_or_link(host).map_err(SlaveError::io(host))? else {
+        return Ok(Reply::Send(vec![ProtocolMessage::Error {
+            code: "missing_hash".into(),
+            message: path.as_str().into(),
+        }]));
+    };
+    match transfer::fulfill(checkout_id, path.clone(), want_hash, &source, signature) {
+        Ok(xfer) => Ok(Reply::Bulk(xfer)),
+        Err(transfer::TransferError::HashMismatch) => {
+            Ok(Reply::Send(vec![ProtocolMessage::Error {
+                code: "missing_hash".into(),
+                message: path.as_str().into(),
+            }]))
+        }
+        Err(err) => Ok(Reply::Send(vec![ProtocolMessage::Error {
+            code: "transfer".into(),
+            message: err.to_string(),
+        }])),
     }
 }
 
