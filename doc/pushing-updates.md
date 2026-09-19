@@ -48,7 +48,7 @@ Missed watchers, offline periods, apply failures:
 
 1. Slave `RootReport` for each checkout central.
 2. Master `RootAck` (compare to `dir_nodes[central]`).
-3. On mismatch, slave walks `DirList*` and 3-way (`spec.md` §10). Walks are bidirectional: the slave both pulls and announces. Initial sync is the same walk with empty `last_synced`.
+3. On mismatch, slave walks `DirList*` and 3-way (`spec.md` §10). A wide directory is more than one `DirListResponse` when one frame would exceed 1 MiB. Walks are bidirectional: the slave both pulls and announces. Initial sync is the same walk with empty `last_synced`.
 
 Master never walks a slave unsolicited. Master never stores a per-slave update queue, “max_queued_updates,” or retry buffer of file contents.
 

@@ -1,12 +1,12 @@
-use arborsync_core::LoadedMaster;
-use arborsync_core::LocalEvent;
 use arborsync_core::config::SlaveAcl;
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{Master, MemoryContent, Reply};
-use arborsync_core::merkle::{DirChild, dir_node, empty_dir_node, file_node};
-use arborsync_core::meta::{EntryKind, hash_bytes};
+use arborsync_core::merkle::{dir_node, empty_dir_node, file_node, DirChild};
+use arborsync_core::meta::{hash_bytes, EntryKind};
 use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
-use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
+use arborsync_core::test_support::{name, p, MemoryStorage, SyncSandbox};
+use arborsync_core::LoadedMaster;
+use arborsync_core::LocalEvent;
 
 const ALICE: [u8; 32] = [0xA1; 32];
 
@@ -132,6 +132,7 @@ fn dir_list_request_returns_only_direct_children() {
                 ProtocolMessage::DirListRequest {
                     checkout_id: "src".into(),
                     path: p("/src"),
+                    after: None,
                 },
             )
             .unwrap(),
@@ -140,7 +141,10 @@ fn dir_list_request_returns_only_direct_children() {
             checkout_id,
             path,
             entries,
+            more,
+            ..
         } => {
+            assert!(!more);
             assert_eq!(checkout_id, "src");
             assert_eq!(path, p("/src"));
             assert_eq!(entries.len(), 1);
@@ -172,6 +176,7 @@ fn dir_list_request_on_a_file_returns_file_announce() {
                 ProtocolMessage::DirListRequest {
                     checkout_id: "src".into(),
                     path: p("/src/hello.txt"),
+                    after: None,
                 },
             )
             .unwrap(),
@@ -225,6 +230,7 @@ fn dir_list_request_without_subscribe_is_an_error() {
                 ProtocolMessage::DirListRequest {
                     checkout_id: "src".into(),
                     path: p("/src"),
+                    after: None,
                 },
             )
             .unwrap(),

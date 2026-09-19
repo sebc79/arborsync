@@ -17,9 +17,9 @@ use crate::keys::format_hex_key;
 use crate::merkle::file_node;
 use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
 use crate::path::{
-    canonical_to_host, is_reserved_root_entry, join_central, CanonicalPath, PathError,
+    canonical_to_host, is_reserved_root_entry, join_central, CanonicalPath, EntryName, PathError,
 };
-use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
+use crate::protocol::{page_dir_list, BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
 use crate::storage::{CheckoutId, Storage};
 use crate::transfer::{self, BulkTransfer};
 use crate::watch::LocalEvent;
@@ -505,9 +505,16 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 path,
                 root,
             )?)),
-            ProtocolMessage::DirListRequest { checkout_id, path } => {
-                Ok(Reply::Send(self.on_dir_list(peer, checkout_id, path)?))
-            }
+            ProtocolMessage::DirListRequest {
+                checkout_id,
+                path,
+                after,
+            } => Ok(Reply::Send(self.on_dir_list(
+                peer,
+                checkout_id,
+                path,
+                after,
+            )?)),
             other => Ok(Reply::Send(ProtocolMessage::Error {
                 code: "unsupported".into(),
                 message: format!("{other:?}"),
@@ -999,6 +1006,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         peer: [u8; 32],
         checkout_id: String,
         path: CanonicalPath,
+        after: Option<EntryName>,
     ) -> Result<ProtocolMessage, MasterError> {
         let checkout = CheckoutName::new(checkout_id.clone());
         let session = match self.live_checkout(&peer, &checkout) {
@@ -1018,11 +1026,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             _ => {
                 let entries = index::list_children(&self.store, &CheckoutId::master(), &path)
                     .map_err(MasterError::index)?;
-                Ok(ProtocolMessage::DirListResponse {
-                    checkout_id,
-                    path,
-                    entries,
-                })
+                Ok(page_dir_list(checkout_id, path, after, entries))
             }
         }
     }

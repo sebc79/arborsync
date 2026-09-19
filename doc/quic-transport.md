@@ -38,7 +38,7 @@ Quinn gives **byte streams**. Control frame:
 u32be length || bincode(u16 version) || bincode(ProtocolMessage)
 ```
 
-That is the field order of `Envelope`. Maximum control frame: 1 MiB. Larger means disconnect (file bodies do not belong here). If `encode_control` of a `SignatureRequest` would overflow that cap, the signature is omitted and the transfer falls back to `Whole` (`spec.md` §9). Bulk header uses the same length prefix. The body is raw and not length-prefixed again (`size` in the header is authoritative).
+That is the field order of `Envelope`. Maximum control frame: 1 MiB. Larger means disconnect (file bodies do not belong here). If `encode_control` of a `SignatureRequest` would overflow that cap, the signature is omitted and the transfer falls back to `Whole` (`spec.md` §9). A `DirListResponse` that would overflow is split. The master sends the longest prefix that still encodes under `MAX_DIR_LIST_PAYLOAD` (`MAX_CONTROL_FRAME / 4`) and sets `more`. One child that exceeds that still goes if `encode_control` succeeds. The slave continues with `DirListRequest.after`. Bulk header uses the same length prefix. The body is raw and not length-prefixed again (`size` in the header is authoritative).
 
 One message per bulk stream. Close the stream after the body. Control stream stays open for the session.
 

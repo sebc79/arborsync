@@ -98,7 +98,7 @@ Master `publish` writes the new live file and does not sidecar a successful repl
 
 Watchers drop events. Correctness is the slow path.
 
-After `SubscribeAck`, after every rescan, and after reconnect, the slave sends `RootReport` for each checkout. The master replies `RootAck` with `matched` and its subtree root. On mismatch the slave walks `DirListRequest` and `DirListResponse` and runs a 3-way on `last_synced`:
+After `SubscribeAck`, after every rescan, and after reconnect, the slave sends `RootReport` for each checkout. The master replies `RootAck` with `matched` and its subtree root. On mismatch the slave walks `DirListRequest` and `DirListResponse` and runs a 3-way on `last_synced`. A wide directory arrives as more than one `DirListResponse` when one frame would exceed 1 MiB.
 
 - Local equals last-synced and master differs: pull.
 - Master equals last-synced and local differs: announce.

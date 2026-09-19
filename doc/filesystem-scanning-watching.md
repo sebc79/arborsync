@@ -64,7 +64,7 @@ Rescan exists because inotify/kqueue/NFS drop events. It cannot know dirty subtr
 Watching is the fast path. Correctness is reconcile:
 
 - Slave `RootReport` ↔ master `RootAck`.
-- Walk `DirList*` on mismatch.
+- Walk `DirList*` on mismatch. Continue with `DirListRequest.after` while `more` is true.
 - 3-way with `last_synced`.
 
 Triggers: after each rescan, after `SubscribeAck`, after reconnect. Not “after every batch of FS events” (that is the announce fast path).

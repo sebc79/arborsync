@@ -14,7 +14,7 @@ use crate::merkle::{file_node, DirChild};
 use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
 use crate::path::{
     canonical_to_host, conflict_sidecar_path, is_reserved_root_entry, join_central,
-    local_paths_overlap, strip_central, CanonicalPath, PathError,
+    local_paths_overlap, strip_central, CanonicalPath, EntryName, PathError,
 };
 use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
 use crate::reconcile::{decide_child, WalkAction};
@@ -341,8 +341,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             ProtocolMessage::DirListResponse {
                 checkout_id,
                 path,
+                after,
                 entries,
-            } => self.on_dir_list(checkout_id, path, entries),
+                more,
+            } => self.on_dir_list(checkout_id, path, after, entries, more),
             ProtocolMessage::FileAnnounce {
                 checkout_id,
                 path,
@@ -1017,6 +1019,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         Ok(Reply::Send(vec![ProtocolMessage::DirListRequest {
             checkout_id: checkout_id.into(),
             path,
+            after: None,
         }]))
     }
 
@@ -1024,24 +1027,42 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         &mut self,
         checkout_id: String,
         path: CanonicalPath,
+        after: Option<EntryName>,
         entries: Vec<DirChild>,
+        more: bool,
     ) -> Result<Reply, SlaveError> {
         let ck = self.checkout(&checkout_id)?.id.clone();
         let local = index::list_children(&self.store, &ck, &path).map_err(SlaveError::index)?;
+        let page_end = entries
+            .last()
+            .map(|child| child.name().as_str().to_string());
 
         let mut by_name: BTreeMap<String, (Option<DirChild>, Option<DirChild>)> = BTreeMap::new();
         for child in local {
             by_name.insert(child.name().as_str().to_string(), (Some(child), None));
         }
-        for child in entries {
+        for child in &entries {
             by_name
                 .entry(child.name().as_str().to_string())
                 .and_modify(|pair| pair.1 = Some(child.clone()))
-                .or_insert((None, Some(child)));
+                .or_insert((None, Some(child.clone())));
         }
 
         let mut out = Vec::new();
         for (entry, (slave_child, master_child)) in by_name {
+            if after
+                .as_ref()
+                .is_some_and(|cursor| entry.as_str() <= cursor.as_str())
+            {
+                continue;
+            }
+            if more
+                && page_end
+                    .as_ref()
+                    .is_none_or(|end| entry.as_str() > end.as_str() && master_child.is_none())
+            {
+                continue;
+            }
             let child_path = join_central(&path, &entry)?;
             let last_synced = self.last_synced(&checkout_id, &child_path)?;
             let local_meta = self.meta(&checkout_id, &child_path)?;
@@ -1056,6 +1077,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 WalkAction::Recurse => out.push(ProtocolMessage::DirListRequest {
                     checkout_id: checkout_id.clone(),
                     path: child_path,
+                    after: None,
                 }),
                 WalkAction::Pull => {
                     let master_dir = matches!(master_child, Some(DirChild::Directory { .. }));
@@ -1072,6 +1094,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                     out.push(ProtocolMessage::DirListRequest {
                         checkout_id: checkout_id.clone(),
                         path: child_path,
+                        after: None,
                     });
                 }
                 WalkAction::AnnounceCreate | WalkAction::AnnounceCas => {
@@ -1080,6 +1103,15 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 WalkAction::AnnounceDelete => {
                     out.extend(self.note_removed(&checkout_id, &child_path)?);
                 }
+            }
+        }
+        if more {
+            if let Some(last) = entries.last() {
+                out.push(ProtocolMessage::DirListRequest {
+                    checkout_id,
+                    path,
+                    after: Some(last.name().clone()),
+                });
             }
         }
         Ok(Reply::Send(out))

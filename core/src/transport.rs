@@ -368,6 +368,32 @@ pub async fn read_bulk(recv: &mut RecvStream) -> Result<(BulkHeader, Vec<u8>), T
     Ok((header, body))
 }
 
+fn control_summary(msg: &ProtocolMessage) -> String {
+    match msg {
+        ProtocolMessage::DirListResponse {
+            path,
+            entries,
+            more,
+            after,
+            ..
+        } => format!(
+            "DirListResponse path={} entries={} more={more} after={}",
+            path.as_str(),
+            entries.len(),
+            after.as_ref().map(|name| name.as_str()).unwrap_or("-")
+        ),
+        ProtocolMessage::DirListRequest { path, after, .. } => format!(
+            "DirListRequest path={} after={}",
+            path.as_str(),
+            after.as_ref().map(|name| name.as_str()).unwrap_or("-")
+        ),
+        ProtocolMessage::FileAnnounce { path, .. } => {
+            format!("FileAnnounce path={}", path.as_str())
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 impl Transport for Connection {
     type Error = TransportError;
     type ControlSend = SendStream;
@@ -401,7 +427,13 @@ impl Transport for Connection {
         send: &mut Self::ControlSend,
         msg: &ProtocolMessage,
     ) -> Result<(), Self::Error> {
-        let frame = protocol::encode_control(msg)?;
+        let frame = match protocol::encode_control(msg) {
+            Ok(frame) => frame,
+            Err(err) => {
+                log::warn!("encode_control failed ({err}) for {}", control_summary(msg));
+                return Err(TransportError::Frame(err));
+            }
+        };
         send.write_all(&frame).await.map_err(stream_err)
     }
 
@@ -410,6 +442,13 @@ impl Transport for Connection {
         recv.read_exact(&mut header).await.map_err(stream_err)?;
         let len = u32::from_be_bytes(header) as usize;
         if len > MAX_CONTROL_FRAME {
+            log::warn!(
+                "incoming control length {len} exceeds 1 MiB (header {:02x} {:02x} {:02x} {:02x})",
+                header[0],
+                header[1],
+                header[2],
+                header[3]
+            );
             return Err(TransportError::Frame(FrameError::TooLarge));
         }
         let mut payload = vec![0u8; len];

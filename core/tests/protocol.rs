@@ -2,8 +2,9 @@ use arborsync_core::hash::{ContentHash, DirNode, FileNode};
 use arborsync_core::meta::FileMetadata;
 use arborsync_core::path::{CanonicalPath, EntryName};
 use arborsync_core::protocol::{
-    BulkEncoding, BulkHeader, DirEntry, Envelope, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE,
-    PROTOCOL_VERSION, ProtocolMessage, decode_bulk, decode_control, encode_bulk, encode_control,
+    decode_bulk, decode_control, encode_bulk, encode_control, page_dir_list, BulkEncoding,
+    BulkHeader, DirEntry, Envelope, FrameError, ProtocolMessage, MAX_CONTROL_FRAME,
+    PROTOCOL_PREAMBLE, PROTOCOL_VERSION,
 };
 use arborsync_core::test_support::{name, p};
 
@@ -49,11 +50,110 @@ fn file_announce_round_trips_through_the_frame() {
     assert_eq!(decoded, msg);
 }
 
+fn wide_dir_entries(n: usize) -> Vec<DirEntry> {
+    (0..n)
+        .map(|i| DirEntry::File {
+            name: name(&format!("f{i:05}")),
+            node: FileNode::from_bytes([1; 32]),
+        })
+        .collect()
+}
+
+fn wide_dir_list(n: usize) -> ProtocolMessage {
+    ProtocolMessage::DirListResponse {
+        checkout_id: "src".into(),
+        path: p("/src"),
+        after: None,
+        entries: wide_dir_entries(n),
+        more: false,
+    }
+}
+
+#[test]
+fn dir_list_response_for_long_names_fits_a_control_frame() {
+    let pad = "x".repeat(236);
+    let all: Vec<DirEntry> = (0..4000)
+        .map(|i| DirEntry::File {
+            name: name(&format!("f{i:04}{pad}")),
+            node: FileNode::from_bytes([1; 32]),
+        })
+        .collect();
+    assert_eq!(
+        encode_control(&ProtocolMessage::DirListResponse {
+            checkout_id: "src".into(),
+            path: p("/src"),
+            after: None,
+            entries: all.clone(),
+            more: false,
+        })
+        .unwrap_err(),
+        FrameError::TooLarge
+    );
+    let page = page_dir_list("src".into(), p("/src"), None, all);
+    encode_control(&page).expect("first long-name page must fit");
+    match page {
+        ProtocolMessage::DirListResponse { more, entries, .. } => {
+            assert!(more, "4000 long names must need another page");
+            assert!(!entries.is_empty());
+        }
+        other => panic!("expected DirListResponse, got {other:?}"),
+    }
+}
+
+#[test]
+fn dir_list_response_for_a_wide_directory_fits_a_control_frame() {
+    assert_eq!(
+        encode_control(&wide_dir_list(50_000)).unwrap_err(),
+        FrameError::TooLarge
+    );
+
+    let mut after = None;
+    let mut seen = Vec::new();
+    let all = wide_dir_entries(50_000);
+    loop {
+        let page = page_dir_list("src".into(), p("/src"), after.clone(), all.clone());
+        let ProtocolMessage::DirListResponse {
+            entries,
+            more,
+            after: echoed,
+            ..
+        } = page
+        else {
+            panic!("expected DirListResponse, got {page:?}");
+        };
+        assert_eq!(echoed, after);
+        encode_control(&ProtocolMessage::DirListResponse {
+            checkout_id: "src".into(),
+            path: p("/src"),
+            after: echoed.clone(),
+            entries: entries.clone(),
+            more,
+        })
+        .expect("each DirList page must fit a control frame");
+        assert!(!entries.is_empty());
+        seen.extend(
+            entries
+                .iter()
+                .map(|entry| entry.name().as_str().to_string()),
+        );
+        if !more {
+            break;
+        }
+        after = Some(entries.last().unwrap().name().clone());
+    }
+    let expected: Vec<String> = all
+        .iter()
+        .map(|entry| entry.name().as_str().to_string())
+        .collect();
+    assert_eq!(seen, expected);
+}
+
 #[test]
 fn dir_list_response_round_trips_each_child_brand() {
     let msg = ProtocolMessage::DirListResponse {
         checkout_id: "src".into(),
         path: p("/src"),
+        after: None,
         entries: vec![
             DirEntry::File {
                 name: name("foo.rs"),
@@ -68,6 +168,7 @@ fn dir_list_response_round_trips_each_child_brand() {
                 node: FileNode::from_bytes([3; 32]),
             },
         ],
+        more: false,
     };
     let frame = encode_control(&msg).unwrap();
     let (decoded, _) = decode_control(&frame).unwrap();

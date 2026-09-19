@@ -6,10 +6,10 @@ use arborsync_core::meta::{collect_from_path, hash_bytes, EntryKind, FileMetadat
 use arborsync_core::path::{conflict_sidecar_path, RESERVED_CONFLICTS, RESERVED_TMP};
 use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
 use arborsync_core::slave::{Reply as SlaveReply, Slave};
-use arborsync_core::LocalEvent;
 use arborsync_core::test_support::{p, MemoryStorage, SyncSandbox};
 use arborsync_core::LoadedMaster;
 use arborsync_core::LoadedSlave;
+use arborsync_core::LocalEvent;
 
 const ALICE: [u8; 32] = [0xA1; 32];
 const BACKUP: [u8; 32] = [0xB1; 32];
@@ -672,7 +672,9 @@ fn slave_rescan_then_reconcile_announces_a_file_the_watcher_never_saw() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::DirListRequest { checkout_id, path }] => {
+        [ProtocolMessage::DirListRequest {
+            checkout_id, path, ..
+        }] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src"));
         }
@@ -684,7 +686,9 @@ fn slave_rescan_then_reconcile_announces_a_file_the_watcher_never_saw() {
             .handle(ProtocolMessage::DirListResponse {
                 checkout_id: "src".into(),
                 path: p("/src"),
+                after: None,
                 entries: vec![],
+                more: false,
             })
             .unwrap(),
     )[..]

@@ -1,16 +1,16 @@
-use arborsync_core::LoadedMaster;
-use arborsync_core::LocalEvent;
 use arborsync_core::config::{ReloadError, SlaveAcl};
 use arborsync_core::hash::{ContentHash, FileNode};
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{
-    CasDecision, Master, MemoryContent, Reply, WholeFileLater, decide_cas,
+    decide_cas, CasDecision, Master, MemoryContent, Reply, WholeFileLater,
 };
-use arborsync_core::merkle::{self, DirChild, file_node};
-use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};
+use arborsync_core::merkle::{self, file_node, DirChild};
+use arborsync_core::meta::{hash_bytes, EntryKind, FileMetadata};
 use arborsync_core::path::RESERVED_CONFLICTS;
 use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
-use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
+use arborsync_core::test_support::{name, p, MemoryStorage, SyncSandbox};
+use arborsync_core::LoadedMaster;
+use arborsync_core::LocalEvent;
 
 const ALICE: [u8; 32] = [0xA1; 32];
 const BACKUP: [u8; 32] = [0xB1; 32];
@@ -390,12 +390,10 @@ fn handle_type_change_file_to_symlink_and_back() {
         other => panic!("expected CasAccept, got {other:?}"),
     }
     let host = sandbox.central_root().join("src/hello.txt");
-    assert!(
-        std::fs::symlink_metadata(&host)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
+    assert!(std::fs::symlink_metadata(&host)
+        .unwrap()
+        .file_type()
+        .is_symlink());
     assert_eq!(
         std::fs::read_link(&host).unwrap(),
         std::path::Path::new("somewhere")
@@ -1025,13 +1023,11 @@ fn handle_rename_moves_the_file_accepts_both_paths_and_fans_out() {
 
     let alice = master.poll(ALICE);
     match &alice[..] {
-        [
-            ProtocolMessage::CasAccept {
-                path,
-                file_node: node,
-                ..
-            },
-        ] => {
+        [ProtocolMessage::CasAccept {
+            path,
+            file_node: node,
+            ..
+        }] => {
             assert_eq!(path, &p("/src/old.txt"));
             assert_eq!(*node, None);
         }
@@ -1620,9 +1616,7 @@ fn rescan_reuses_content_hash_when_only_mode_changes() {
 #[test]
 fn git_object_fanout_dir_is_indexed_as_dir_and_dir_list_does_not_read_it() {
     let sandbox = SyncSandbox::new();
-    let objects = sandbox
-        .central_root()
-        .join("src/arborsync/.git/objects/39");
+    let objects = sandbox.central_root().join("src/arborsync/.git/objects/39");
     std::fs::create_dir_all(&objects).unwrap();
     std::fs::write(objects.join("deadbeef"), b"blob").unwrap();
 
@@ -1641,16 +1635,15 @@ fn git_object_fanout_dir_is_indexed_as_dir_and_dir_list_does_not_read_it() {
             ProtocolMessage::DirListRequest {
                 checkout_id: "src".into(),
                 path: path.clone(),
+                after: None,
             },
         )
         .unwrap()
     {
         Reply::Send(ProtocolMessage::DirListResponse { entries, .. }) => {
-            assert!(
-                entries
-                    .iter()
-                    .any(|child| child.name().as_str() == "deadbeef")
-            );
+            assert!(entries
+                .iter()
+                .any(|child| child.name().as_str() == "deadbeef"));
         }
         other => panic!("expected DirListResponse, got {other:?}"),
     }
@@ -1659,9 +1652,7 @@ fn git_object_fanout_dir_is_indexed_as_dir_and_dir_list_does_not_read_it() {
 #[test]
 fn signature_request_for_a_git_object_fanout_dir_is_missing_hash() {
     let sandbox = SyncSandbox::new();
-    let objects = sandbox
-        .central_root()
-        .join("src/arborsync/.git/objects/39");
+    let objects = sandbox.central_root().join("src/arborsync/.git/objects/39");
     std::fs::create_dir_all(&objects).unwrap();
     std::fs::write(objects.join("deadbeef"), b"blob").unwrap();
 
@@ -1701,9 +1692,7 @@ fn directory_cas_survives_when_dir_metadata_is_eperm() {
         .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
         .unwrap();
 
-    let objects = sandbox
-        .central_root()
-        .join("src/arborsync/.git/objects/39");
+    let objects = sandbox.central_root().join("src/arborsync/.git/objects/39");
     std::fs::create_dir_all(&objects).unwrap();
     let flagged = std::process::Command::new("chflags")
         .args(["uchg", objects.to_str().unwrap()])

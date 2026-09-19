@@ -90,7 +90,9 @@ fn measure(n: usize) {
             .handle(ProtocolMessage::DirListResponse {
                 checkout_id: "src".into(),
                 path: CanonicalPath::parse("/src").unwrap(),
+                after: None,
                 entries: vec![],
+                more: false,
             })
             .unwrap(),
     );
@@ -106,7 +108,9 @@ fn measure(n: usize) {
             .handle(ProtocolMessage::DirListResponse {
                 checkout_id: "src".into(),
                 path: CanonicalPath::parse("/src").unwrap(),
+                after: None,
                 entries: vec![],
+                more: false,
             })
             .unwrap(),
     );
