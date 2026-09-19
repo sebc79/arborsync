@@ -6,7 +6,9 @@ use arborsync_core::config::SlaveAcl;
 use arborsync_core::keys::{format_hex_key, public_from_secret, write_static_key};
 use arborsync_core::master::{Master, MemoryContent, Reply};
 use arborsync_core::meta::hash_bytes;
-use arborsync_core::protocol::{BulkEncoding, BulkHeader, ProtocolMessage};
+use arborsync_core::hash::ContentHash;
+use arborsync_core::meta::FileMetadata;
+use arborsync_core::protocol::{encode_control, BulkEncoding, BulkHeader, ProtocolMessage};
 use arborsync_core::slave::Slave;
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
 use arborsync_core::transfer::BulkTransfer;
@@ -329,6 +331,77 @@ async fn quic_bulk_survives_a_50ms_select_tick() {
     let (header, got) = server_task.await.unwrap();
     assert_eq!(header.size, 2 << 20);
     assert_eq!(hash_bytes(&got), want_hash);
+}
+
+#[tokio::test]
+async fn quic_control_survives_select_cancel_mid_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = write_key(dir.path(), "master.key");
+    let _ = write_key(dir.path(), "slave.key");
+    let master_secret = arborsync_core::read_static_key(dir.path().join("master.key")).unwrap();
+    let slave_secret = arborsync_core::read_static_key(dir.path().join("slave.key")).unwrap();
+
+    let msg = ProtocolMessage::FileAnnounce {
+        checkout_id: "src".into(),
+        path: p("/src/pico/obj/c/err.txt"),
+        new: FileMetadata::file(3, 0, 0o100644, ContentHash::from_bytes([9; 32])),
+        basis: None,
+    };
+    let frame = encode_control(&msg).unwrap();
+    let pico = b"pico";
+    let at = frame
+        .windows(4)
+        .position(|window| window == pico)
+        .expect("path bytes land in the frame");
+    assert!(at > 4, "pico must sit in the payload, not the length");
+
+    let server = listen(SocketAddr::from(([127, 0, 0, 1], 0)), &master_secret).unwrap();
+    let addr = server.local_addr().unwrap();
+    let client = client_endpoint(&slave_secret).unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("accept").await.expect("hs");
+        let (_send, mut recv) = conn.accept_control().await.unwrap();
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
+        loop {
+            tokio::select! {
+                result = Connection::read_control(&mut recv) => return result,
+                incoming = conn.accept_uni() => {
+                    let mut bulk = incoming.expect("uni");
+                    let _ = arborsync_core::transport::read_bulk(&mut bulk).await;
+                }
+                _ = tick.tick() => {}
+            }
+        }
+    });
+
+    let conn = connect(&client, addr).await.unwrap();
+    let (mut send, _recv) = conn.open_control().await.unwrap();
+    send.write_all(&frame[..at]).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    conn.write_bulk(&BulkTransfer {
+        header: BulkHeader {
+            path: p("/src/pico/obj/c/err.txt"),
+            checkout_id: "src".into(),
+            want_hash: ContentHash::from_bytes([1; 32]),
+            encoding: BulkEncoding::Whole,
+            size: 1,
+        },
+        body: vec![0x5a],
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    send.write_all(&frame[at..]).await.unwrap();
+
+    let got = tokio::time::timeout(std::time::Duration::from_secs(10), server_task)
+        .await
+        .expect("control read timed out")
+        .unwrap();
+    match got {
+        Ok(got) => assert_eq!(got, msg),
+        Err(err) => panic!("{err}"),
+    }
 }
 
 #[tokio::test]
