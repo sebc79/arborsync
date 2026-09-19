@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::apply;
 use crate::config::{ConfigError, LoadedSlave, ReloadError, SlaveReload};
-use crate::crawl::{Crawl, DirListPage, RescanWalk, STEP_BUDGET};
+use crate::crawl::{Crawl, DirListPage, RescanWalk, STEP_BUDGET, WalkError};
 use crate::hash::{ContentHash, FileNode};
 use crate::index;
 use crate::inflight::Inflight;
@@ -1222,13 +1222,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             return Ok(Vec::new());
         };
         let ck = walk.ck.clone();
-        let local = walk.local.clone();
-        walk.collect(budget, |path| {
-            self.store
-                .get_meta(&ck, path)
-                .map_err(|err| io::Error::other(err.to_string()))
-        })
-        .map_err(SlaveError::io(&local))?;
+        walk.collect(budget, |path| self.store.get_meta(&ck, path))
+            .map_err(into_slave_walk_err)?;
         let Some(walk) = self.crawl.take_finished_rescan() else {
             return Ok(Vec::new());
         };
@@ -1419,12 +1414,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             start_rel,
             start_meta,
         )?;
-        walk.collect(usize::MAX, |path| {
-            self.store
-                .get_meta(&ck, path)
-                .map_err(|err| io::Error::other(err.to_string()))
-        })
-        .map_err(SlaveError::io(&host))?;
+        walk.collect(usize::MAX, |path| self.store.get_meta(&ck, path))
+            .map_err(into_slave_walk_err)?;
         Ok(walk.found)
     }
 
@@ -1777,6 +1768,16 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.checkouts
             .get_mut(id)
             .ok_or_else(|| SlaveError::UnknownCheckout(id.into()))
+    }
+}
+
+fn into_slave_walk_err<E: std::error::Error + Send + Sync + 'static>(
+    err: WalkError<E>,
+) -> SlaveError {
+    match err {
+        WalkError::Io { path, source } => SlaveError::Io { path, source },
+        WalkError::Index(err) => SlaveError::index(err),
+        WalkError::Path(err) => err.into(),
     }
 }
 

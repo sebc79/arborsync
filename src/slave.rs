@@ -280,13 +280,7 @@ async fn session(
                 outbound.on_bulk_done(slave, &conn, result)?;
             }
             Some(err) = write_err_rx.recv() => return Err(err.into()),
-            _ = async {
-                if slave.lock().expect("slave").crawl_pending() {
-                    std::future::ready(()).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
+            _ = wait_if_crawl_pending(slave) => {
                 match slave.lock().expect("slave").crawl_step() {
                     Ok(outs) => outbound.enqueue(outs)?,
                     Err(SlaveError::UnknownCheckout(_)) => {}
@@ -339,6 +333,13 @@ async fn session(
             }
         }
     }
+}
+
+async fn wait_if_crawl_pending(slave: &SharedSlave) {
+    if slave.lock().expect("slave").crawl_pending() {
+        return;
+    }
+    std::future::pending::<()>().await;
 }
 
 async fn next_outbound(

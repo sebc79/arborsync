@@ -6,12 +6,18 @@ use std::path::PathBuf;
 use crate::merkle::DirChild;
 use crate::meta::{self, EntryKind, FileMetadata};
 use crate::path::{
-    CanonicalPath, EntryName, canonical_to_host, is_reserved_root_entry, join_central,
+    CanonicalPath, EntryName, PathError, canonical_to_host, is_reserved_root_entry, join_central,
 };
 use crate::protocol::ProtocolMessage;
 use crate::storage::CheckoutId;
 
 pub(crate) const STEP_BUDGET: usize = 64;
+
+pub(crate) enum WalkError<E> {
+    Io { path: PathBuf, source: io::Error },
+    Index(E),
+    Path(PathError),
+}
 
 #[derive(Default)]
 pub(crate) struct Crawl {
@@ -133,26 +139,34 @@ impl RescanWalk {
         self.open.is_none() && self.pending.is_empty()
     }
 
-    pub(crate) fn collect(
+    pub(crate) fn collect<E>(
         &mut self,
         budget: usize,
-        mut previous: impl FnMut(&CanonicalPath) -> Result<Option<FileMetadata>, io::Error>,
-    ) -> Result<bool, io::Error> {
+        mut previous: impl FnMut(&CanonicalPath) -> Result<Option<FileMetadata>, E>,
+    ) -> Result<bool, WalkError<E>> {
         let mut used = 0;
         while used < budget {
             if let Some(open) = &mut self.open {
                 if let Some((name, host_child)) = open.remaining.pop() {
-                    let rel_child = join_central(&open.rel, &name)
-                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+                    let rel_child = join_central(&open.rel, &name).map_err(WalkError::Path)?;
                     let child =
                         join_central(&self.central, rel_child.as_str().trim_start_matches('/'))
-                            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-                    let prior = previous(&child)?;
-                    if let Some(meta) = meta::collect_for_rescan(&host_child, prior.as_ref())? {
-                        if meta.kind == EntryKind::Dir {
-                            self.pending.push(rel_child);
+                            .map_err(WalkError::Path)?;
+                    let prior = previous(&child).map_err(WalkError::Index)?;
+                    match meta::collect_for_rescan(&host_child, prior.as_ref()) {
+                        Ok(Some(meta)) => {
+                            if meta.kind == EntryKind::Dir {
+                                self.pending.push(rel_child);
+                            }
+                            self.found.insert(child, meta);
                         }
-                        self.found.insert(child, meta);
+                        Ok(None) => {}
+                        Err(source) => {
+                            return Err(WalkError::Io {
+                                path: host_child,
+                                source,
+                            });
+                        }
                     }
                     used += 1;
                     continue;
@@ -174,7 +188,9 @@ impl RescanWalk {
                     }
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(source) => {
+                    return Err(WalkError::Io { path: host, source });
+                }
             };
             self.open = Some(OpenDir {
                 rel: rel_dir,
