@@ -657,13 +657,22 @@ fn slave_rescan_then_reconcile_announces_a_file_the_watcher_never_saw() {
     let local = slave.checkout_local("src").unwrap().to_path_buf();
     sandbox.tree(&local).file("leftover.txt", b"mine");
 
-    match &slave.rescan("src").unwrap()[..] {
-        [ProtocolMessage::RootReport { path, root, .. }] => {
-            assert_eq!(path, &p("/src"));
-            assert_ne!(*root, empty_dir_node().into());
-        }
-        other => panic!("expected RootReport, got {other:?}"),
-    }
+    let scanned = slave.rescan("src").unwrap();
+    assert!(
+        scanned.iter().any(|msg| matches!(
+            msg,
+            ProtocolMessage::RootReport { path, root, .. }
+                if path == &p("/src") && *root != empty_dir_node().into()
+        )),
+        "expected RootReport, got {scanned:?}"
+    );
+    assert!(
+        scanned.iter().any(|msg| matches!(
+            msg,
+            ProtocolMessage::FileAnnounce { path, .. } if path == &p("/src/leftover.txt")
+        )),
+        "expected leftover FileAnnounce, got {scanned:?}"
+    );
     assert_eq!(
         slave
             .meta("src", &p("/src/leftover.txt"))

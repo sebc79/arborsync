@@ -300,8 +300,8 @@ async fn session(
                         }
                     }
                     Work::Rescan { checkout } => {
-                        match slave.lock().expect("slave").rescan(&checkout) {
-                            Ok(outs) => outbound.enqueue(outs)?,
+                        match slave.lock().expect("slave").request_rescan(&checkout) {
+                            Ok(()) => {}
                             Err(SlaveError::UnknownCheckout(_)) => {}
                             Err(err) => return Err(err.into()),
                         }

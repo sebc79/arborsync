@@ -58,6 +58,10 @@ impl Crawl {
         !self.rescans.is_empty()
     }
 
+    pub(crate) fn has_pages(&self) -> bool {
+        !self.pages.is_empty()
+    }
+
     pub(crate) fn rescanning(&self, checkout_id: &str) -> bool {
         self.rescans
             .iter()
@@ -143,8 +147,9 @@ impl RescanWalk {
         &mut self,
         budget: usize,
         mut previous: impl FnMut(&CanonicalPath) -> Result<Option<FileMetadata>, E>,
-    ) -> Result<bool, WalkError<E>> {
+    ) -> Result<Vec<(CanonicalPath, FileMetadata)>, WalkError<E>> {
         let mut used = 0;
+        let mut newly = Vec::new();
         while used < budget {
             if let Some(open) = &mut self.open {
                 if let Some((name, host_child)) = open.remaining.pop() {
@@ -158,7 +163,8 @@ impl RescanWalk {
                             if meta.kind == EntryKind::Dir {
                                 self.pending.push(rel_child);
                             }
-                            self.found.insert(child, meta);
+                            self.found.insert(child.clone(), meta.clone());
+                            newly.push((child, meta));
                         }
                         Ok(None) => {}
                         Err(source) => {
@@ -174,7 +180,7 @@ impl RescanWalk {
                 self.open = None;
             }
             let Some(rel_dir) = self.pending.pop() else {
-                return Ok(true);
+                return Ok(newly);
             };
             let host = canonical_to_host(&self.local, &rel_dir);
             let remaining = match read_dir_names(&host, rel_dir.as_str() == "/") {
@@ -197,7 +203,7 @@ impl RescanWalk {
                 remaining,
             });
         }
-        Ok(self.collect_done())
+        Ok(newly)
     }
 }
 
