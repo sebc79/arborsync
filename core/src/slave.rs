@@ -10,14 +10,14 @@ use crate::config::{ConfigError, LoadedSlave, ReloadError, SlaveReload};
 use crate::hash::{ContentHash, FileNode};
 use crate::index;
 use crate::inflight::Inflight;
-use crate::merkle::{DirChild, file_node};
-use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
+use crate::merkle::{file_node, DirChild};
+use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
 use crate::path::{
-    CanonicalPath, EntryName, PathError, canonical_to_host, conflict_sidecar_path,
-    is_reserved_root_entry, join_central, local_paths_overlap, strip_central,
+    canonical_to_host, conflict_sidecar_path, is_reserved_root_entry, join_central,
+    local_paths_overlap, strip_central, CanonicalPath, EntryName, PathError,
 };
 use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
-use crate::reconcile::{WalkAction, decide_child};
+use crate::reconcile::{decide_child, WalkAction};
 use crate::status::{Queues, SlaveStatus, StatusLedger};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
 use crate::transfer::{self, BulkTransfer};
@@ -428,6 +428,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 current,
             } => self.on_cas_reject(checkout_id, path, current),
             ProtocolMessage::Disconnect { reason } => Ok(Reply::Hangup { reason }),
+            ProtocolMessage::Error { code, message } => {
+                self.status.error(None, format!("error:{code}:{message}"));
+                Ok(Reply::Send(Vec::new()))
+            }
             ProtocolMessage::SignatureRequest {
                 checkout_id,
                 path,
@@ -463,16 +467,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     fn apply_bulk_message(&mut self, header: BulkHeader, body: &[u8]) -> Result<Reply, SlaveError> {
         let key = (header.checkout_id.clone(), header.path.clone());
         let Some(pending) = self.pending.get(&key) else {
-            return Ok(Reply::Send(vec![ProtocolMessage::Error {
-                code: "unknown_transfer".into(),
-                message: header.path.as_str().into(),
-            }]));
+            return self.accept_if_live_matches(&header);
         };
         if pending.new.content_hash != header.want_hash {
-            return Ok(Reply::Send(vec![ProtocolMessage::Error {
-                code: "unknown_transfer".into(),
-                message: header.path.as_str().into(),
-            }]));
+            return self.accept_if_live_matches(&header);
         }
         let host = self.host_for(&header.checkout_id, &header.path)?;
         let previous = self.meta(&header.checkout_id, &header.path)?;
@@ -507,6 +505,21 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 }]))
             }
         }
+    }
+
+    fn accept_if_live_matches(&self, header: &BulkHeader) -> Result<Reply, SlaveError> {
+        let host = self.host_for(&header.checkout_id, &header.path)?;
+        let live = apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))?;
+        if live
+            .as_deref()
+            .is_some_and(|bytes| hash_bytes(bytes) == header.want_hash)
+        {
+            return Ok(Reply::Send(Vec::new()));
+        }
+        Ok(Reply::Send(vec![ProtocolMessage::Error {
+            code: "unknown_transfer".into(),
+            message: header.path.as_str().into(),
+        }]))
     }
 
     pub fn note_local(

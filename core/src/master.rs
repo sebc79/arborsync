@@ -15,11 +15,11 @@ use crate::index;
 use crate::inflight::Inflight;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
-use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
+use crate::meta::{self, hash_bytes, EntryKind, FileMetadata};
 use crate::path::{
-    CanonicalPath, EntryName, PathError, canonical_to_host, is_reserved_root_entry, join_central,
+    canonical_to_host, is_reserved_root_entry, join_central, CanonicalPath, EntryName, PathError,
 };
-use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage, page_dir_list};
+use crate::protocol::{page_dir_list, BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
 use crate::status::{MasterStatus, PeerLive, Queues, StatusLedger};
 use crate::storage::{CheckoutId, Storage};
 use crate::transfer::{self, BulkTransfer};
@@ -567,16 +567,10 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     ) -> Result<Reply, MasterError> {
         let key = (header.checkout_id.clone(), header.path.clone());
         let Some(pending) = self.pending.get(&key) else {
-            return Ok(Reply::Send(ProtocolMessage::Error {
-                code: "unknown_transfer".into(),
-                message: header.path.as_str().into(),
-            }));
+            return self.accept_if_live_matches(&header);
         };
         if pending.peer != peer || pending.new.content_hash != header.want_hash {
-            return Ok(Reply::Send(ProtocolMessage::Error {
-                code: "unknown_transfer".into(),
-                message: header.path.as_str().into(),
-            }));
+            return self.accept_if_live_matches(&header);
         }
         let host = canonical_to_host(&self.central_root, &header.path);
         let basis = if pending
@@ -627,6 +621,26 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 }))
             }
         }
+    }
+
+    fn accept_if_live_matches(&self, header: &BulkHeader) -> Result<Reply, MasterError> {
+        let host = canonical_to_host(&self.central_root, &header.path);
+        let live = apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))?;
+        if live
+            .as_deref()
+            .is_some_and(|bytes| hash_bytes(bytes) == header.want_hash)
+        {
+            let node = self.meta(&header.path)?.as_ref().map(file_node);
+            return Ok(Reply::Send(ProtocolMessage::CasAccept {
+                checkout_id: header.checkout_id.clone(),
+                path: header.path.clone(),
+                file_node: node,
+            }));
+        }
+        Ok(Reply::Send(ProtocolMessage::Error {
+            code: "unknown_transfer".into(),
+            message: header.path.as_str().into(),
+        }))
     }
 
     pub fn note_local(&mut self, event: LocalEvent) -> Result<(), MasterError> {

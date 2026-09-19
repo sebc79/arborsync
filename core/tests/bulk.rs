@@ -1,15 +1,15 @@
-use arborsync_core::LoadedMaster;
 use arborsync_core::config::{CheckoutConfig, SlaveAcl};
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{Master, MemoryContent, Reply};
 use arborsync_core::merkle::file_node;
-use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};
+use arborsync_core::meta::{hash_bytes, EntryKind, FileMetadata};
 use arborsync_core::protocol::{BulkEncoding, ProtocolMessage};
 use arborsync_core::slave::Slave;
-use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
+use arborsync_core::test_support::{p, MemoryStorage, SyncSandbox};
 use arborsync_core::transfer::{
-    MIN_DELTA_BASIS, ask_kind, delta_bytes, fulfill, patch_bytes, signature_bytes,
+    ask_kind, delta_bytes, fulfill, patch_bytes, signature_bytes, MIN_DELTA_BASIS,
 };
+use arborsync_core::LoadedMaster;
 
 const ALICE: [u8; 32] = [0xA1; 32];
 const MTIME: i64 = 1_700_000_000_000;
@@ -159,6 +159,55 @@ fn master_asks_then_applies_a_whole_bulk_stream() {
             assert_eq!(node, Some(file_node(&new)));
         }
         other => panic!("expected CasAccept, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(sandbox.central_root().join("src/hello.txt")).unwrap(),
+        hello
+    );
+}
+
+#[test]
+fn second_announce_then_second_bulk_is_idempotent() {
+    let sandbox = SyncSandbox::new();
+    let mut master = alice_master(&sandbox);
+    master.handle(ALICE, subscribe()).unwrap();
+
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    let announce = ProtocolMessage::FileAnnounce {
+        checkout_id: "src".into(),
+        path: p("/src/hello.txt"),
+        new: new.clone(),
+        basis: None,
+    };
+    master.handle(ALICE, announce.clone()).unwrap();
+    master.handle(ALICE, announce).unwrap();
+
+    let first = fulfill("src", p("/src/hello.txt"), hash, hello, &[]).unwrap();
+    match master
+        .apply_bulk(ALICE, first.header.clone(), &first.body)
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept { path, .. }) => {
+            assert_eq!(path, p("/src/hello.txt"))
+        }
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    let second = fulfill("src", p("/src/hello.txt"), hash, hello, &[]).unwrap();
+    match master
+        .apply_bulk(ALICE, second.header, &second.body)
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept {
+            path,
+            file_node: node,
+            ..
+        }) => {
+            assert_eq!(path, p("/src/hello.txt"));
+            assert_eq!(node, Some(file_node(&new)));
+        }
+        other => panic!("expected idempotent CasAccept, got {other:?}"),
     }
     assert_eq!(
         std::fs::read(sandbox.central_root().join("src/hello.txt")).unwrap(),
@@ -345,13 +394,11 @@ fn slave_asks_then_applies_a_whole_bulk_stream() {
         .unwrap()
     {
         arborsync_core::slave::Reply::Send(msgs) => match &msgs[..] {
-            [
-                ProtocolMessage::SignatureRequest {
-                    want_hash,
-                    signature,
-                    ..
-                },
-            ] => {
+            [ProtocolMessage::SignatureRequest {
+                want_hash,
+                signature,
+                ..
+            }] => {
                 assert_eq!(*want_hash, hash);
                 assert!(signature.is_empty());
             }
@@ -368,4 +415,45 @@ fn slave_asks_then_applies_a_whole_bulk_stream() {
         slave.last_synced("src", &p("/src/hello.txt")).unwrap(),
         Some(file_node(&new))
     );
+}
+
+#[test]
+fn slave_second_bulk_after_accept_is_idempotent() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox);
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            new: new.clone(),
+            basis: None,
+        })
+        .unwrap();
+    let xfer = fulfill("src", p("/src/hello.txt"), hash, hello, &[]).unwrap();
+    slave.apply_bulk(xfer.header.clone(), &xfer.body).unwrap();
+    match slave.apply_bulk(xfer.header, &xfer.body).unwrap() {
+        arborsync_core::slave::Reply::Send(msgs) => assert!(msgs.is_empty()),
+        other => panic!("expected empty Send, got {other:?}"),
+    }
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    assert_eq!(std::fs::read(local.join("hello.txt")).unwrap(), hello);
+}
+
+#[test]
+fn slave_does_not_echo_unknown_transfer() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox);
+    match slave
+        .handle(ProtocolMessage::Error {
+            code: "unknown_transfer".into(),
+            message: "/src/hello.txt".into(),
+        })
+        .unwrap()
+    {
+        arborsync_core::slave::Reply::Send(msgs) => assert!(msgs.is_empty()),
+        other => panic!("expected empty Send, got {other:?}"),
+    }
 }
