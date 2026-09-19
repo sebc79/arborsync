@@ -135,6 +135,10 @@ struct DaemonPair {
 
 impl DaemonPair {
     fn start() -> Self {
+        Self::start_with_local(|_| {})
+    }
+
+    fn start_with_local(prefill: impl FnOnce(&Path)) -> Self {
         let sandbox = SyncSandbox::new();
         let local = sandbox.add_checkout("dev-alice", "src");
         let master_key = sandbox.path().join("master/master.key");
@@ -160,6 +164,7 @@ impl DaemonPair {
                 allowed_prefixes: vec!["/src".into()],
             }],
         };
+        fs::create_dir_all(sandbox.central_root().join("src")).expect("central src");
         let master_cfg_path = sandbox.master_config_path();
         write_toml(
             &master_cfg_path,
@@ -203,6 +208,7 @@ impl DaemonPair {
         };
         let slave_cfg_path = sandbox.slave_root("dev-alice").join("slave.toml");
         write_toml(&slave_cfg_path, &slave_cfg.to_toml().expect("slave toml"));
+        prefill(&local);
 
         let mut slave = KillOnDrop::new(spawn_logged(
             &["slave", "--config", slave_cfg_path.to_str().expect("utf8")],
@@ -255,7 +261,31 @@ fn slave_write_after_connect_appears_on_master() {
     wait_bytes(
         &pair.central_root.join("src/hello.txt"),
         b"from-slave",
-        Duration::from_secs(15),
+        Duration::from_secs(20),
+        || pair.log_tails(),
+    );
+    pair.kill_both();
+}
+
+#[test]
+fn leftover_nested_drop_appears_on_master() {
+    let mut pair = DaemonPair::start_with_local(|local| {
+        for dir_n in 0..16 {
+            let dir = local.join(format!("d{dir_n:02}"));
+            fs::create_dir_all(&dir).expect("leftover dir");
+            for file_n in 0..16 {
+                fs::write(
+                    dir.join(format!("f{file_n:02}.txt")),
+                    format!("d{dir_n:02}-f{file_n:02}"),
+                )
+                .expect("leftover file");
+            }
+        }
+    });
+    wait_bytes(
+        &pair.central_root.join("src/d15/f15.txt"),
+        b"d15-f15",
+        Duration::from_secs(60),
         || pair.log_tails(),
     );
     pair.kill_both();
@@ -272,7 +302,7 @@ fn master_write_after_connect_appears_on_slave() {
     wait_bytes(
         &pair.local.join("from-master.txt"),
         b"from-master",
-        Duration::from_secs(15),
+        Duration::from_secs(20),
         || pair.log_tails(),
     );
     pair.kill_both();

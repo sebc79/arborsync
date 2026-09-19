@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,8 +10,10 @@ use anyhow::Context;
 use arborsync_core::LocalEvent;
 use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::path::local_to_canonical;
+use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::slave::{Reply, Slave, SlaveError, WholeFileLater};
 use arborsync_core::storage::Storage;
+use arborsync_core::transfer::BulkTransfer;
 use arborsync_core::transport::{Transport, client_endpoint, connect, read_bulk, stream_err};
 use arborsync_core::watch::to_local_events;
 use arborsync_core::{CanonicalPath, LoadedSlave, RedbStorage, ReloadError, SlaveReload};
@@ -18,7 +21,7 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use quinn::Connection;
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::reload::{apply_file_log_level, spawn_config_watch};
 
@@ -241,15 +244,19 @@ async fn session(
 
     let (mut send, mut recv) = conn.open_control().await?;
     Connection::write_control(&mut send, &subscribe).await?;
-    dispatch_slave(
-        &conn,
-        &mut send,
-        slave
-            .lock()
-            .expect("slave")
-            .handle(Connection::read_control(&mut recv).await?)?,
-    )
-    .await?;
+    let (write_tx, mut write_rx) = unbounded_channel::<ProtocolMessage>();
+    let (write_err_tx, mut write_err_rx) = unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(msg) = write_rx.recv().await {
+            if let Err(err) = Connection::write_control(&mut send, &msg).await {
+                let _ = write_err_tx.send(err);
+                break;
+            }
+        }
+    });
+    let (bulk_tx, mut bulk_rx) = unbounded_channel();
+    let mut outbound = Outbound::new(write_tx.clone(), bulk_tx);
+    outbound.ingest(slave, &conn, Connection::read_control(&mut recv).await?)?;
     log::info!("connected to {addr_text}");
 
     let mut status_clock = crate::status::Clock::new();
@@ -257,19 +264,20 @@ async fn session(
         let status_every = slave.lock().expect("slave").status_interval_seconds();
         tokio::select! {
             msg = Connection::read_control(&mut recv) => {
-                let msg = msg?;
-                dispatch_slave(&conn, &mut send, slave.lock().expect("slave").handle(msg)?).await?;
+                outbound.ingest(slave, &conn, msg?)?;
             }
             incoming = conn.accept_uni() => {
                 let mut recv = incoming.map_err(stream_err)?;
                 let (header, body) = read_bulk(&mut recv).await?;
-                dispatch_slave(
+                outbound.push_reply(
                     &conn,
-                    &mut send,
                     slave.lock().expect("slave").apply_bulk(header, &body)?,
-                )
-                .await?;
+                )?;
             }
+            Some(result) = bulk_rx.recv() => {
+                outbound.on_bulk_done(slave, &conn, result)?;
+            }
+            Some(err) = write_err_rx.recv() => return Err(err.into()),
             work = work.recv() => {
                 let Some(work) = work else {
                     anyhow::bail!("watch channel closed");
@@ -277,22 +285,14 @@ async fn session(
                 match work {
                     Work::Local { checkout, event } => {
                         match slave.lock().expect("slave").note_local(&checkout, event) {
-                            Ok(outs) => {
-                                for out in outs {
-                                    Connection::write_control(&mut send, &out).await?;
-                                }
-                            }
+                            Ok(outs) => outbound.enqueue(outs)?,
                             Err(SlaveError::UnknownCheckout(_)) => {}
                             Err(err) => return Err(err.into()),
                         }
                     }
                     Work::Rescan { checkout } => {
                         match slave.lock().expect("slave").rescan(&checkout) {
-                            Ok(outs) => {
-                                for out in outs {
-                                    Connection::write_control(&mut send, &out).await?;
-                                }
-                            }
+                            Ok(outs) => outbound.enqueue(outs)?,
                             Err(SlaveError::UnknownCheckout(_)) => {}
                             Err(err) => return Err(err.into()),
                         }
@@ -306,9 +306,8 @@ async fn session(
                     work_tx,
                     watch_gen,
                     peer,
-                    &mut send,
-                )
-                .await?;
+                    &outbound.write_tx,
+                )?;
             }
             Some(()) = config_rx.recv() => {
                 apply_live_slave_reload(
@@ -317,9 +316,8 @@ async fn session(
                     work_tx,
                     watch_gen,
                     peer,
-                    &mut send,
-                )
-                .await?;
+                    &outbound.write_tx,
+                )?;
             }
             _ = status_clock.wait(status_every) => {
                 emit_slave_status(slave, true);
@@ -337,13 +335,13 @@ fn emit_slave_status(slave: &SharedSlave, connected: bool) {
     log::info!("{}", guard.take_status(connected).line(period));
 }
 
-async fn apply_live_slave_reload(
+fn apply_live_slave_reload(
     config_path: &Path,
     slave: &SharedSlave,
     work_tx: &UnboundedSender<Work>,
     watch_gen: &Arc<AtomicU64>,
     peer: [u8; 32],
-    send: &mut quinn::SendStream,
+    write_tx: &UnboundedSender<ProtocolMessage>,
 ) -> anyhow::Result<()> {
     let Some(plan) = reload_slave_from_disk(config_path, slave, work_tx, watch_gen) else {
         return Ok(());
@@ -353,28 +351,100 @@ async fn apply_live_slave_reload(
     }
     if plan.resubscribe {
         let subscribe = slave.lock().expect("slave").subscribe();
-        Connection::write_control(send, &subscribe).await?;
+        write_tx
+            .send(subscribe)
+            .map_err(|_| anyhow::anyhow!("control writer closed"))?;
     }
     Ok(())
 }
 
-async fn dispatch_slave(
-    conn: &quinn::Connection,
-    send: &mut quinn::SendStream,
-    reply: Reply,
-) -> anyhow::Result<()> {
-    match reply {
-        Reply::Hangup { reason } => anyhow::bail!("{reason}"),
-        Reply::Send(outs) => {
-            for out in outs {
-                Connection::write_control(send, &out).await?;
+struct Outbound {
+    write_tx: UnboundedSender<ProtocolMessage>,
+    parked: VecDeque<ProtocolMessage>,
+    bulk_tx: UnboundedSender<anyhow::Result<()>>,
+    bulk_busy: bool,
+}
+
+impl Outbound {
+    fn new(
+        write_tx: UnboundedSender<ProtocolMessage>,
+        bulk_tx: UnboundedSender<anyhow::Result<()>>,
+    ) -> Self {
+        Self {
+            write_tx,
+            parked: VecDeque::new(),
+            bulk_tx,
+            bulk_busy: false,
+        }
+    }
+
+    fn ingest(
+        &mut self,
+        slave: &SharedSlave,
+        conn: &Connection,
+        msg: ProtocolMessage,
+    ) -> anyhow::Result<()> {
+        if self.bulk_busy && matches!(msg, ProtocolMessage::SignatureRequest { .. }) {
+            self.parked.push_back(msg);
+            return Ok(());
+        }
+        let reply = slave.lock().expect("slave").handle(msg)?;
+        self.push_reply(conn, reply)
+    }
+
+    fn enqueue(&mut self, msgs: Vec<ProtocolMessage>) -> anyhow::Result<()> {
+        for msg in msgs {
+            self.write_tx
+                .send(msg)
+                .map_err(|_| anyhow::anyhow!("control writer closed"))?;
+        }
+        Ok(())
+    }
+
+    fn push_reply(&mut self, conn: &Connection, reply: Reply) -> anyhow::Result<()> {
+        match reply {
+            Reply::Hangup { reason } => anyhow::bail!("{reason}"),
+            Reply::Send(msgs) => self.enqueue(msgs),
+            Reply::Bulk(xfer) => {
+                self.spawn_bulk(conn, xfer);
+                Ok(())
             }
-            Ok(())
         }
-        Reply::Bulk(xfer) => {
-            conn.write_bulk(&xfer).await?;
-            Ok(())
+    }
+
+    fn spawn_bulk(&mut self, conn: &Connection, xfer: BulkTransfer) {
+        self.bulk_busy = true;
+        let conn = conn.clone();
+        let tx = self.bulk_tx.clone();
+        tokio::spawn(async move {
+            let result = conn
+                .write_bulk(&xfer)
+                .await
+                .map_err(|err| anyhow::anyhow!("{err:#}"));
+            let _ = tx.send(result);
+        });
+    }
+
+    fn on_bulk_done(
+        &mut self,
+        slave: &SharedSlave,
+        conn: &Connection,
+        result: anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        result?;
+        self.bulk_busy = false;
+        self.kick(slave, conn)
+    }
+
+    fn kick(&mut self, slave: &SharedSlave, conn: &Connection) -> anyhow::Result<()> {
+        while !self.bulk_busy {
+            let Some(msg) = self.parked.pop_front() else {
+                return Ok(());
+            };
+            let reply = slave.lock().expect("slave").handle(msg)?;
+            self.push_reply(conn, reply)?;
         }
+        Ok(())
     }
 }
 
