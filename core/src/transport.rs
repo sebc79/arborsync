@@ -394,10 +394,35 @@ fn control_summary(msg: &ProtocolMessage) -> String {
     }
 }
 
+pub struct ControlReader {
+    stream: RecvStream,
+    pending: Vec<u8>,
+}
+
+impl ControlReader {
+    fn new(stream: RecvStream) -> Self {
+        Self {
+            stream,
+            pending: Vec::new(),
+        }
+    }
+
+    async fn fill(&mut self, need: usize) -> Result<(), TransportError> {
+        while self.pending.len() < need {
+            let mut buf = [0u8; 8192];
+            match self.stream.read(&mut buf).await.map_err(stream_err)? {
+                None | Some(0) => return Err(TransportError::Closed),
+                Some(n) => self.pending.extend_from_slice(&buf[..n]),
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Transport for Connection {
     type Error = TransportError;
     type ControlSend = SendStream;
-    type ControlRecv = RecvStream;
+    type ControlRecv = ControlReader;
 
     fn peer_static_key(&self) -> Result<[u8; 32], Self::Error> {
         let identity = self
@@ -416,11 +441,13 @@ impl Transport for Connection {
     }
 
     async fn open_control(&self) -> Result<(Self::ControlSend, Self::ControlRecv), Self::Error> {
-        self.open_bi().await.map_err(stream_err)
+        let (send, recv) = self.open_bi().await.map_err(stream_err)?;
+        Ok((send, ControlReader::new(recv)))
     }
 
     async fn accept_control(&self) -> Result<(Self::ControlSend, Self::ControlRecv), Self::Error> {
-        self.accept_bi().await.map_err(stream_err)
+        let (send, recv) = self.accept_bi().await.map_err(stream_err)?;
+        Ok((send, ControlReader::new(recv)))
     }
 
     async fn write_control(
@@ -438,8 +465,8 @@ impl Transport for Connection {
     }
 
     async fn read_control(recv: &mut Self::ControlRecv) -> Result<ProtocolMessage, Self::Error> {
-        let mut header = [0u8; 4];
-        recv.read_exact(&mut header).await.map_err(stream_err)?;
+        recv.fill(4).await?;
+        let header: [u8; 4] = recv.pending[..4].try_into().expect("4 bytes");
         let len = u32::from_be_bytes(header) as usize;
         if len > MAX_CONTROL_FRAME {
             log::warn!(
@@ -451,11 +478,8 @@ impl Transport for Connection {
             );
             return Err(TransportError::Frame(FrameError::TooLarge));
         }
-        let mut payload = vec![0u8; len];
-        recv.read_exact(&mut payload).await.map_err(stream_err)?;
-        let mut frame = Vec::with_capacity(4 + len);
-        frame.extend_from_slice(&header);
-        frame.extend_from_slice(&payload);
+        recv.fill(4 + len).await?;
+        let frame: Vec<u8> = recv.pending.drain(..4 + len).collect();
         Ok(protocol::decode_control(&frame)?.0)
     }
 
