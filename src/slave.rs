@@ -12,9 +12,8 @@ use arborsync_core::hash::ContentHash;
 use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::path::local_to_canonical;
 use arborsync_core::protocol::ProtocolMessage;
-use arborsync_core::slave::{Reply, Slave, SlaveError, WholeFileLater};
+use arborsync_core::slave::{Reply, Slave, SlaveError, WholeFileLater, fulfill_from_host};
 use arborsync_core::storage::Storage;
-use arborsync_core::transfer::BulkTransfer;
 use arborsync_core::transport::{Transport, client_endpoint, connect, read_bulk, stream_err};
 use arborsync_core::watch::to_local_events;
 use arborsync_core::{CanonicalPath, LoadedSlave, RedbStorage, ReloadError, SlaveReload};
@@ -280,7 +279,7 @@ async fn session(
                 outbound.on_bulk_done(slave, &conn, result)?;
             }
             Some(err) = write_err_rx.recv() => return Err(err.into()),
-            _ = wait_if_crawl_pending(slave) => {
+            _ = wait_if_should_crawl(slave, outbound.serving()) => {
                 match slave.lock().expect("slave").crawl_step() {
                     Ok(outs) => outbound.enqueue(outs)?,
                     Err(SlaveError::UnknownCheckout(_)) => {}
@@ -335,7 +334,10 @@ async fn session(
     }
 }
 
-async fn wait_if_crawl_pending(slave: &SharedSlave) {
+async fn wait_if_should_crawl(slave: &SharedSlave, serving: bool) {
+    if serving {
+        std::future::pending::<()>().await;
+    }
     if slave.lock().expect("slave").crawl_pending() {
         return;
     }
@@ -391,20 +393,30 @@ fn apply_live_slave_reload(
     Ok(())
 }
 
+const MAX_BULK_INFLIGHT: usize = 4;
+const LARGE_BULK_BYTES: u64 = 16 * 1024 * 1024;
+
+struct BulkDone {
+    result: anyhow::Result<()>,
+    large: bool,
+    control: Vec<ProtocolMessage>,
+}
+
 struct Outbound {
     urgent_tx: UnboundedSender<ProtocolMessage>,
     walk_tx: UnboundedSender<ProtocolMessage>,
     parked: VecDeque<ProtocolMessage>,
     fulfilled_asks: HashSet<(String, CanonicalPath, ContentHash)>,
-    bulk_tx: UnboundedSender<anyhow::Result<()>>,
-    bulk_busy: bool,
+    bulk_tx: UnboundedSender<BulkDone>,
+    inflight: usize,
+    large_inflight: usize,
 }
 
 impl Outbound {
     fn new(
         urgent_tx: UnboundedSender<ProtocolMessage>,
         walk_tx: UnboundedSender<ProtocolMessage>,
-        bulk_tx: UnboundedSender<anyhow::Result<()>>,
+        bulk_tx: UnboundedSender<BulkDone>,
     ) -> Self {
         Self {
             urgent_tx,
@@ -412,8 +424,13 @@ impl Outbound {
             parked: VecDeque::new(),
             fulfilled_asks: HashSet::new(),
             bulk_tx,
-            bulk_busy: false,
+            inflight: 0,
+            large_inflight: 0,
         }
+    }
+
+    fn serving(&self) -> bool {
+        self.inflight > 0 || !self.parked.is_empty()
     }
 
     fn ingest(
@@ -423,6 +440,7 @@ impl Outbound {
         msg: ProtocolMessage,
     ) -> anyhow::Result<()> {
         if let Some(key) = signature_request_key(&msg) {
+            slave.lock().expect("slave").note_inbound(&msg);
             if self.fulfilled_asks.contains(&key)
                 || self
                     .parked
@@ -431,10 +449,11 @@ impl Outbound {
             {
                 return Ok(());
             }
-            if self.bulk_busy {
+            if !self.can_start(slave, &msg) {
                 self.parked.push_back(msg);
                 return Ok(());
             }
+            return self.start_ask(slave, conn, msg);
         }
         let reply = slave.lock().expect("slave").handle(msg)?;
         self.push_reply(conn, reply)
@@ -453,55 +472,147 @@ impl Outbound {
         Ok(())
     }
 
-    fn push_reply(&mut self, conn: &Connection, reply: Reply) -> anyhow::Result<()> {
+    fn push_reply(&mut self, _conn: &Connection, reply: Reply) -> anyhow::Result<()> {
         match reply {
             Reply::Hangup { reason } => anyhow::bail!("{reason}"),
             Reply::Send(msgs) => self.enqueue(msgs),
-            Reply::Bulk(xfer) => {
-                self.spawn_bulk(conn, xfer);
-                Ok(())
-            }
+            Reply::Bulk(_) => anyhow::bail!("bulk reply must start via start_ask"),
         }
     }
 
-    fn spawn_bulk(&mut self, conn: &Connection, xfer: BulkTransfer) {
-        self.fulfilled_asks.insert((
-            xfer.header.checkout_id.clone(),
-            xfer.header.path.clone(),
-            xfer.header.want_hash,
-        ));
-        self.bulk_busy = true;
+    fn can_start(&self, slave: &SharedSlave, msg: &ProtocolMessage) -> bool {
+        if self.inflight >= MAX_BULK_INFLIGHT {
+            return false;
+        }
+        !(self.is_large(slave, msg) && self.large_inflight > 0)
+    }
+
+    fn is_large(&self, slave: &SharedSlave, msg: &ProtocolMessage) -> bool {
+        let Some((checkout_id, path, _)) = signature_request_key(msg) else {
+            return true;
+        };
+        slave
+            .lock()
+            .expect("slave")
+            .announced_size(&checkout_id, &path)
+            .ok()
+            .flatten()
+            .is_some_and(|size| size >= LARGE_BULK_BYTES)
+    }
+
+    fn start_ask(
+        &mut self,
+        slave: &SharedSlave,
+        conn: &Connection,
+        msg: ProtocolMessage,
+    ) -> anyhow::Result<()> {
+        let ProtocolMessage::SignatureRequest {
+            checkout_id,
+            path,
+            want_hash,
+            signature,
+        } = msg
+        else {
+            return Ok(());
+        };
+        let (host, large) = {
+            let guard = slave.lock().expect("slave");
+            let host = match guard.bulk_host(&checkout_id, &path) {
+                Ok(host) => host,
+                Err(SlaveError::UnknownCheckout(_)) => return Ok(()),
+                Err(err) => return Err(err.into()),
+            };
+            let large = match guard.announced_size(&checkout_id, &path) {
+                Ok(size) => size.is_some_and(|size| size >= LARGE_BULK_BYTES),
+                Err(SlaveError::UnknownCheckout(_)) => return Ok(()),
+                Err(err) => return Err(err.into()),
+            };
+            (host, large)
+        };
+        self.fulfilled_asks
+            .insert((checkout_id.clone(), path.clone(), want_hash));
+        self.inflight += 1;
+        if large {
+            self.large_inflight += 1;
+        }
         let conn = conn.clone();
         let tx = self.bulk_tx.clone();
+        let status = slave.clone();
         tokio::spawn(async move {
-            let result = conn
-                .write_bulk(&xfer)
-                .await
-                .map_err(|err| anyhow::anyhow!("{err:#}"));
-            let _ = tx.send(result);
+            let reply = tokio::task::spawn_blocking(move || {
+                fulfill_from_host(checkout_id, path, want_hash, &signature, &host)
+            })
+            .await;
+            let done = match reply {
+                Ok(Ok(Reply::Bulk(xfer))) => {
+                    let bytes = xfer.body.len() as u64;
+                    status.lock().expect("slave").note_bulk_out(bytes);
+                    let result = conn
+                        .write_bulk(&xfer)
+                        .await
+                        .map_err(|err| anyhow::anyhow!("{err:#}"));
+                    BulkDone {
+                        result,
+                        large,
+                        control: Vec::new(),
+                    }
+                }
+                Ok(Ok(Reply::Send(control))) => BulkDone {
+                    result: Ok(()),
+                    large,
+                    control,
+                },
+                Ok(Ok(Reply::Hangup { reason })) => BulkDone {
+                    result: Err(anyhow::anyhow!("{reason}")),
+                    large,
+                    control: Vec::new(),
+                },
+                Ok(Err(err)) => BulkDone {
+                    result: Err(anyhow::anyhow!("{err}")),
+                    large,
+                    control: Vec::new(),
+                },
+                Err(err) => BulkDone {
+                    result: Err(anyhow::anyhow!("{err}")),
+                    large,
+                    control: Vec::new(),
+                },
+            };
+            let _ = tx.send(done);
         });
+        Ok(())
     }
 
     fn on_bulk_done(
         &mut self,
         slave: &SharedSlave,
         conn: &Connection,
-        result: anyhow::Result<()>,
+        done: BulkDone,
     ) -> anyhow::Result<()> {
-        result?;
-        self.bulk_busy = false;
+        done.result?;
+        self.inflight = self.inflight.saturating_sub(1);
+        if done.large {
+            self.large_inflight = self.large_inflight.saturating_sub(1);
+        }
+        for msg in &done.control {
+            slave.lock().expect("slave").note_outbound(msg);
+        }
+        self.enqueue(done.control)?;
         self.kick(slave, conn)
     }
 
     fn kick(&mut self, slave: &SharedSlave, conn: &Connection) -> anyhow::Result<()> {
-        while !self.bulk_busy {
-            let Some(msg) = self.parked.pop_front() else {
+        loop {
+            let idx = self
+                .parked
+                .iter()
+                .position(|msg| self.can_start(slave, msg));
+            let Some(idx) = idx else {
                 return Ok(());
             };
-            let reply = slave.lock().expect("slave").handle(msg)?;
-            self.push_reply(conn, reply)?;
+            let msg = self.parked.remove(idx).expect("parked ask");
+            self.start_ask(slave, conn, msg)?;
         }
-        Ok(())
     }
 }
 
