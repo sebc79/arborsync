@@ -33,6 +33,8 @@ use crate::reload::{apply_file_log_level, spawn_config_watch};
 
 type SharedSlave = Arc<Mutex<Slave<RedbStorage, WholeFileLater>>>;
 
+const HASH_DONE_BATCH: usize = 64;
+
 enum Work {
     Local { checkout: String, event: LocalEvent },
     Rescan { checkout: String },
@@ -72,8 +74,8 @@ impl HashPump {
         }
     }
 
-    fn finish(&mut self, slave: &SharedSlave) {
-        self.inflight = self.inflight.saturating_sub(1);
+    fn finish_n(&mut self, slave: &SharedSlave, n: usize) {
+        self.inflight = self.inflight.saturating_sub(n);
         self.kick(slave);
     }
 }
@@ -340,9 +342,17 @@ async fn session(
             }
             Some(err) = write_err_rx.recv() => return Err(err.into()),
             Some(done) = hash_rx.recv() => {
-                let outs = slave.lock().expect("slave").commit_hashed(done)?;
+                let mut dones = vec![done];
+                while dones.len() < HASH_DONE_BATCH {
+                    match hash_rx.try_recv() {
+                        Ok(more) => dones.push(more),
+                        Err(_) => break,
+                    }
+                }
+                let n = dones.len();
+                let outs = slave.lock().expect("slave").commit_hashed_batch(dones)?;
                 outbound.enqueue(outs)?;
-                hasher.finish(slave);
+                hasher.finish_n(slave, n);
                 offer_pending_hashes(slave, &mut hasher);
                 if slave.lock().expect("slave").should_step_crawl(outbound.serving()) {
                     match slave.lock().expect("slave").crawl_step() {

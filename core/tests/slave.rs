@@ -4,6 +4,7 @@ use arborsync_core::LoadedSlave;
 use arborsync_core::LocalEvent;
 use arborsync_core::config::{CheckoutConfig, ReloadError};
 use arborsync_core::hash::ContentHash;
+use arborsync_core::hashing::HashPlan;
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::merkle::file_node;
 use arborsync_core::meta::{FileMetadata, hash_bytes};
@@ -1108,6 +1109,86 @@ fn echo_of_an_applied_rename_does_not_reannounce() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn hashed_siblings_announce_with_matching_index_rows() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    let tree = sandbox.tree(&local);
+    tree.file("a.txt", b"aaa");
+    tree.file("b.txt", b"bbb");
+    tree.file("nested/c.txt", b"ccc");
+
+    let mut plan = HashPlan::default();
+    for path in ["/src/a.txt", "/src/b.txt", "/src/nested/c.txt"] {
+        plan.append(
+            slave
+                .plan_local("src", LocalEvent::Changed(p(path)))
+                .unwrap(),
+        );
+    }
+    assert!(
+        plan.send.is_empty(),
+        "new files should need a hash job, got {:?}",
+        plan.send
+    );
+    let mut dones = Vec::new();
+    for need in plan.hash {
+        slave.start_hashed(&need.key);
+        dones.push(need.run());
+    }
+    let out = slave.commit_hashed_batch(dones).unwrap();
+    let hashes: Vec<(&str, ContentHash)> = out
+        .iter()
+        .map(|msg| match msg {
+            ProtocolMessage::FileAnnounce {
+                checkout_id,
+                path,
+                new,
+                basis,
+            } => {
+                assert_eq!(checkout_id, "src");
+                assert_eq!(*basis, None);
+                (path.as_str(), new.content_hash)
+            }
+            other => panic!("expected FileAnnounce, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        hashes,
+        [
+            ("/src/a.txt", hash_bytes(b"aaa")),
+            ("/src/b.txt", hash_bytes(b"bbb")),
+            ("/src/nested/c.txt", hash_bytes(b"ccc")),
+        ]
+    );
+    assert_eq!(
+        slave
+            .meta("src", &p("/src/a.txt"))
+            .unwrap()
+            .unwrap()
+            .content_hash,
+        hash_bytes(b"aaa")
+    );
+    assert_eq!(
+        slave
+            .meta("src", &p("/src/b.txt"))
+            .unwrap()
+            .unwrap()
+            .content_hash,
+        hash_bytes(b"bbb")
+    );
+    assert_eq!(
+        slave
+            .meta("src", &p("/src/nested/c.txt"))
+            .unwrap()
+            .unwrap()
+            .content_hash,
+        hash_bytes(b"ccc")
+    );
+    assert_eq!(slave.last_synced("src", &p("/src/a.txt")).unwrap(), None);
 }
 
 #[test]
