@@ -17,6 +17,7 @@ use crate::meta::FileMetadata;
 use crate::path::{CanonicalPath, EntryName, RESERVED_CONFLICTS, RESERVED_TMP};
 use crate::protocol::ProtocolMessage;
 use crate::storage::{CheckoutId, Storage, WriteBatch};
+use crate::tune::TuneSpec;
 
 /// Canonical path from a test literal. Panics on a non-canonical spelling,
 /// which in a test is a typo, not an input to handle.
@@ -493,6 +494,7 @@ impl SyncSandbox {
             max_connections: 100,
             max_connection_attempts_per_minute: 60,
             slaves,
+            tune: TuneSpec::default(),
         };
         let path = self.master_config_path();
         fs::write(&path, cfg.to_toml().expect("toml")).expect("write master.toml");
@@ -520,6 +522,7 @@ impl SyncSandbox {
             rescan_interval_seconds: 60,
             status_interval_seconds: 0,
             checkouts,
+            tune: TuneSpec::default(),
         };
         let path = root.join("slave.toml");
         fs::write(&path, cfg.to_toml().expect("toml")).expect("write slave.toml");

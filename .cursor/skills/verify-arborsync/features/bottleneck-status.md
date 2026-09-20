@@ -1,6 +1,6 @@
 # Name the limiting hop on status lines
 
-Each `status ` line names `bottleneck=` after `health=`. Idle is `bottleneck=none`. A wait that is open also prints `age=` and `depth=`. The master's per-slave line adds `hint=fresh`, `hint=stale`, or `hint=absent` so you can tell a slave verdict that arrived as a datagram from a silent peer.
+Each `status ` line names `bottleneck=` after `health=`. Idle is `bottleneck=none`. A wait that is open also prints `age=` and `depth=`. The master's per-slave line adds `hint=fresh`, `hint=stale`, or `hint=absent` so you can tell a slave verdict that arrived as a datagram from a silent peer. `bottleneck=hashing` and `bottleneck=fulfill_parked` are the hops you raise with `[tune.hashing]` and `[tune.fulfill_parked]`. See [Raise a named hashing or fulfill hop](./tune-hops.md).
 
 ## Sub-features
 

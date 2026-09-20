@@ -475,6 +475,9 @@ max_checkouts_per_slave = 100
 max_connections = 100
 max_connection_attempts_per_minute = 60
 
+# [tune.hashing]
+# workers = "nproc"
+
 [[slaves]]
 id = "dev-alice"
 public_keys = ["hex:32-byte-x25519-public"]
@@ -500,6 +503,11 @@ watcher_debounce_ms = 200
 rescan_interval_seconds = 60
 status_interval_seconds = 5
 
+# [tune.hashing]
+# workers = "nproc"
+# [tune.fulfill_parked]
+# inflight = 4
+
 checkouts = [
     { id = "src",  central = "/src",  local = "/opt/projects/src" },
     { id = "docs", central = "/docs", local = "/opt/projects/docs" },
@@ -509,6 +517,8 @@ checkouts = [
 A `/` checkout on `dev-alice` is `SubscribeReject`ed. Full-replica / overlap checkouts belong on a slave whose ACL includes `/` (see `backup-1` in §3).
 
 Both sides enforce the same `max_checkouts_per_slave`. Config files are `0600` (they hold key *paths*, and slaves hold master pins). Private key files are `0600`.
+
+`[tune.hashing].workers` is `"nproc"` or 1 through 256 on both roles. `[tune.fulfill_parked].inflight` is 1 through 64 on the slave. Omit both tables for those defaults. `0` is a parse error. A `[tune]` hop other than `hashing` or `fulfill_parked` is a parse error. Master `[tune.fulfill_parked]` is `TuneNotOnRole`. Both knobs apply on SIGHUP. There is no NixOS option for either key.
 
 CLI overrides: `--config PATH`. Env: `ARBORSYNC_CONFIG`, `ARBORSYNC_LOG_LEVEL`. Do not put key material in the environment.
 
@@ -565,7 +575,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 4. ✅ Slave: connect, pin check, Subscribe, per-checkout watch, announce, apply, sidecar, log public pin at startup.
 5. ✅ Bulk `copia` streams; whole-file fallback. Apply reconstructs in memory, then writes the full buffer through `.arborsync-tmp`.
 6. ✅ Reconcile walk + rescan + reconnect.
-7. ✅ Config watch for checkout add/remove; SIGHUP ACL/log/status-interval reload.
+7. ✅ Config watch for checkout add/remove; SIGHUP ACL/log/status-interval/tune reload.
 8. ✅ Tests: `core/tests/scenarios.rs` covers reserved dirs, two checkouts on one slave (`/src` and `/`), CAS conflict, echo suppression, ACL deny, and rescan-as-missed-watcher. Those tests call `handle`, `note_local`, and `rescan` on `MemoryStorage`. `src/watch.rs` starts a real `notify-debouncer-full` thread and asserts a FileAnnounce after a post-arm write. `tests/sync.rs` starts master and slave over QUIC and asserts a post-connect write crosses.
 
 **✅ Framing and storage.** `decode_control` reads `Envelope.version`, then `ProtocolMessage`. An unknown version is `FrameError::UnsupportedVersion`, including a v2 variant index under version 2. On-disk `FileMetadata` is `u16le META_SCHEMA_VERSION || bincode` with its own `meta_bincode_config`. Wire frames use `wire_bincode_config`. Both configs are `bincode::config::standard()` today. The schema prefix is what stops a wire change from silently reinterpreting stored rows.
@@ -600,9 +610,10 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §12 `Transport` trait | `Transport` is a live session. It exposes the peer static key, one control stream pair, on-demand bulk, best-effort datagrams, and `close`. `impl Transport for quinn::Connection` is the QUIC path. The master and slave binaries and `core/tests/transport.rs` call the trait. `MemoryTransport::pair` is the in-memory test impl and has no datagrams. `pair_with_datagrams` is the opt-in. Most unit tests still call `handle`. |
 | ➖ | §14 `quic_*` / `reconnect_*` | Struck in `doc/configuration.md`. Not struct fields. Reconnect is 1 s, doubling, cap 60 s. |
 | ✅ | §11 / §12 keep-alive | Idle timeout stays at the Quinn 30 s default. `listen` and `client_endpoint` set `keep_alive_interval` to 10 s. No application `Heartbeat`. |
-| ✅ | Backpressure (`set_writable`) | `flush_outbox` polls the batch and `set_writable(peer, false)` when the batch is longer than 32. The writer task sets `writable` true after that batch is written. `set_writable(false)` still clears the leftover outbox. |
+| ✅ | Backpressure (`set_writable`) | `flush_outbox` polls the batch and `set_writable(peer, false)` when the batch is longer than 32. The writer task sets `writable` true after that batch is written. `set_writable(false)` clears the leftover outbox and increments `fanout_dropped` on that interval. |
 | ✅ | In-flight bulk after disconnect | `Master::disconnect` drops pending rows whose `peer` is the disconnected peer. |
-| ✅ | Interval status reports | Master and slave log a `status ` summary each `status_interval_seconds` (default 5, `0` disables, max 3600). Health is `idle`, `busy`, `stuck`, or `failed`. Each line also names `bottleneck=` (the hop that is limiting progress), with `age=` and `depth=` when a wait is open. The master adds one line per slave. Reload applies the interval live. No metrics port. |
+| ✅ | Interval status reports | Master and slave log a `status ` summary each `status_interval_seconds` (default 5, `0` disables, max 3600). Health is `idle`, `busy`, `stuck`, or `failed`. Each line also names `bottleneck=` (the hop that is limiting progress), with `age=` and `depth=` when a wait is open. The master adds one line per slave and prints `fanout_dropped=` on the master queue fields. Reload applies the interval live. No metrics port. |
+| ✅ | §14 `[tune.hashing]` / `[tune.fulfill_parked]` | `workers` is `"nproc"` or 1 through 256 on both roles. Slave `inflight` is 1 through 64. Defaults are `"nproc"` and 4. `0` and `[tune.origin_bytes]` fail parse. Master `[tune.fulfill_parked]` is `TuneNotOnRole`. Both knobs apply on SIGHUP. Hash work and master fulfill run on `spawn_blocking`. Slave leftover inflight is `FulfillAdmission`. No NixOS option. |
 | ✅ | Bottleneck side-channel | The slave sends its own `bottleneck=` verdict to the master as a 25-byte QUIC datagram each status period. Not a `ProtocolMessage`. A missing or stale gauge prints `hint=absent` or `hint=stale` on that slave line only. An old peer keeps syncing. |
 
 Topic documents:

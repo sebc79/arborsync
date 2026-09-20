@@ -35,6 +35,9 @@ max_checkouts_per_slave = 100
 max_connections = 100
 max_connection_attempts_per_minute = 60
 
+# [tune.hashing]
+# workers = "nproc"                 # or 1–256. Omit the table for this default.
+
 [[slaves]]
 id = "dev-alice"
 public_keys = ["hex:0123…"]          # 32-byte X25519 public, one or more
@@ -64,6 +67,11 @@ watcher_debounce_ms = 200
 rescan_interval_seconds = 60
 status_interval_seconds = 5           # 0 disables, max 3600
 
+# [tune.hashing]
+# workers = "nproc"                   # or 1–256. Omit the table for this default.
+# [tune.fulfill_parked]
+# inflight = 4                        # 1–64. Slave only.
+
 checkouts = [
     { id = "src",  central = "/src",  local = "/opt/projects/src" },
     { id = "docs", central = "/docs", local = "/opt/projects/docs" },
@@ -80,9 +88,21 @@ Reconnect backoff is hardcoded at 1 s, doubling, cap 60 s. `reconnect_initial_ms
 
 `max_checkouts_per_slave` must be the same idea on both sides. A slave config longer than the master’s limit is `SubscribeReject`ed; validate locally against the slave’s own copy of the setting as a first check.
 
+## Tune
+
+`[tune.hashing]` and `[tune.fulfill_parked]` are the only hop tables. A `[tune]` key that does not name one of those hops is a parse error. Extra top-level TOML keys still vanish. `0` is never auto.
+
+`[tune.hashing].workers` is `"nproc"` or an integer from 1 through 256. The default is `"nproc"`. Omit the table when that is what you want. `"nproc"` uses `available_parallelism` and clamps to 256. If the OS returns no width, the process uses 1 and logs that. Both roles accept this table.
+
+`[tune.fulfill_parked].inflight` is an integer from 1 through 64. The default is 4. Slave only. Master TOML that contains this table is `ConfigError::TuneNotOnRole`.
+
+Both knobs apply on SIGHUP. Hash admission and `can_start` read `Loaded*` after the cfg swap. There is no dedicated hash pool. There is no NixOS option for either key.
+
+`STEP_BUDGET`, `OUTBOX_BACKPRESSURE`, and the 16 MiB large-lane cutoff stay hardcoded.
+
 ## Validation
 
-- TOML types and ranges (`watcher_debounce_ms` in 200–500, `status_interval_seconds` in 0–3600, `log_level` enum, ports).
+- TOML types and ranges (`watcher_debounce_ms` in 200–500, `status_interval_seconds` in 0–3600, `log_level` enum, ports, `tune.hashing.workers` in 1–256 or `"nproc"`, `tune.fulfill_parked.inflight` in 1–64).
 - Keys: each `hex:` value decodes to exactly 32 bytes. Secret key files are 32 raw bytes or the same `hex:` form.
 - Prefixes: absolute, normalized, no `..`.
 - Slave `slave_id` is a non-empty UTF-8 string matching `[A-Za-z0-9._:-]+`.
@@ -90,7 +110,7 @@ Reconnect backoff is hardcoded at 1 s, doubling, cap 60 s. `reconnect_initial_ms
 
 ## Reload (SIGHUP)
 
-**Applied live:** `log_level`, `max_connection_attempts_per_minute`, `max_connections` (affects new accepts), `[[slaves]]` (add/remove rows, change `allowed_prefixes`, add rotation keys), slave `master_public_keys`, slave `checkouts` (add/remove per `spec.md` §3), debounce, rescan, and status intervals (the next window uses the new value). Watcher restart is only for debounce or rescan. A status interval change is read on the next tick.
+**Applied live:** `log_level`, `max_connection_attempts_per_minute`, `max_connections` (affects new accepts), `[[slaves]]` (add/remove rows, change `allowed_prefixes`, add rotation keys), slave `master_public_keys`, slave `checkouts` (add/remove per `spec.md` §3), debounce, rescan, and status intervals (the next window uses the new value), `[tune.hashing].workers`, and slave `[tune.fulfill_parked].inflight`. Watcher restart is only for debounce or rescan. A status interval change is read on the next tick. A worker or inflight change is read on the next hash admission or `can_start`.
 
 **Requires restart:** `listen_addr`, `db_path`, `central_root`, `master_addr`, `*_key_path`, and slave `slave_id`.
 

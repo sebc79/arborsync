@@ -9,6 +9,7 @@ mod inflight;
 pub mod bottleneck;
 pub mod config;
 pub mod hash;
+pub mod hashing;
 pub mod keys;
 pub mod master;
 pub mod merkle;
@@ -21,6 +22,7 @@ pub mod status;
 pub mod storage;
 pub mod transfer;
 pub mod transport;
+pub mod tune;
 pub mod watch;
 
 pub mod test_support;
@@ -30,6 +32,7 @@ pub use config::{
     SlaveReload, log_level_filter,
 };
 pub use hash::{ContentHash, DirNode, FileNode, SubtreeRoot};
+pub use hashing::{HashDone, HashKey, HashNeed, HashOutcome, HashPlan};
 pub use keys::{
     KeyError, format_hex_key, parse_hex_key, public_from_secret, read_static_key, write_static_key,
 };
@@ -40,4 +43,5 @@ pub use path::{
 };
 pub use storage::{CheckoutId, RedbStorage, Storage, WriteBatch};
 pub use transport::{MemoryTransport, Transport};
+pub use tune::{FulfillAdmission, FulfillCap, Tune, WorkerCount, WorkerCountSpec};
 pub use watch::LocalEvent;

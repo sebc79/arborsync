@@ -12,11 +12,12 @@ use crate::apply;
 use crate::bottleneck::{Gauge, Stage, Waiting};
 use crate::config::{LoadedMaster, MasterReload, ReloadError};
 use crate::hash::{ContentHash, FileNode, SubtreeRoot};
+use crate::hashing::{HashDone, HashKey, HashNeed, HashOutcome, HashPlan};
 use crate::index;
 use crate::inflight::Inflight;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
-use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
+use crate::meta::{self, EntryKind, FileMetadata, Inspected, hash_bytes};
 use crate::path::{
     CanonicalPath, EntryName, PathError, canonical_to_host, is_reserved_root_entry, join_central,
 };
@@ -24,6 +25,7 @@ use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage, pag
 use crate::status::{MasterStatus, PeerLive, Queues, StatusLedger};
 use crate::storage::{CheckoutId, Storage};
 use crate::transfer::{self, BulkTransfer};
+use crate::tune::Tune;
 use crate::watch::LocalEvent;
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
@@ -84,6 +86,48 @@ pub enum Reply {
     Send(ProtocolMessage),
     Hangup { reason: String, rate_limit: bool },
     Bulk(BulkTransfer),
+}
+
+pub enum FulfillPlan {
+    BulkHost {
+        host: PathBuf,
+        checkout_id: String,
+        path: CanonicalPath,
+        want_hash: ContentHash,
+        signature: Vec<u8>,
+    },
+    Send(ProtocolMessage),
+}
+
+impl FulfillPlan {
+    pub fn run(self) -> Result<Reply, MasterError> {
+        match self {
+            Self::Send(msg) => Ok(Reply::Send(msg)),
+            Self::BulkHost {
+                host,
+                checkout_id,
+                path,
+                want_hash,
+                signature,
+            } => {
+                let Some(source) =
+                    apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))?
+                else {
+                    return Ok(Reply::Send(missing_hash(&path)));
+                };
+                match transfer::fulfill(checkout_id, path.clone(), want_hash, &source, &signature) {
+                    Ok(xfer) => Ok(Reply::Bulk(xfer)),
+                    Err(transfer::TransferError::HashMismatch) => {
+                        Ok(Reply::Send(missing_hash(&path)))
+                    }
+                    Err(err) => Ok(Reply::Send(ProtocolMessage::Error {
+                        code: "transfer".into(),
+                        message: err.to_string(),
+                    })),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -300,17 +344,20 @@ impl Roster {
         }
     }
 
-    fn set_writable(&mut self, peer: &[u8; 32], writable: bool) {
+    fn set_writable(&mut self, peer: &[u8; 32], writable: bool) -> u64 {
         let Some(slave) = self.by_peer.get(peer).cloned() else {
-            return;
+            return 0;
         };
         let Some(live) = self.by_slave.get_mut(&slave) else {
-            return;
+            return 0;
         };
         live.writable = writable;
-        if !writable {
-            live.outbox.clear();
+        if writable {
+            return 0;
         }
+        let dropped = live.outbox.len() as u64;
+        live.outbox.clear();
+        dropped
     }
 }
 
@@ -394,6 +441,11 @@ struct PendingApply {
     retried: bool,
 }
 
+pub struct CentralWalk {
+    pub ready: BTreeMap<CanonicalPath, FileMetadata>,
+    pub needs: Vec<HashNeed>,
+}
+
 pub struct Master<S: Storage, C: ContentHook> {
     cfg: LoadedMaster,
     store: S,
@@ -402,6 +454,7 @@ pub struct Master<S: Storage, C: ContentHook> {
     inflight: Inflight,
     bodies: C,
     pending: Waiting<(String, CanonicalPath), PendingApply>,
+    hashing: Waiting<HashKey, ()>,
     dirs: index::DirChildren,
     status: StatusLedger,
 }
@@ -422,6 +475,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             inflight: Inflight::new(debounce),
             bodies,
             pending: Waiting::new(Stage::OriginBytes),
+            hashing: Waiting::new(Stage::Hashing),
             dirs: index::DirChildren::default(),
             status: StatusLedger::default(),
         };
@@ -513,7 +567,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 path,
                 want_hash,
                 signature,
-            } => self.on_signature_request(peer, checkout_id, path, want_hash, signature),
+            } => self
+                .plan_fulfill(peer, checkout_id, path, want_hash, signature)?
+                .run(),
             ProtocolMessage::RootReport {
                 checkout_id,
                 path,
@@ -647,28 +703,113 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         }))
     }
 
-    pub fn note_local(&mut self, event: LocalEvent) -> Result<(), MasterError> {
-        let result = match event {
-            LocalEvent::Changed(path) => self.note_changed(path),
-            LocalEvent::Metadata(path) => self.note_metadata(path),
-            LocalEvent::Removed(path) => self.note_removed(&path),
-            LocalEvent::Renamed { from, to } => self.note_renamed(from, to),
+    pub fn tune(&self) -> &Tune {
+        self.cfg.tune()
+    }
+
+    pub fn plan_local(&mut self, event: LocalEvent) -> Result<HashPlan, MasterError> {
+        let plan = match event {
+            LocalEvent::Changed(path) => self.note_changed(path)?,
+            LocalEvent::Metadata(path) => self.note_metadata(path)?,
+            LocalEvent::Removed(path) => {
+                self.note_removed(&path)?;
+                HashPlan::default()
+            }
+            LocalEvent::Renamed { from, to } => self.note_renamed(from, to)?,
         };
-        if result.is_ok() {
-            self.status.local(None);
+        self.status.local(None);
+        Ok(plan)
+    }
+
+    pub fn note_local(&mut self, event: LocalEvent) -> Result<(), MasterError> {
+        let plan = self.plan_local(event)?;
+        self.drain_plan(plan)
+    }
+
+    pub fn commit_hashed(&mut self, done: HashDone) -> Result<HashPlan, MasterError> {
+        self.hashing.remove(&done.key);
+        let HashKey::Central(path) = done.key else {
+            return Ok(HashPlan::default());
+        };
+        match done.outcome {
+            HashOutcome::File(found) => {
+                if self.meta(&path)?.as_ref() == Some(&found) {
+                    return Ok(HashPlan::default());
+                }
+                let current = self.meta(&path)?;
+                if current.as_ref() != done.previous.as_ref() {
+                    return self.note_changed(path);
+                }
+                self.note_present(path, found)?;
+                Ok(HashPlan::default())
+            }
+            HashOutcome::Absent => {
+                self.note_removed(&path)?;
+                Ok(HashPlan::default())
+            }
+            HashOutcome::Io(kind) => {
+                log::warn!("hash {}: {kind}", path.as_str());
+                Ok(HashPlan::default())
+            }
         }
-        result
+    }
+
+    fn drain_plan(&mut self, plan: HashPlan) -> Result<(), MasterError> {
+        for need in plan.hash {
+            self.hashing.remove(&need.key);
+            let next = self.commit_hashed(need.run())?;
+            self.drain_plan(next)?;
+        }
+        Ok(())
+    }
+
+    pub fn start_hashed(&mut self, key: &HashKey) {
+        self.hashing.remove(key);
     }
 
     pub fn rescan(&mut self) -> Result<(), MasterError> {
-        let disk = self.walk_central()?;
+        let walk = self.walk_central_stats()?;
+        self.apply_central_ready(&walk.ready, &walk.needs)?;
+        for need in walk.needs {
+            self.hashing.remove(&need.key);
+            let next = self.commit_hashed(need.run())?;
+            self.drain_plan(next)?;
+        }
+        self.status.rescan(None);
+        Ok(())
+    }
+
+    pub fn plan_rescan(&mut self) -> Result<HashPlan, MasterError> {
+        let walk = self.walk_central_stats()?;
+        self.apply_central_ready(&walk.ready, &walk.needs)?;
+        let mut plan = HashPlan::default();
+        for need in walk.needs {
+            self.hashing.insert(need.key.clone(), (), Instant::now());
+            plan.hash.push(need);
+        }
+        self.status.rescan(None);
+        Ok(plan)
+    }
+
+    fn apply_central_ready(
+        &mut self,
+        disk: &BTreeMap<CanonicalPath, FileMetadata>,
+        needs: &[HashNeed],
+    ) -> Result<(), MasterError> {
         let indexed = self
             .store
             .range_meta(&CheckoutId::master(), &CanonicalPath::root())
             .map_err(MasterError::index)?;
 
+        let hashing: HashSet<_> = needs
+            .iter()
+            .filter_map(|need| match &need.key {
+                HashKey::Central(path) => Some(path.clone()),
+                HashKey::Checkout { .. } => None,
+            })
+            .collect();
         for (path, previous) in indexed {
-            if disk.contains_key(&path) {
+            if disk.contains_key(&path) || hashing.contains(&path) {
                 continue;
             }
             if self.meta(&path)?.is_none() {
@@ -676,14 +817,13 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             }
             self.commit(&Origin::Local, &path, None, Some(&previous))?;
         }
-        for (path, found) in &disk {
+        for (path, found) in disk {
             let current = self.meta(path)?;
             if current.as_ref() == Some(found) {
                 continue;
             }
             self.commit(&Origin::Local, path, Some(found), current.as_ref())?;
         }
-        self.status.rescan(None);
         Ok(())
     }
 
@@ -722,7 +862,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     }
 
     pub fn set_writable(&mut self, peer: [u8; 32], writable: bool) {
-        self.roster.set_writable(&peer, writable);
+        let dropped = self.roster.set_writable(&peer, writable);
+        let slave = self.status_slave(&peer);
+        self.status.fanout_dropped(slave.as_deref(), dropped);
     }
 
     pub fn central_root(&self) -> &std::path::Path {
@@ -770,8 +912,11 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 }
             })
             .collect();
-        self.status
-            .take_master(live, self.cfg.status_interval_seconds())
+        self.status.take_master(
+            live,
+            self.hashing.oldest().into_iter().collect(),
+            self.cfg.status_interval_seconds(),
+        )
     }
 
     pub fn note_status_error(&mut self, slave: Option<&str>, reason: impl Into<String>) {
@@ -1300,32 +1445,38 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         Ok(())
     }
 
-    fn note_changed(&mut self, path: CanonicalPath) -> Result<(), MasterError> {
+    fn note_changed(&mut self, path: CanonicalPath) -> Result<HashPlan, MasterError> {
         if path.has_reserved_root_name() {
-            return Ok(());
+            return Ok(HashPlan::default());
         }
         let host = canonical_to_host(&self.central_root, &path);
         let previous = self.meta(&path)?;
-        let Some(found) =
-            meta::collect_for_rescan(&host, previous.as_ref()).map_err(MasterError::io(&host))?
-        else {
-            return self.note_removed(&path);
-        };
-        self.note_present(path, found)
+        match meta::inspect_for_hash(&host, previous.as_ref()).map_err(MasterError::io(&host))? {
+            Inspected::Ready(found) => {
+                self.note_present(path, found)?;
+                Ok(HashPlan::default())
+            }
+            Inspected::Absent => {
+                self.note_removed(&path)?;
+                Ok(HashPlan::default())
+            }
+            Inspected::NeedHash(host) => {
+                let key = HashKey::Central(path);
+                self.hashing.insert(key.clone(), (), Instant::now());
+                Ok(HashPlan {
+                    send: Vec::new(),
+                    hash: vec![HashNeed {
+                        key,
+                        host,
+                        previous,
+                    }],
+                })
+            }
+        }
     }
 
-    fn note_metadata(&mut self, path: CanonicalPath) -> Result<(), MasterError> {
-        if path.has_reserved_root_name() {
-            return Ok(());
-        }
-        let host = canonical_to_host(&self.central_root, &path);
-        let previous = self.meta(&path)?;
-        let Some(found) =
-            meta::collect_for_rescan(&host, previous.as_ref()).map_err(MasterError::io(&host))?
-        else {
-            return self.note_removed(&path);
-        };
-        self.note_present(path, found)
+    fn note_metadata(&mut self, path: CanonicalPath) -> Result<HashPlan, MasterError> {
+        self.note_changed(path)
     }
 
     fn note_present(
@@ -1344,28 +1495,35 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         self.commit(&Origin::Local, &path, Some(&found), current.as_ref())
     }
 
-    fn note_renamed(&mut self, from: CanonicalPath, to: CanonicalPath) -> Result<(), MasterError> {
+    fn note_renamed(
+        &mut self,
+        from: CanonicalPath,
+        to: CanonicalPath,
+    ) -> Result<HashPlan, MasterError> {
         if from.has_reserved_root_name() || to.has_reserved_root_name() {
-            return Ok(());
+            return Ok(HashPlan::default());
         }
         let host_to = canonical_to_host(&self.central_root, &to);
         let from_previous = self.meta(&from)?;
         let Some(found) = meta::collect_for_rescan(&host_to, from_previous.as_ref())
             .map_err(MasterError::io(&host_to))?
         else {
-            return self.note_removed(&from);
+            self.note_removed(&from)?;
+            return Ok(HashPlan::default());
         };
         if self.inflight.consume_if_echo(&to, &found.content_hash) {
-            return Ok(());
+            return Ok(HashPlan::default());
         }
         let Some(from_previous) = from_previous else {
-            return self.note_present(to, found);
+            self.note_present(to, found)?;
+            return Ok(HashPlan::default());
         };
         let current_to = self.meta(&to)?;
         if current_to.as_ref() == Some(&found) && self.meta(&from)?.is_none() {
-            return Ok(());
+            return Ok(HashPlan::default());
         }
-        self.commit_rename(&Origin::Local, &from, &to, &from_previous, &found)
+        self.commit_rename(&Origin::Local, &from, &to, &from_previous, &found)?;
+        Ok(HashPlan::default())
     }
 
     fn reindex_descendants(
@@ -1400,35 +1558,39 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         Ok(())
     }
 
-    fn on_signature_request(
+    pub fn plan_fulfill(
         &mut self,
         peer: [u8; 32],
         checkout_id: String,
         path: CanonicalPath,
         want_hash: ContentHash,
         signature: Vec<u8>,
-    ) -> Result<Reply, MasterError> {
+    ) -> Result<FulfillPlan, MasterError> {
+        let slave = self.status_slave(&peer);
+        self.status.inbound(
+            slave.as_deref(),
+            &ProtocolMessage::SignatureRequest {
+                checkout_id: checkout_id.clone(),
+                path: path.clone(),
+                want_hash,
+                signature: signature.clone(),
+            },
+        );
         let checkout = CheckoutName::new(checkout_id.clone());
         let session = match self.live_checkout(&peer, &checkout) {
             Ok(session) => session,
-            Err(refusal) => return Ok(Reply::Send(refusal.into_error(&checkout))),
+            Err(refusal) => return Ok(FulfillPlan::Send(refusal.into_error(&checkout))),
         };
         if !session.central.covers(&path) {
-            return Ok(Reply::Send(outside_central(&path)));
+            return Ok(FulfillPlan::Send(outside_central(&path)));
         }
-        let host = canonical_to_host(&self.central_root, &path);
-        let Some(source) = apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))?
-        else {
-            return Ok(Reply::Send(missing_hash(&path)));
-        };
-        match transfer::fulfill(checkout_id, path.clone(), want_hash, &source, &signature) {
-            Ok(xfer) => Ok(Reply::Bulk(xfer)),
-            Err(transfer::TransferError::HashMismatch) => Ok(Reply::Send(missing_hash(&path))),
-            Err(err) => Ok(Reply::Send(ProtocolMessage::Error {
-                code: "transfer".into(),
-                message: err.to_string(),
-            })),
-        }
+        Ok(FulfillPlan::BulkHost {
+            host: canonical_to_host(&self.central_root, &path),
+            checkout_id,
+            path,
+            want_hash,
+            signature,
+        })
     }
 
     fn note_removed(&mut self, path: &CanonicalPath) -> Result<(), MasterError> {
@@ -1442,6 +1604,72 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             return Ok(());
         };
         self.commit(&Origin::Local, path, None, Some(&previous))
+    }
+
+    fn walk_central_stats(&self) -> Result<CentralWalk, MasterError> {
+        let mut ready = BTreeMap::new();
+        let mut needs = Vec::new();
+        let root_prev = self.meta(&CanonicalPath::root())?;
+        match meta::inspect_for_hash(&self.central_root, root_prev.as_ref())
+            .map_err(MasterError::io(&self.central_root))?
+        {
+            Inspected::Ready(root) => {
+                ready.insert(CanonicalPath::root(), root);
+            }
+            Inspected::NeedHash(host) => {
+                needs.push(HashNeed {
+                    key: HashKey::Central(CanonicalPath::root()),
+                    host,
+                    previous: root_prev,
+                });
+            }
+            Inspected::Absent => {}
+        }
+        let mut pending = vec![CanonicalPath::root()];
+        while let Some(dir) = pending.pop() {
+            let host = canonical_to_host(&self.central_root, &dir);
+            let entries = match fs::read_dir(&host) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                    log::warn!("skipping {}: permission denied", host.display());
+                    continue;
+                }
+                Err(err) => return Err(MasterError::io(&host)(err)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(MasterError::io(&host))?;
+                let raw = entry.file_name();
+                let Some(name) = raw.to_str() else {
+                    log::warn!("skipping non-UTF-8 name under {}", host.display());
+                    continue;
+                };
+                if dir.as_str() == "/" && is_reserved_root_entry(name) {
+                    continue;
+                }
+                let child = join_central(&dir, name)?;
+                let host_child = entry.path();
+                let previous = self.meta(&child)?;
+                match meta::inspect_for_hash(&host_child, previous.as_ref())
+                    .map_err(MasterError::io(&host_child))?
+                {
+                    Inspected::Ready(meta) => {
+                        if meta.kind == EntryKind::Dir {
+                            pending.push(child.clone());
+                        }
+                        ready.insert(child, meta);
+                    }
+                    Inspected::NeedHash(host) => {
+                        needs.push(HashNeed {
+                            key: HashKey::Central(child),
+                            host,
+                            previous,
+                        });
+                    }
+                    Inspected::Absent => {}
+                }
+            }
+        }
+        Ok(CentralWalk { ready, needs })
     }
 
     fn walk_central(&self) -> Result<BTreeMap<CanonicalPath, FileMetadata>, MasterError> {

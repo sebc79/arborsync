@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use arborsync_core::ReloadError;
+use arborsync_core::hashing::HashNeed;
 use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
-use arborsync_core::master::{Master, Reply, WholeFileLater};
+use arborsync_core::master::{FulfillPlan, Master, Reply, WholeFileLater};
 use arborsync_core::path::host_to_canonical;
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::storage::Storage;
@@ -58,6 +59,14 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
     let max_attempts = cfg.max_connection_attempts_per_minute();
 
     let master = Arc::new(Mutex::new(Master::open(cfg, store, WholeFileLater)?));
+    {
+        let guard = master.lock().expect("master");
+        log::info!(
+            "tune hashing.workers={} from={}",
+            guard.tune().hashing_workers().get(),
+            guard.tune().hashing_workers_spec()
+        );
+    }
     let endpoint = listen(listen_addr, &secret)?;
     log::info!(
         "master watching {} and listening on {}",
@@ -68,6 +77,8 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
     let watch_gen = Arc::new(AtomicU64::new(0));
     let watched = master.clone();
     let watched_gen = watch_gen.clone();
+    let rt = tokio::runtime::Handle::current();
+    let hash_inflight = Arc::new(AtomicU64::new(0));
     std::thread::spawn(move || {
         loop {
             let (debounce, rescan_every, start_gen) = {
@@ -78,9 +89,15 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
                     watched_gen.load(Ordering::Relaxed),
                 )
             };
-            if let Err(err) =
-                watch_central(&watched, debounce, rescan_every, &watched_gen, start_gen)
-            {
+            if let Err(err) = watch_central(
+                &watched,
+                debounce,
+                rescan_every,
+                &watched_gen,
+                start_gen,
+                &rt,
+                &hash_inflight,
+            ) {
                 log::warn!("filesystem watcher stopped: {err}");
             }
             if let Err(err) = watched.lock().expect("master").rescan() {
@@ -265,9 +282,61 @@ async fn accept_session(
             }
             msg = Connection::read_control(&mut recv) => {
                 let msg = msg?;
-                let reply = master.lock().expect("master").handle(peer, msg)?;
-                if dispatch_master(&master, peer, &slave_id, &conn, &write_tx, reply, &limiter, ip)? {
-                    break;
+                if let ProtocolMessage::SignatureRequest {
+                    checkout_id,
+                    path,
+                    want_hash,
+                    signature,
+                } = msg
+                {
+                    let plan = master.lock().expect("master").plan_fulfill(
+                        peer,
+                        checkout_id,
+                        path,
+                        want_hash,
+                        signature,
+                    )?;
+                    match plan {
+                        FulfillPlan::Send(out) => {
+                            if dispatch_master(
+                                &master,
+                                peer,
+                                &slave_id,
+                                &conn,
+                                &write_tx,
+                                Reply::Send(out),
+                                &limiter,
+                                ip,
+                            )? {
+                                break;
+                            }
+                        }
+                        job @ FulfillPlan::BulkHost { .. } => {
+                            let conn = conn.clone();
+                            tokio::spawn(async move {
+                                match tokio::task::spawn_blocking(move || job.run()).await {
+                                    Ok(Ok(Reply::Bulk(xfer))) => {
+                                        if let Err(err) = conn.write_bulk(&xfer).await {
+                                            log::warn!("master bulk send: {err:#}");
+                                        }
+                                    }
+                                    Ok(Ok(Reply::Send(out))) => {
+                                        log::warn!("master fulfill: {out:?}");
+                                    }
+                                    Ok(Ok(Reply::Hangup { reason, .. })) => {
+                                        log::warn!("master fulfill hangup: {reason}");
+                                    }
+                                    Ok(Err(err)) => log::warn!("master fulfill: {err}"),
+                                    Err(err) => log::warn!("master fulfill join: {err}"),
+                                }
+                            });
+                        }
+                    }
+                } else {
+                    let reply = master.lock().expect("master").handle(peer, msg)?;
+                    if dispatch_master(&master, peer, &slave_id, &conn, &write_tx, reply, &limiter, ip)? {
+                        break;
+                    }
                 }
             }
             incoming = conn.accept_uni() => {
@@ -363,6 +432,8 @@ fn watch_central(
     rescan_every: Duration,
     watch_gen: &AtomicU64,
     start_gen: u64,
+    rt: &tokio::runtime::Handle,
+    hash_inflight: &Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     let root = master.lock().expect("master").central_root().to_path_buf();
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
@@ -370,7 +441,12 @@ fn watch_central(
     debouncer
         .watch(&root, RecursiveMode::Recursive)
         .with_context(|| format!("watch {}", root.display()))?;
-    master.lock().expect("master").rescan()?;
+    submit_master_hashes(
+        rt,
+        master,
+        hash_inflight,
+        master.lock().expect("master").plan_rescan()?.hash,
+    );
 
     loop {
         if watch_gen.load(Ordering::Relaxed) != start_gen {
@@ -380,19 +456,91 @@ fn watch_central(
             Ok(Ok(events)) => {
                 let (need_rescan, mapped) = crate::watch::classify(events);
                 if need_rescan {
-                    master.lock().expect("master").rescan()?;
+                    submit_master_hashes(
+                        rt,
+                        master,
+                        hash_inflight,
+                        master.lock().expect("master").plan_rescan()?.hash,
+                    );
                 }
                 let locals = to_local_events(mapped, |host| host_to_canonical(&root, host).ok());
                 for event in locals {
-                    master.lock().expect("master").note_local(event)?;
+                    let plan = master.lock().expect("master").plan_local(event)?;
+                    submit_master_hashes(rt, master, hash_inflight, plan.hash);
                 }
             }
             Ok(Err(errs)) => {
                 log::warn!("watch error, rescanning: {errs:?}");
-                master.lock().expect("master").rescan()?;
+                submit_master_hashes(
+                    rt,
+                    master,
+                    hash_inflight,
+                    master.lock().expect("master").plan_rescan()?.hash,
+                );
             }
-            Err(RecvTimeoutError::Timeout) => master.lock().expect("master").rescan()?,
+            Err(RecvTimeoutError::Timeout) => submit_master_hashes(
+                rt,
+                master,
+                hash_inflight,
+                master.lock().expect("master").plan_rescan()?.hash,
+            ),
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
+    }
+}
+
+fn submit_master_hashes(
+    rt: &tokio::runtime::Handle,
+    master: &SharedMaster,
+    inflight: &Arc<AtomicU64>,
+    needs: Vec<HashNeed>,
+) {
+    for need in needs {
+        let master = master.clone();
+        let inflight = inflight.clone();
+        rt.spawn(async move {
+            let cap = master
+                .lock()
+                .expect("master")
+                .tune()
+                .hashing_workers()
+                .get() as u64;
+            while inflight.load(Ordering::Relaxed) >= cap {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            inflight.fetch_add(1, Ordering::Relaxed);
+            master.lock().expect("master").start_hashed(&need.key);
+            let done = tokio::task::spawn_blocking(move || need.run()).await;
+            inflight.fetch_sub(1, Ordering::Relaxed);
+            match done {
+                Ok(mut done) => loop {
+                    let follow = {
+                        let mut guard = master.lock().expect("master");
+                        match guard.commit_hashed(done) {
+                            Ok(plan) if plan.hash.is_empty() => None,
+                            Ok(mut plan) => Some(Ok(plan.hash.remove(0))),
+                            Err(err) => Some(Err(err)),
+                        }
+                    };
+                    match follow {
+                        None => break,
+                        Some(Ok(need)) => {
+                            match tokio::task::spawn_blocking(move || need.run()).await {
+                                Ok(next) => done = next,
+                                Err(err) => {
+                                    log::warn!("hash join: {err}");
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Err(err)) => {
+                            log::warn!("commit hashed: {err}");
+                            break;
+                        }
+                    }
+                },
+                Err(err) => log::warn!("hash join: {err}"),
+            }
+        });
     }
 }

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use arborsync_core::config::{CheckoutConfig, MasterConfig, SlaveAcl, SlaveConfig};
 use arborsync_core::test_support::SyncSandbox;
+use arborsync_core::tune::TuneSpec;
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_arborsync"))
@@ -170,6 +171,7 @@ impl DaemonPair {
                 public_keys: vec![slave_pub],
                 allowed_prefixes: vec!["/src".into()],
             }],
+            tune: TuneSpec::default(),
         };
         let central_src = sandbox.central_root().join("src");
         fs::create_dir_all(&central_src).expect("central src");
@@ -214,6 +216,7 @@ impl DaemonPair {
                 central: "/src".into(),
                 local: local.to_string_lossy().into_owned(),
             }],
+            tune: TuneSpec::default(),
         };
         let slave_cfg_path = sandbox.slave_root("dev-alice").join("slave.toml");
         write_toml(&slave_cfg_path, &slave_cfg.to_toml().expect("slave toml"));

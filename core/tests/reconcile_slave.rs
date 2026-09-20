@@ -47,6 +47,15 @@ fn send(reply: Reply) -> Vec<ProtocolMessage> {
     }
 }
 
+fn send_and_drain(
+    slave: &mut Slave<MemoryStorage, MemoryContent>,
+    reply: Reply,
+) -> Vec<ProtocolMessage> {
+    let mut msgs = send(reply);
+    msgs.extend(slave.drain_hashes().unwrap());
+    msgs
+}
+
 #[test]
 fn subscribe_ack_on_empty_checkout_reports_empty_dir() {
     let sandbox = SyncSandbox::new();
@@ -74,12 +83,12 @@ fn subscribe_ack_rescans_leftover_disk_file_into_meta() {
     let local = slave.checkout_local("src").unwrap().to_path_buf();
     sandbox.tree(&local).file("leftover.txt", b"mine");
 
-    let first = send(slave.handle(subscribe_ack()).unwrap());
+    let reply = slave.handle(subscribe_ack()).unwrap();
+    let first = send_and_drain(&mut slave, reply);
     assert!(
         first.iter().any(|msg| matches!(
             msg,
-            ProtocolMessage::RootReport { path, root, .. }
-                if path == &p("/src") && *root != empty_dir_node().into()
+            ProtocolMessage::RootReport { path, .. } if path == &p("/src")
         )),
         "expected RootReport, got {first:?}"
     );
@@ -351,18 +360,16 @@ fn dir_list_slave_only_nested_dir_announces_the_nested_file() {
         other => panic!("expected album announce and walk, got {other:?}"),
     }
 
-    match &send(
-        slave
-            .handle(ProtocolMessage::DirListResponse {
-                checkout_id: "src".into(),
-                path: p("/src/photos/album"),
-                after: None,
-                entries: vec![],
-                more: false,
-            })
-            .unwrap(),
-    )[..]
-    {
+    let reply = slave
+        .handle(ProtocolMessage::DirListResponse {
+            checkout_id: "src".into(),
+            path: p("/src/photos/album"),
+            after: None,
+            entries: vec![],
+            more: false,
+        })
+        .unwrap();
+    match &send_and_drain(&mut slave, reply)[..] {
         [
             ProtocolMessage::FileAnnounce {
                 path, new, basis, ..
@@ -400,18 +407,16 @@ fn dir_list_slave_only_with_last_synced_equal_local_deletes() {
         Some(file_node(&new))
     );
 
-    match &send(
-        slave
-            .handle(ProtocolMessage::DirListResponse {
-                checkout_id: "src".into(),
-                path: p("/src"),
-                after: None,
-                entries: vec![],
-                more: false,
-            })
-            .unwrap(),
-    )[..]
-    {
+    let reply = slave
+        .handle(ProtocolMessage::DirListResponse {
+            checkout_id: "src".into(),
+            path: p("/src"),
+            after: None,
+            entries: vec![],
+            more: false,
+        })
+        .unwrap();
+    match &send_and_drain(&mut slave, reply)[..] {
         [
             ProtocolMessage::Delete {
                 checkout_id,
@@ -447,18 +452,16 @@ fn dir_list_slave_only_dir_with_last_synced_equal_local_deletes() {
         Some(file_node(&dir))
     );
 
-    match &send(
-        slave
-            .handle(ProtocolMessage::DirListResponse {
-                checkout_id: "src".into(),
-                path: p("/src"),
-                after: None,
-                entries: vec![],
-                more: false,
-            })
-            .unwrap(),
-    )[..]
-    {
+    let reply = slave
+        .handle(ProtocolMessage::DirListResponse {
+            checkout_id: "src".into(),
+            path: p("/src"),
+            after: None,
+            entries: vec![],
+            more: false,
+        })
+        .unwrap();
+    match &send_and_drain(&mut slave, reply)[..] {
         [
             ProtocolMessage::Delete {
                 checkout_id,
@@ -552,11 +555,12 @@ fn subscribe_ack_reports_and_announces_before_walk_finishes() {
             .any(|msg| matches!(msg, ProtocolMessage::RootReport { .. })),
         "SubscribeAck must RootReport before the walk finishes, got {first:?}"
     );
+    let hashed = slave.drain_hashes().unwrap();
     assert!(
-        first
+        hashed
             .iter()
             .any(|msg| matches!(msg, ProtocolMessage::FileAnnounce { .. })),
-        "one crawl step must announce leftover files before the walk finishes, got {first:?}"
+        "one crawl step must hash leftover files before the walk finishes, got {hashed:?}"
     );
 
     let rest = slave.finish_crawl().unwrap();

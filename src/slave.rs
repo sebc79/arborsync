@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +10,7 @@ use anyhow::Context;
 use arborsync_core::LocalEvent;
 use arborsync_core::bottleneck::{Stage, Wait, Waiting};
 use arborsync_core::hash::ContentHash;
+use arborsync_core::hashing::{HashDone, HashNeed};
 use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::path::local_to_canonical;
 use arborsync_core::protocol::ProtocolMessage;
@@ -19,6 +20,7 @@ use arborsync_core::slave::{
 use arborsync_core::status::SlaveStatus;
 use arborsync_core::storage::Storage;
 use arborsync_core::transport::{Transport, client_endpoint, connect, read_bulk, stream_err};
+use arborsync_core::tune::FulfillAdmission;
 use arborsync_core::watch::to_local_events;
 use arborsync_core::{CanonicalPath, LoadedSlave, RedbStorage, ReloadError, SlaveReload};
 use notify::RecursiveMode;
@@ -39,6 +41,46 @@ enum Work {
 enum WatchStop {
     Restart,
     Removed,
+}
+
+struct HashPump {
+    inflight: usize,
+    queued: VecDeque<HashNeed>,
+    done_tx: UnboundedSender<HashDone>,
+}
+
+impl HashPump {
+    fn offer(&mut self, slave: &SharedSlave, needs: Vec<HashNeed>) {
+        self.queued.extend(needs);
+        self.kick(slave);
+    }
+
+    fn kick(&mut self, slave: &SharedSlave) {
+        let cap = slave.lock().expect("slave").tune().hashing_workers().get();
+        while self.inflight < cap {
+            let Some(need) = self.queued.pop_front() else {
+                break;
+            };
+            slave.lock().expect("slave").start_hashed(&need.key);
+            self.inflight += 1;
+            let tx = self.done_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                if tx.send(need.run()).is_err() {
+                    log::warn!("hash done channel closed");
+                }
+            });
+        }
+    }
+
+    fn finish(&mut self, slave: &SharedSlave) {
+        self.inflight = self.inflight.saturating_sub(1);
+        self.kick(slave);
+    }
+}
+
+fn offer_pending_hashes(slave: &SharedSlave, hasher: &mut HashPump) {
+    let needs = slave.lock().expect("slave").take_hash_jobs();
+    hasher.offer(slave, needs);
 }
 
 pub fn run(config: Option<PathBuf>) -> anyhow::Result<()> {
@@ -65,6 +107,11 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
     let slave = Arc::new(Mutex::new(Slave::open(cfg, store, WholeFileLater)?));
     let watched = {
         let guard = slave.lock().expect("slave");
+        log::info!(
+            "tune hashing.workers={} from={}",
+            guard.tune().hashing_workers().get(),
+            guard.tune().hashing_workers_spec()
+        );
         log::info!("slave {} ready", guard.slave_id());
         guard.watched_checkouts()
     };
@@ -260,8 +307,15 @@ async fn session(
         }
     });
     let (bulk_tx, mut bulk_rx) = unbounded_channel();
+    let (hash_tx, mut hash_rx) = unbounded_channel();
+    let mut hasher = HashPump {
+        inflight: 0,
+        queued: VecDeque::new(),
+        done_tx: hash_tx,
+    };
     let mut outbound = Outbound::new(urgent_tx, walk_tx.clone(), bulk_tx);
     outbound.ingest(slave, &conn, Connection::read_control(&mut recv).await?)?;
+    offer_pending_hashes(slave, &mut hasher);
     log::info!("connected to {addr_text}");
 
     let mut status_clock = crate::status::Clock::new();
@@ -271,6 +325,7 @@ async fn session(
         tokio::select! {
             msg = Connection::read_control(&mut recv) => {
                 outbound.ingest(slave, &conn, msg?)?;
+                offer_pending_hashes(slave, &mut hasher);
             }
             incoming = conn.accept_uni() => {
                 let mut recv = incoming.map_err(stream_err)?;
@@ -284,12 +339,27 @@ async fn session(
                 outbound.on_bulk_done(slave, &conn, result)?;
             }
             Some(err) = write_err_rx.recv() => return Err(err.into()),
+            Some(done) = hash_rx.recv() => {
+                let outs = slave.lock().expect("slave").commit_hashed(done)?;
+                outbound.enqueue(outs)?;
+                hasher.finish(slave);
+                offer_pending_hashes(slave, &mut hasher);
+                if !outbound.serving() && slave.lock().expect("slave").crawl_runnable() {
+                    match slave.lock().expect("slave").crawl_step() {
+                        Ok(outs) => outbound.enqueue(outs)?,
+                        Err(SlaveError::UnknownCheckout(_)) => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                    offer_pending_hashes(slave, &mut hasher);
+                }
+            }
             _ = wait_if_should_crawl(slave, outbound.serving()) => {
                 match slave.lock().expect("slave").crawl_step() {
                     Ok(outs) => outbound.enqueue(outs)?,
                     Err(SlaveError::UnknownCheckout(_)) => {}
                     Err(err) => return Err(err.into()),
                 }
+                offer_pending_hashes(slave, &mut hasher);
             }
             work = work.recv() => {
                 let Some(work) = work else {
@@ -297,8 +367,12 @@ async fn session(
                 };
                 match work {
                     Work::Local { checkout, event } => {
-                        match slave.lock().expect("slave").note_local(&checkout, event) {
-                            Ok(outs) => outbound.enqueue(outs)?,
+                        let planned = slave.lock().expect("slave").plan_local(&checkout, event);
+                        match planned {
+                            Ok(plan) => {
+                                outbound.enqueue(plan.send)?;
+                                hasher.offer(slave, plan.hash);
+                            }
                             Err(SlaveError::UnknownCheckout(_)) => {}
                             Err(err) => return Err(err.into()),
                         }
@@ -348,7 +422,7 @@ async fn wait_if_should_crawl(slave: &SharedSlave, serving: bool) {
     if serving {
         std::future::pending::<()>().await;
     }
-    if slave.lock().expect("slave").crawl_pending() {
+    if slave.lock().expect("slave").crawl_runnable() {
         return;
     }
     std::future::pending::<()>().await;
@@ -404,9 +478,6 @@ fn apply_live_slave_reload(
     }
     Ok(())
 }
-
-const MAX_BULK_INFLIGHT: usize = 4;
-const LARGE_BULK_BYTES: u64 = 16 * 1024 * 1024;
 
 type AskKey = (String, CanonicalPath, ContentHash);
 type IsLarge = bool;
@@ -506,23 +577,19 @@ impl Outbound {
     }
 
     fn can_start(&self, slave: &SharedSlave, msg: &ProtocolMessage) -> bool {
-        if self.sending.len() >= MAX_BULK_INFLIGHT {
-            return false;
-        }
-        !(self.is_large(slave, msg) && self.sending.values().any(|large| *large))
-    }
-
-    fn is_large(&self, slave: &SharedSlave, msg: &ProtocolMessage) -> bool {
-        let Some((checkout_id, path, _)) = signature_request_key(msg) else {
-            return true;
+        let guard = slave.lock().expect("slave");
+        let admission = guard.tune().fulfill_admission().expect("slave role");
+        let next_size = match signature_request_key(msg) {
+            Some((checkout_id, path, _)) => {
+                guard.announced_size(&checkout_id, &path).ok().flatten()
+            }
+            None => Some(FulfillAdmission::LARGE_BYTES),
         };
-        slave
-            .lock()
-            .expect("slave")
-            .announced_size(&checkout_id, &path)
-            .ok()
-            .flatten()
-            .is_some_and(|size| size >= LARGE_BULK_BYTES)
+        admission.admits(
+            self.sending.len(),
+            self.sending.values().any(|large| *large),
+            next_size,
+        )
     }
 
     fn start_ask(
@@ -548,7 +615,7 @@ impl Outbound {
                 Err(err) => return Err(err.into()),
             };
             let large = match guard.announced_size(&checkout_id, &path) {
-                Ok(size) => size.is_some_and(|size| size >= LARGE_BULK_BYTES),
+                Ok(size) => size.is_some_and(FulfillAdmission::is_large),
                 Err(SlaveError::UnknownCheckout(_)) => return Ok(()),
                 Err(err) => return Err(err.into()),
             };

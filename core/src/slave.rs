@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 use crate::apply;
 use crate::bottleneck::{Stage, Wait, Waiting};
 use crate::config::{ConfigError, LoadedSlave, ReloadError, SlaveReload};
-use crate::crawl::{Crawl, DirListPage, RescanWalk, STEP_BUDGET, WalkError};
+use crate::crawl::{Crawl, DirListPage, RescanWalk, STEP_BUDGET, WalkError, Walked};
 use crate::hash::{ContentHash, FileNode};
+use crate::hashing::{HashDone, HashKey, HashNeed, HashOutcome, HashPlan};
 use crate::index;
 use crate::inflight::Inflight;
 use crate::merkle::{DirChild, file_node};
-use crate::meta::{self, EntryKind, FileMetadata, hash_bytes};
+use crate::meta::{self, EntryKind, FileMetadata, Inspected, hash_bytes};
 use crate::path::{
     CanonicalPath, EntryName, PathError, canonical_to_host, conflict_sidecar_path, join_central,
     local_paths_overlap, strip_central,
@@ -23,6 +24,7 @@ use crate::reconcile::{WalkAction, decide_child};
 use crate::status::{Queues, SlaveStatus, StatusLedger};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
 use crate::transfer::{self, BulkTransfer};
+use crate::tune::Tune;
 use crate::watch::LocalEvent;
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
@@ -205,6 +207,8 @@ pub struct Slave<S: Storage, C: ContentHook> {
     pending_renames: Waiting<(String, CanonicalPath), CanonicalPath>,
     denied_centrals: HashSet<CanonicalPath>,
     crawl: Crawl,
+    hashing: Waiting<HashKey, ()>,
+    pending_hash: Vec<HashNeed>,
     status: StatusLedger,
 }
 
@@ -238,6 +242,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             pending_renames: Waiting::new(Stage::Reconcile),
             denied_centrals: HashSet::new(),
             crawl: Crawl::default(),
+            hashing: Waiting::new(Stage::Hashing),
+            pending_hash: Vec::new(),
             status: StatusLedger::default(),
         })
     }
@@ -278,6 +284,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.cfg.slave_id()
     }
 
+    pub fn tune(&self) -> &Tune {
+        self.cfg.tune()
+    }
+
     pub fn checkout_local(&self, id: &str) -> Option<&std::path::Path> {
         self.checkouts.get(id).map(|c| c.local.as_path())
     }
@@ -310,6 +320,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             self.pending.oldest(),
             self.pending_pulls.oldest(),
             self.pending_renames.oldest(),
+            self.hashing.oldest(),
         ]
         .into_iter()
         .flatten()
@@ -337,12 +348,34 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.crawl.pending()
     }
 
+    pub fn crawl_runnable(&self) -> bool {
+        self.crawl.runnable()
+    }
+
     pub fn crawl_step(&mut self) -> Result<Vec<ProtocolMessage>, SlaveError> {
-        let msgs = self.step_crawl(STEP_BUDGET)?;
-        for msg in &msgs {
+        let plan = self.step_crawl(STEP_BUDGET)?;
+        self.pending_hash.extend(plan.hash);
+        for msg in &plan.send {
             self.status.outbound(None, msg);
         }
-        Ok(msgs)
+        Ok(plan.send)
+    }
+
+    pub fn take_hash_jobs(&mut self) -> Vec<HashNeed> {
+        std::mem::take(&mut self.pending_hash)
+    }
+
+    pub fn drain_hashes(&mut self) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        let jobs = self.take_hash_jobs();
+        self.drain_hash_jobs(jobs)
+    }
+
+    pub fn start_hashed(&mut self, key: &HashKey) {
+        self.hashing.remove(key);
+    }
+
+    pub fn hashing_wait(&self) -> Option<Wait> {
+        self.hashing.oldest()
     }
 
     pub fn request_rescan(&mut self, checkout_id: &str) -> Result<(), SlaveError> {
@@ -352,11 +385,12 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     pub fn finish_crawl(&mut self) -> Result<Vec<ProtocolMessage>, SlaveError> {
         let mut out = Vec::new();
         while self.crawl.pending() {
-            let batch = self.step_crawl(usize::MAX)?;
-            for msg in &batch {
+            let plan = self.step_crawl(usize::MAX)?;
+            for msg in &plan.send {
                 self.status.outbound(None, msg);
             }
-            out.extend(batch);
+            out.extend(plan.send);
+            out.extend(self.drain_hash_jobs(plan.hash)?);
         }
         Ok(out)
     }
@@ -588,22 +622,106 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         }]))
     }
 
+    pub fn plan_local(
+        &mut self,
+        checkout_id: &str,
+        event: LocalEvent,
+    ) -> Result<HashPlan, SlaveError> {
+        let plan = match event {
+            LocalEvent::Changed(path) => self.note_changed(checkout_id, path)?,
+            LocalEvent::Metadata(path) => self.note_metadata(checkout_id, path)?,
+            LocalEvent::Removed(path) => HashPlan::send(self.note_removed(checkout_id, &path)?),
+            LocalEvent::Renamed { from, to } => self.note_renamed(checkout_id, from, to)?,
+        };
+        self.status.local(None);
+        for msg in &plan.send {
+            self.status.outbound(None, msg);
+        }
+        Ok(plan)
+    }
+
     pub fn note_local(
         &mut self,
         checkout_id: &str,
         event: LocalEvent,
     ) -> Result<Vec<ProtocolMessage>, SlaveError> {
-        let msgs = match event {
-            LocalEvent::Changed(path) => self.note_changed(checkout_id, path),
-            LocalEvent::Metadata(path) => self.note_metadata(checkout_id, path),
-            LocalEvent::Removed(path) => self.note_removed(checkout_id, &path),
-            LocalEvent::Renamed { from, to } => self.note_renamed(checkout_id, from, to),
-        }?;
-        self.status.local(None);
-        for msg in &msgs {
-            self.status.outbound(None, msg);
+        let plan = self.plan_local(checkout_id, event)?;
+        self.drain_plan(plan)
+    }
+
+    pub fn commit_hashed(&mut self, done: HashDone) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        self.hashing.remove(&done.key);
+        let HashKey::Checkout { id, path } = done.key else {
+            return Ok(Vec::new());
+        };
+        self.finish_rescan_hash(&id, &path, &done.outcome);
+        match done.outcome {
+            HashOutcome::File(found) => {
+                if self.meta(&id, &path)?.as_ref() == Some(&found) {
+                    return Ok(Vec::new());
+                }
+                let current = self.meta(&id, &path)?;
+                if current.as_ref() != done.previous.as_ref() {
+                    let plan = self.note_changed(&id, path)?;
+                    self.pending_hash.extend(plan.hash);
+                    return Ok(plan.send);
+                }
+                self.announce_live(&id, path, found)
+            }
+            HashOutcome::Absent => self.note_removed(&id, &path),
+            HashOutcome::Io(kind) => {
+                log::warn!("hash {}: {kind}", path.as_str());
+                Ok(Vec::new())
+            }
         }
-        Ok(msgs)
+    }
+
+    fn drain_plan(&mut self, plan: HashPlan) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        let mut out = plan.send;
+        out.extend(self.drain_hash_jobs(plan.hash)?);
+        Ok(out)
+    }
+
+    fn drain_hash_jobs(&mut self, jobs: Vec<HashNeed>) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        let mut out = Vec::new();
+        let mut jobs = jobs;
+        loop {
+            for need in jobs {
+                self.start_hashed(&need.key);
+                out.extend(self.commit_hashed(need.run())?);
+            }
+            jobs = self.take_hash_jobs();
+            if jobs.is_empty() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn enqueue_hash(&mut self, need: HashNeed) -> HashPlan {
+        self.hashing.insert(need.key.clone(), (), Instant::now());
+        HashPlan {
+            send: Vec::new(),
+            hash: vec![need],
+        }
+    }
+
+    fn finish_rescan_hash(
+        &mut self,
+        checkout_id: &str,
+        path: &CanonicalPath,
+        outcome: &HashOutcome,
+    ) {
+        let Some(walk) = self.crawl.front_rescan_mut() else {
+            return;
+        };
+        if walk.checkout_id != checkout_id {
+            return;
+        }
+        walk.awaiting_hash.remove(path);
+        if let HashOutcome::File(found) = outcome {
+            walk.found.insert(path.clone(), found.clone());
+        }
     }
 
     pub fn meta(
@@ -643,7 +761,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.start_rescan(checkout_id)?;
         let mut out = Vec::new();
         while self.crawl.has_rescan() {
-            out.extend(self.step_crawl(usize::MAX)?);
+            let plan = self.step_crawl(usize::MAX)?;
+            out.extend(plan.send);
+            out.extend(self.drain_hash_jobs(plan.hash)?);
         }
         for msg in &out {
             self.status.outbound(None, msg);
@@ -1122,7 +1242,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         for id in &ids {
             self.start_rescan(id)?;
         }
-        let mut out = self.step_crawl(STEP_BUDGET)?;
+        let plan = self.step_crawl(STEP_BUDGET)?;
+        self.pending_hash.extend(plan.hash);
+        let mut out = plan.send;
         if self.crawl.has_rescan() {
             let mut reports = self.root_reports_for(&ids)?;
             reports.extend(out);
@@ -1200,7 +1322,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             page_end,
             by_name,
         ));
-        Ok(Reply::Send(self.step_crawl(STEP_BUDGET)?))
+        let plan = self.step_crawl(STEP_BUDGET)?;
+        self.pending_hash.extend(plan.hash);
+        Ok(Reply::Send(plan.send))
     }
 
     fn ensure_local_dir(
@@ -1265,32 +1389,38 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         Ok(())
     }
 
-    fn step_crawl(&mut self, budget: usize) -> Result<Vec<ProtocolMessage>, SlaveError> {
+    fn step_crawl(&mut self, budget: usize) -> Result<HashPlan, SlaveError> {
         if self.crawl.has_pages() {
             return self.step_dir_list(budget);
         }
         self.step_rescan(budget)
     }
 
-    fn step_rescan(&mut self, budget: usize) -> Result<Vec<ProtocolMessage>, SlaveError> {
+    fn step_rescan(&mut self, budget: usize) -> Result<HashPlan, SlaveError> {
         let Some(walk) = self.crawl.front_rescan_mut() else {
-            return Ok(Vec::new());
+            return Ok(HashPlan::default());
         };
         let ck = walk.ck.clone();
         let checkout_id = walk.checkout_id.clone();
         let newly = walk
             .collect(budget, |path| self.store.get_meta(&ck, path))
             .map_err(into_slave_walk_err)?;
-        let mut out = Vec::new();
-        for (path, found) in newly {
-            out.extend(self.announce_new_to_index(&checkout_id, path, found)?);
+        let mut plan = HashPlan::default();
+        for row in newly {
+            match row {
+                Walked::Ready(path, found) => {
+                    plan.send
+                        .extend(self.announce_new_to_index(&checkout_id, path, found)?);
+                }
+                Walked::Needs(need) => plan.append(self.enqueue_hash(need)),
+            }
         }
         let Some(walk) = self.crawl.take_finished_rescan() else {
-            return Ok(out);
+            return Ok(plan);
         };
-        out.extend(self.commit_rescan(walk)?);
+        plan.send.extend(self.commit_rescan(walk)?);
         self.status.rescan(None);
-        Ok(out)
+        Ok(plan)
     }
 
     fn commit_rescan(&mut self, walk: RescanWalk) -> Result<Vec<ProtocolMessage>, SlaveError> {
@@ -1325,10 +1455,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.root_reports_for(&[walk.checkout_id])
     }
 
-    fn step_dir_list(&mut self, budget: usize) -> Result<Vec<ProtocolMessage>, SlaveError> {
+    fn step_dir_list(&mut self, budget: usize) -> Result<HashPlan, SlaveError> {
         let (checkout_id, parent, batch, next) = {
             let Some(page) = self.crawl.front_page_mut() else {
-                return Ok(Vec::new());
+                return Ok(HashPlan::default());
             };
             let checkout_id = page.checkout_id.clone();
             let parent = page.path.clone();
@@ -1366,9 +1496,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             (checkout_id, parent, batch, next)
         };
         self.crawl.pop_page_if_empty();
-        let mut out = Vec::new();
+        let mut plan = HashPlan::default();
         for (entry, slave_child, master_child) in batch {
-            out.extend(self.apply_dir_child(
+            plan.append(self.apply_dir_child(
                 &checkout_id,
                 &parent,
                 &entry,
@@ -1377,9 +1507,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             )?);
         }
         if let Some(msg) = next {
-            out.push(msg);
+            plan.send.push(msg);
         }
-        Ok(out)
+        Ok(plan)
     }
 
     fn apply_dir_child(
@@ -1389,15 +1519,15 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         entry: &str,
         slave_child: Option<&DirChild>,
         master_child: Option<&DirChild>,
-    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+    ) -> Result<HashPlan, SlaveError> {
         let child_path = join_central(path, entry)?;
         let last_synced = self.last_synced(checkout_id, &child_path)?;
         let local_meta = self.meta(checkout_id, &child_path)?;
         let local_file = local_meta.as_ref().map(file_node);
-        let mut out = Vec::new();
+        let mut plan = HashPlan::default();
         match decide_child(slave_child, master_child, last_synced, local_file) {
             WalkAction::Matched => {}
-            WalkAction::Recurse => out.push(ProtocolMessage::DirListRequest {
+            WalkAction::Recurse => plan.send.push(ProtocolMessage::DirListRequest {
                 checkout_id: checkout_id.into(),
                 path: child_path,
                 after: None,
@@ -1417,7 +1547,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                         Instant::now(),
                     );
                 }
-                out.push(ProtocolMessage::DirListRequest {
+                plan.send.push(ProtocolMessage::DirListRequest {
                     checkout_id: checkout_id.into(),
                     path: child_path,
                     after: None,
@@ -1428,21 +1558,22 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                     .as_ref()
                     .is_some_and(|meta| meta.kind == EntryKind::Dir);
                 if walk_dir {
-                    out.extend(self.note_changed(checkout_id, child_path.clone())?);
-                    out.push(ProtocolMessage::DirListRequest {
+                    plan.append(self.note_changed(checkout_id, child_path.clone())?);
+                    plan.send.push(ProtocolMessage::DirListRequest {
                         checkout_id: checkout_id.into(),
                         path: child_path,
                         after: None,
                     });
                 } else {
-                    out.extend(self.note_changed(checkout_id, child_path)?);
+                    plan.append(self.note_changed(checkout_id, child_path)?);
                 }
             }
             WalkAction::AnnounceDelete => {
-                out.extend(self.note_removed(checkout_id, &child_path)?);
+                plan.send
+                    .extend(self.reconcile_delete(checkout_id, &child_path)?);
             }
         }
-        Ok(out)
+        Ok(plan)
     }
 
     fn walk_from(
@@ -1478,8 +1609,20 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             start_rel,
             start_meta,
         )?;
-        walk.collect(usize::MAX, |path| self.store.get_meta(&ck, path))
+        let rows = walk
+            .collect(usize::MAX, |path| self.store.get_meta(&ck, path))
             .map_err(into_slave_walk_err)?;
+        for row in rows {
+            if let Walked::Needs(need) = row {
+                let key = need.key.clone();
+                if let HashOutcome::File(found) = need.run().outcome {
+                    let HashKey::Checkout { path, .. } = key else {
+                        continue;
+                    };
+                    walk.found.insert(path, found);
+                }
+            }
+        }
         Ok(walk.found)
     }
 
@@ -1487,10 +1630,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         &mut self,
         checkout_id: &str,
         path: CanonicalPath,
-    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+    ) -> Result<HashPlan, SlaveError> {
         let central = self.checkout(checkout_id)?.central.clone();
         if is_reserved(&central, &path) {
-            return Ok(Vec::new());
+            return Ok(HashPlan::default());
         }
         let (local, relative) = {
             let checkout = self.checkout(checkout_id)?;
@@ -1501,12 +1644,22 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         };
         let host = canonical_to_host(&local, &relative);
         let previous = self.meta(checkout_id, &path)?;
-        let Some(found) =
-            meta::collect_for_rescan(&host, previous.as_ref()).map_err(SlaveError::io(&host))?
-        else {
-            return self.note_removed(checkout_id, &path);
-        };
-        self.announce_live(checkout_id, path, found)
+        match meta::inspect_for_hash(&host, previous.as_ref()).map_err(SlaveError::io(&host))? {
+            Inspected::Ready(found) => Ok(HashPlan::send(self.announce_live(
+                checkout_id,
+                path,
+                found,
+            )?)),
+            Inspected::Absent => Ok(HashPlan::send(self.note_removed(checkout_id, &path)?)),
+            Inspected::NeedHash(host) => Ok(self.enqueue_hash(HashNeed {
+                key: HashKey::Checkout {
+                    id: checkout_id.into(),
+                    path,
+                },
+                host,
+                previous,
+            })),
+        }
     }
 
     fn announce_new_to_index(
@@ -1566,10 +1719,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         &mut self,
         checkout_id: &str,
         path: CanonicalPath,
-    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+    ) -> Result<HashPlan, SlaveError> {
         let central = self.checkout(checkout_id)?.central.clone();
         if is_reserved(&central, &path) {
-            return Ok(Vec::new());
+            return Ok(HashPlan::default());
         }
         let (local, relative) = {
             let checkout = self.checkout(checkout_id)?;
@@ -1580,24 +1733,37 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         };
         let host = canonical_to_host(&local, &relative);
         let previous = self.meta(checkout_id, &path)?;
-        let Some(found) =
-            meta::collect_for_rescan(&host, previous.as_ref()).map_err(SlaveError::io(&host))?
-        else {
-            return self.note_removed(checkout_id, &path);
+        let found = match meta::inspect_for_hash(&host, previous.as_ref())
+            .map_err(SlaveError::io(&host))?
+        {
+            Inspected::Ready(found) => found,
+            Inspected::Absent => {
+                return Ok(HashPlan::send(self.note_removed(checkout_id, &path)?));
+            }
+            Inspected::NeedHash(host) => {
+                return Ok(self.enqueue_hash(HashNeed {
+                    key: HashKey::Checkout {
+                        id: checkout_id.into(),
+                        path,
+                    },
+                    host,
+                    previous,
+                }));
+            }
         };
         if self
             .checkout_mut(checkout_id)?
             .inflight
             .consume_if_echo(&path, &found.content_hash)
         {
-            return Ok(Vec::new());
+            return Ok(HashPlan::default());
         }
         let last_synced = self.last_synced(checkout_id, &path)?;
         if last_synced == Some(file_node(&found)) {
-            return Ok(Vec::new());
+            return Ok(HashPlan::default());
         }
         if previous.as_ref() == Some(&found) {
-            return Ok(Vec::new());
+            return Ok(HashPlan::default());
         }
         let ck = self.checkout(checkout_id)?.id.clone();
         self.index_ancestors(checkout_id, &path)?;
@@ -1609,12 +1775,12 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             index::LastSynced::Keep,
         )
         .map_err(SlaveError::index)?;
-        Ok(vec![ProtocolMessage::FileAnnounce {
+        Ok(HashPlan::send(vec![ProtocolMessage::FileAnnounce {
             checkout_id: checkout_id.into(),
             path,
             new: found,
             basis: last_synced,
-        }])
+        }]))
     }
 
     fn note_renamed(
@@ -1622,18 +1788,18 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         checkout_id: &str,
         from: CanonicalPath,
         to: CanonicalPath,
-    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+    ) -> Result<HashPlan, SlaveError> {
         let central = self.checkout(checkout_id)?.central.clone();
         let from_reserved = is_reserved(&central, &from);
         let to_reserved = is_reserved(&central, &to);
         if from_reserved && to_reserved {
-            return Ok(Vec::new());
+            return Ok(HashPlan::default());
         }
         if from_reserved {
             return self.note_changed(checkout_id, to);
         }
         if to_reserved {
-            return self.note_removed(checkout_id, &from);
+            return Ok(HashPlan::send(self.note_removed(checkout_id, &from)?));
         }
 
         let from_meta = self.meta(checkout_id, &from)?;
@@ -1656,7 +1822,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 {
                     return self.note_changed(checkout_id, to);
                 }
-                return Ok(Vec::new());
+                return Ok(HashPlan::default());
             }
         };
 
@@ -1671,7 +1837,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         let Some(found) =
             meta::collect_for_rescan(&host, from_meta.as_ref()).map_err(SlaveError::io(&host))?
         else {
-            return self.note_removed(checkout_id, &from);
+            return Ok(HashPlan::send(self.note_removed(checkout_id, &from)?));
         };
 
         let ck = self.checkout(checkout_id)?.id.clone();
@@ -1688,13 +1854,13 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             to.clone(),
             Instant::now(),
         );
-        Ok(vec![ProtocolMessage::Rename {
+        Ok(HashPlan::send(vec![ProtocolMessage::Rename {
             checkout_id: checkout_id.into(),
             from,
             to,
             from_basis,
             to_new: found,
-        }])
+        }]))
     }
 
     fn reindex_descendants(
@@ -1787,6 +1953,14 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         if self.checkout_mut(checkout_id)?.inflight.is_armed(path) {
             return Ok(Vec::new());
         }
+        self.reconcile_delete(checkout_id, path)
+    }
+
+    fn reconcile_delete(
+        &mut self,
+        checkout_id: &str,
+        path: &CanonicalPath,
+    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
         let Some(previous) = self.meta(checkout_id, path)? else {
             return Ok(Vec::new());
         };

@@ -49,4 +49,5 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Sync a master write to the slave](./sync-from-master.md) covers a central file appearing in the checkout.
 - [Read interval status lines](./interval-status.md) covers the 5 s master and slave summaries.
 - [Name the limiting hop on status lines](./bottleneck-status.md) covers `bottleneck=` and the slave-to-master gauge.
+- [Raise a named hashing or fulfill hop](./tune-hops.md) covers `[tune.hashing]`, slave `[tune.fulfill_parked]`, live SIGHUP, and `fanout_dropped=`.
 - [Resume a leftover checkout drop](./leftover-drop.md) covers a tree already on the slave at connect.

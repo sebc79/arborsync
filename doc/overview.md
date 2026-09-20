@@ -115,7 +115,7 @@ Rescan is a full `stat` walk, not a dirty-subtree walk. `collect_for_rescan` has
 
 Config is TOML. `--config` and `ARBORSYNC_CONFIG` pick the file. `ARBORSYNC_LOG_LEVEL` overrides `log_level`. Key material does not go in the environment.
 
-SIGHUP and a watch on the config's parent directory reload live fields: log level, rate limits, ACL rows, extra public keys, checkout add or remove, debounce, rescan interval, and status interval. `listen_addr`, `db_path`, `central_root`, `master_addr`, and key paths need a restart. Changing slave `slave_id` also needs a restart.
+SIGHUP and a watch on the config's parent directory reload live fields: log level, rate limits, ACL rows, extra public keys, checkout add or remove, debounce, rescan interval, status interval, `[tune.hashing].workers`, and slave `[tune.fulfill_parked].inflight`. `listen_addr`, `db_path`, `central_root`, `master_addr`, and key paths need a restart. Changing slave `slave_id` also needs a restart.
 
 A new session with a valid key for an already-connected `slave_id` replaces the old session. The binary `close`s the previous connection and signals the old task. Roster interest switches on the new `Subscribe`.
 
@@ -131,6 +131,8 @@ Tightening `allowed_prefixes` drops those checkouts from interest and leaves the
 | Framing, `ProtocolMessage` | `core/src/protocol.rs` |
 | Noise XX, streams, attempt limiter | `core/src/transport.rs` |
 | TOML and reload plan | `core/src/config.rs` |
+| Hop knobs | `core/src/tune.rs` |
+| Off-lock hash jobs | `core/src/hashing.rs` |
 | Canonical paths, reserved names, overlap | `core/src/path.rs` |
 | `FileNode` and `DirNode` | `core/src/merkle.rs`, `core/src/hash.rs` |
 | Stat, hash, skip devices | `core/src/meta.rs` |
@@ -151,7 +153,7 @@ Tightening `allowed_prefixes` drops those checkouts from interest and leaves the
 
 ## Status
 
-`spec.md` §16 items 1 through 8 are built. The struck `quic_*` / `reconnect_*` keys are not fields. Reconnect backoff is 1 s, doubling, cap 60 s. `flake.nix` and `nix/module.nix` expose `services.arborsync.master` so NixOS can run that same `arborsync master` binary.
+`spec.md` §16 items 1 through 8 are built. `[tune.hashing]` and slave `[tune.fulfill_parked]` apply on SIGHUP. The struck `quic_*` / `reconnect_*` keys are not fields. Reconnect backoff is 1 s, doubling, cap 60 s. `flake.nix` and `nix/module.nix` expose `services.arborsync.master` so NixOS can run that same `arborsync master` binary. There is no NixOS option for the tune tables.
 
 `core/tests/scenarios.rs` names the §16.8 cases and drives them through `handle` and `note_local` on `MemoryStorage`. `src/watch.rs` starts a real `notify-debouncer-full` thread. `tests/sync.rs` starts master and slave over QUIC and asserts a post-connect write crosses.
 

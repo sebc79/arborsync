@@ -1,15 +1,21 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use crate::hashing::{HashKey, HashNeed};
 use crate::merkle::DirChild;
-use crate::meta::{self, EntryKind, FileMetadata};
+use crate::meta::{self, EntryKind, FileMetadata, Inspected};
 use crate::path::{
     CanonicalPath, EntryName, PathError, canonical_to_host, is_reserved_root_entry, join_central,
 };
 use crate::protocol::ProtocolMessage;
 use crate::storage::CheckoutId;
+
+pub(crate) enum Walked {
+    Ready(CanonicalPath, FileMetadata),
+    Needs(HashNeed),
+}
 
 pub(crate) const STEP_BUDGET: usize = 64;
 
@@ -33,6 +39,7 @@ pub(crate) struct RescanWalk {
     pending: Vec<CanonicalPath>,
     open: Option<OpenDir>,
     pub found: BTreeMap<CanonicalPath, FileMetadata>,
+    pub awaiting_hash: HashSet<CanonicalPath>,
 }
 
 struct OpenDir {
@@ -52,6 +59,16 @@ pub(crate) struct DirListPage {
 impl Crawl {
     pub(crate) fn pending(&self) -> bool {
         !self.rescans.is_empty() || !self.pages.is_empty()
+    }
+
+    pub(crate) fn runnable(&self) -> bool {
+        if self.has_pages() {
+            return true;
+        }
+        let Some(walk) = self.rescans.front() else {
+            return false;
+        };
+        !walk.collect_done() || walk.awaiting_hash.is_empty()
     }
 
     pub(crate) fn has_rescan(&self) -> bool {
@@ -89,7 +106,10 @@ impl Crawl {
     }
 
     pub(crate) fn take_finished_rescan(&mut self) -> Option<RescanWalk> {
-        let done = self.rescans.front().is_some_and(|walk| walk.collect_done());
+        let done = self
+            .rescans
+            .front()
+            .is_some_and(|walk| walk.collect_done() && walk.awaiting_hash.is_empty());
         if done { self.rescans.pop_front() } else { None }
     }
 
@@ -136,6 +156,7 @@ impl RescanWalk {
             pending,
             open: None,
             found,
+            awaiting_hash: HashSet::new(),
         })
     }
 
@@ -147,7 +168,7 @@ impl RescanWalk {
         &mut self,
         budget: usize,
         mut previous: impl FnMut(&CanonicalPath) -> Result<Option<FileMetadata>, E>,
-    ) -> Result<Vec<(CanonicalPath, FileMetadata)>, WalkError<E>> {
+    ) -> Result<Vec<Walked>, WalkError<E>> {
         let mut used = 0;
         let mut newly = Vec::new();
         while used < budget {
@@ -158,15 +179,26 @@ impl RescanWalk {
                         join_central(&self.central, rel_child.as_str().trim_start_matches('/'))
                             .map_err(WalkError::Path)?;
                     let prior = previous(&child).map_err(WalkError::Index)?;
-                    match meta::collect_for_rescan(&host_child, prior.as_ref()) {
-                        Ok(Some(meta)) => {
+                    match meta::inspect_for_hash(&host_child, prior.as_ref()) {
+                        Ok(Inspected::Ready(meta)) => {
                             if meta.kind == EntryKind::Dir {
                                 self.pending.push(rel_child);
                             }
                             self.found.insert(child.clone(), meta.clone());
-                            newly.push((child, meta));
+                            newly.push(Walked::Ready(child, meta));
                         }
-                        Ok(None) => {}
+                        Ok(Inspected::NeedHash(host)) => {
+                            self.awaiting_hash.insert(child.clone());
+                            newly.push(Walked::Needs(HashNeed {
+                                key: HashKey::Checkout {
+                                    id: self.checkout_id.clone(),
+                                    path: child,
+                                },
+                                host,
+                                previous: prior,
+                            }));
+                        }
+                        Ok(Inspected::Absent) => {}
                         Err(source) => {
                             return Err(WalkError::Io {
                                 path: host_child,

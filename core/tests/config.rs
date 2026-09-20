@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use arborsync_core::config::{MasterReload, ReloadError, SlaveReload, log_level_filter};
 use arborsync_core::path::PathError;
 use arborsync_core::test_support::p;
-use arborsync_core::{ConfigError, LoadedMaster, LoadedSlave};
+use arborsync_core::{ConfigError, LoadedMaster, LoadedSlave, WorkerCountSpec};
 
 static HOME_LOCK: Mutex<()> = Mutex::new(());
 
@@ -648,4 +648,121 @@ fn slave_reload_log_only_does_not_resubscribe() {
     assert!(plan.removed.is_empty());
     assert_eq!(plan.resubscribe, false);
     assert_eq!(plan.log_level, "debug");
+}
+
+fn resolved_nproc() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(256).max(1))
+        .unwrap_or(1)
+}
+
+#[test]
+fn omitted_tune_defaults_to_nproc_and_inflight_4() {
+    let master = LoadedMaster::parse(&valid_master()).unwrap();
+    assert_eq!(
+        master.tune().hashing_workers_spec(),
+        &WorkerCountSpec::Nproc
+    );
+    assert_eq!(master.tune().hashing_workers().get(), resolved_nproc());
+    assert_eq!(master.tune().fulfill_cap(), None);
+
+    let slave = LoadedSlave::parse(&slave_toml("checkouts = []")).unwrap();
+    assert_eq!(slave.tune().hashing_workers_spec(), &WorkerCountSpec::Nproc);
+    assert_eq!(slave.tune().hashing_workers().get(), resolved_nproc());
+    assert_eq!(slave.tune().fulfill_cap().unwrap().get(), 4);
+}
+
+#[test]
+fn nproc_string_resolves_via_available_parallelism() {
+    let master = valid_master()
+        + r#"
+[tune.hashing]
+workers = "nproc"
+"#;
+    let loaded = LoadedMaster::parse(&master).unwrap();
+    assert_eq!(
+        loaded.tune().hashing_workers_spec(),
+        &WorkerCountSpec::Nproc
+    );
+    assert_eq!(loaded.tune().hashing_workers().get(), resolved_nproc());
+}
+
+#[test]
+fn workers_0_is_out_of_range() {
+    let master = valid_master()
+        + r#"
+[tune.hashing]
+workers = 0
+"#;
+    match LoadedMaster::parse(&master) {
+        Err(ConfigError::Toml { source, .. }) => {
+            let text = source.to_string();
+            assert!(
+                text.contains("tune.hashing.workers 0"),
+                "expected workers 0 reject, got {text}"
+            );
+        }
+        other => panic!("expected Toml, got {other:?}"),
+    }
+    let slave = slave_toml("checkouts = []")
+        + r#"
+[tune.hashing]
+workers = 0
+"#;
+    match LoadedSlave::parse(&slave) {
+        Err(ConfigError::Toml { source, .. }) => {
+            let text = source.to_string();
+            assert!(
+                text.contains("tune.hashing.workers 0"),
+                "expected workers 0 reject, got {text}"
+            );
+        }
+        other => panic!("expected Toml, got {other:?}"),
+    }
+}
+
+#[test]
+fn inflight_0_is_out_of_range() {
+    let slave = slave_toml("checkouts = []")
+        + r#"
+[tune.fulfill_parked]
+inflight = 0
+"#;
+    match LoadedSlave::parse(&slave) {
+        Err(ConfigError::InflightOutOfRange { value: 0 }) => {}
+        other => panic!("expected InflightOutOfRange, got {other:?}"),
+    }
+}
+
+#[test]
+fn tune_origin_bytes_is_unknown() {
+    let master = valid_master()
+        + r#"
+[tune.origin_bytes]
+"#;
+    match LoadedMaster::parse(&master) {
+        Err(ConfigError::Toml { source, .. }) => {
+            assert!(
+                source.to_string().contains("origin_bytes"),
+                "expected unknown field origin_bytes, got {source}"
+            );
+        }
+        other => panic!("expected Toml, got {other:?}"),
+    }
+}
+
+#[test]
+fn master_fulfill_parked_is_not_on_role() {
+    let master = valid_master()
+        + r#"
+[tune.fulfill_parked]
+inflight = 8
+"#;
+    match LoadedMaster::parse(&master) {
+        Err(ConfigError::TuneNotOnRole {
+            field,
+            role: "master",
+        }) => assert_eq!(field, "tune.fulfill_parked"),
+        other => panic!("expected TuneNotOnRole, got {other:?}"),
+    }
 }

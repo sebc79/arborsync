@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -167,39 +167,45 @@ pub fn collect_from_path(host: &Path) -> Result<Option<FileMetadata>, io::Error>
     )))
 }
 
-/// Re-stat `host` and reuse `previous.content_hash` when kind, size, and
-/// mtime match (`spec.md` §6 / §7). Mode is not a miss. Missing row or a
-/// miss falls through to [`collect_from_path`].
-pub fn collect_for_rescan(
+pub enum Inspected {
+    Ready(FileMetadata),
+    NeedHash(PathBuf),
+    Absent,
+}
+
+/// Stat, symlink, and directory only. A file whose mtime, size, and kind match
+/// `previous` is `Ready` and reuses that content hash. A file miss is `NeedHash`.
+pub fn inspect_for_hash(
     host: &Path,
     previous: Option<&FileMetadata>,
-) -> Result<Option<FileMetadata>, io::Error> {
+) -> Result<Inspected, io::Error> {
     let md = match fs::symlink_metadata(host) {
         Ok(md) => md,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Inspected::Absent),
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
             log::warn!("skipping {}: permission denied", host.display());
-            return Ok(None);
+            return Ok(Inspected::Absent);
         }
         Err(err) => return Err(err),
     };
     let mode = md.mode();
     let mtime_ns = md.mtime() * 1_000_000_000 + md.mtime_nsec();
     let ft = md.file_type();
-    let (kind, size) = if ft.is_symlink() {
-        (EntryKind::Symlink, md.len())
-    } else if ft.is_dir() {
-        (EntryKind::Dir, 0)
-    } else if ft.is_file() {
-        (EntryKind::File, md.len())
-    } else {
+    if ft.is_symlink() || ft.is_dir() {
+        return Ok(match collect_from_path(host)? {
+            Some(meta) => Inspected::Ready(meta),
+            None => Inspected::Absent,
+        });
+    }
+    if !ft.is_file() {
         log::warn!("skipping special file {}", host.display());
-        return Ok(None);
-    };
+        return Ok(Inspected::Absent);
+    }
+    let size = md.len();
     if let Some(prev) = previous {
-        if prev.kind == kind && prev.size == size && prev.mtime_ns == mtime_ns {
-            return Ok(Some(FileMetadata {
-                kind,
+        if prev.kind == EntryKind::File && prev.size == size && prev.mtime_ns == mtime_ns {
+            return Ok(Inspected::Ready(FileMetadata {
+                kind: EntryKind::File,
                 size,
                 mtime_ns,
                 mode,
@@ -207,5 +213,19 @@ pub fn collect_for_rescan(
             }));
         }
     }
-    collect_from_path(host)
+    Ok(Inspected::NeedHash(host.to_path_buf()))
+}
+
+/// Re-stat `host` and reuse `previous.content_hash` when kind, size, and
+/// mtime match (`spec.md` §6 / §7). Mode is not a miss. Missing row or a
+/// miss falls through to [`collect_from_path`].
+pub fn collect_for_rescan(
+    host: &Path,
+    previous: Option<&FileMetadata>,
+) -> Result<Option<FileMetadata>, io::Error> {
+    match inspect_for_hash(host, previous)? {
+        Inspected::Ready(meta) => Ok(Some(meta)),
+        Inspected::Absent => Ok(None),
+        Inspected::NeedHash(_) => collect_from_path(host),
+    }
 }

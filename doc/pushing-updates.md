@@ -67,7 +67,7 @@ A manual resync is a future `arborsync slave reconcile` subcommand, or wait for 
 
 Specified: if a slave’s control stream is blocked, stop sending it more announces. The next `RootReport` after it catches up repairs anything missed. Do not grow an unbounded in-memory queue.
 
-As built: `Master::set_writable` exists and the binary never calls it. A connected slow slave can grow `outbox`. `quic_max_concurrent_streams` is not parsed. Slow apply on the slave is the slave’s problem. The master does not snapshot file contents for it.
+As built: `flush_outbox` calls `set_writable(peer, false)` when a polled batch is longer than 32. The writer task sets `writable` true after that batch is written. `set_writable(false)` clears leftover outbox frames and increments `fanout_dropped` on the master status line. `quic_max_concurrent_streams` is not parsed. Slow apply on the slave is the slave’s problem. The master does not snapshot file contents for it.
 
 `Master::pending` holds in-flight bulk after the master asked for bytes. `disconnect` drops rows whose `peer` is the disconnected peer. The key is `(checkout_id, path)`. Checkout ids are per slave.
 
@@ -77,7 +77,7 @@ Disconnect drops interest. The 1000-update queue in earlier drafts is gone. Catc
 
 ## Observability
 
-Log at `info`: connect/disconnect, Subscribe accept/reject, CAS accept/reject counts, reconcile starts, apply failures. Each `status_interval_seconds` (default 5, `0` disables, max 3600) the daemons also log a `status ` summary. The master logs one aggregate line plus one line per slave. Each line names health (`idle`, `busy`, `stuck`, `failed`), `bottleneck=` (the hop that is limiting progress), interval counters, queue depths, and `last_error`. When a wait is open, `age=` and `depth=` sit on the same line. The slave also sends that verdict to the master as a 25-byte QUIC datagram so a parked leftover send can show as `fulfill_parked` instead of a useless `origin_bytes`. A missing gauge is `hint=absent` on that slave line only. No metrics port in v1.
+Log at `info`: connect/disconnect, Subscribe accept/reject, CAS accept/reject counts, reconcile starts, apply failures. Each `status_interval_seconds` (default 5, `0` disables, max 3600) the daemons also log a `status ` summary. The master logs one aggregate line plus one line per slave. Each line names health (`idle`, `busy`, `stuck`, `failed`), `bottleneck=` (the hop that is limiting progress), interval counters, queue depths, and `last_error`. The master line also prints `fanout_dropped=`. When a wait is open, `age=` and `depth=` sit on the same line. The slave also sends that verdict to the master as a 25-byte QUIC datagram so a parked leftover send can show as `fulfill_parked` instead of a useless `origin_bytes`. A missing gauge is `hint=absent` on that slave line only. No metrics port in v1.
 
 ## Config knobs that remain
 
@@ -85,6 +85,14 @@ Log at `info`: connect/disconnect, Subscribe accept/reject, CAS accept/reject co
 watcher_debounce_ms = 200
 rescan_interval_seconds = 60
 status_interval_seconds = 5
+
+[tune.hashing]
+workers = "nproc"
+
+[tune.fulfill_parked]
+inflight = 4
 ```
+
+`[tune.fulfill_parked]` is slave-only. See `configuration.md`.
 
 Removed: `push_debounce_ms` as a second debounce (the watcher debounce is enough), `max_queued_updates_per_slave`, `max_push_attempts`, `enable_delta_caching`, `max_delta_cache_size_mb`, `push_batch_size` as a correctness parameter. A sender may coalesce multiple control messages in one syscall; that is not a specified batch protocol.

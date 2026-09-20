@@ -48,6 +48,7 @@ pub struct Flow {
     pub local: u64,
     pub rescan: u64,
     pub flushed: u64,
+    pub fanout_dropped: u64,
 }
 
 impl Flow {
@@ -74,6 +75,7 @@ pub struct Queues {
     pub sending: usize,
     pub work: usize,
     pub writable: bool,
+    pub fanout_dropped: u64,
 }
 
 impl Default for Queues {
@@ -87,6 +89,7 @@ impl Default for Queues {
             sending: 0,
             work: 0,
             writable: true,
+            fanout_dropped: 0,
         }
     }
 }
@@ -105,6 +108,7 @@ impl Queues {
         self.pending_pulls += other.pending_pulls;
         self.pending_renames += other.pending_renames;
         self.writable = self.writable && other.writable;
+        self.fanout_dropped += other.fanout_dropped;
     }
 }
 
@@ -224,6 +228,13 @@ impl StatusLedger {
         self.touch(slave, |flow| flow.flushed += n);
     }
 
+    pub fn fanout_dropped(&mut self, slave: Option<&str>, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.touch(slave, |flow| flow.fanout_dropped += n);
+    }
+
     pub fn local(&mut self, slave: Option<&str>) {
         self.touch(slave, |flow| flow.local += 1);
     }
@@ -285,6 +296,7 @@ impl StatusLedger {
     pub fn take_master(
         &mut self,
         live: Vec<PeerLive>,
+        extra_waits: Vec<Wait>,
         status_interval_seconds: u64,
     ) -> MasterStatus {
         let now = Instant::now();
@@ -294,11 +306,13 @@ impl StatusLedger {
         let mut accs = std::mem::take(&mut self.by_slave);
         let mut slaves = Vec::new();
         let mut queues = Queues::default();
-        let mut all_waits = Vec::new();
+        let mut all_waits = extra_waits;
 
         for peer in live {
-            queues.add_assign(&peer.queues);
             let acc = accs.remove(&peer.slave_id).unwrap_or_default();
+            let mut peer_queues = peer.queues;
+            peer_queues.fanout_dropped = acc.flow.fanout_dropped;
+            queues.add_assign(&peer_queues);
             let error_count = acc.last_error.as_ref().map(|e| e.count).unwrap_or(0);
             let (hint, heard) = self.heard(&peer.slave_id, now, stale_after);
             let mut waits = peer.waits;
@@ -306,21 +320,23 @@ impl StatusLedger {
             let bottleneck = peer_line(verdict(&waits, now), hint, &peer.slave_id);
             all_waits.extend(waits);
             slaves.push(SlavePeerStatus {
-                health: classify(&acc.flow, &peer.queues, error_count),
+                health: classify(&acc.flow, &peer_queues, error_count),
                 slave_id: peer.slave_id,
                 connected: true,
                 checkouts: peer.checkouts,
                 bottleneck,
                 hint,
                 flow: acc.flow,
-                queues: peer.queues,
+                queues: peer_queues,
                 last_error: acc.last_error,
             });
         }
 
         for (slave_id, acc) in accs {
             let error_count = acc.last_error.as_ref().map(|e| e.count).unwrap_or(0);
-            let empty = Queues::default();
+            let mut empty = Queues::default();
+            empty.fanout_dropped = acc.flow.fanout_dropped;
+            queues.add_assign(&empty);
             slaves.push(SlavePeerStatus {
                 health: classify(&acc.flow, &empty, error_count),
                 slave_id,
@@ -546,8 +562,8 @@ fn flow_fields(flow: &Flow) -> String {
 fn queue_fields(queues: &Queues, master: bool) -> String {
     if master {
         format!(
-            "pending={} outbox={} writable={}",
-            queues.pending, queues.outbox, queues.writable
+            "pending={} outbox={} writable={} fanout_dropped={}",
+            queues.pending, queues.outbox, queues.writable, queues.fanout_dropped
         )
     } else {
         format!(

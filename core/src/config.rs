@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::keys::parse_hex_key;
 use crate::path::{CanonicalPath, PathError, local_paths_overlap};
 use crate::storage::CheckoutId;
+use crate::tune::{Tune, TuneRole, TuneSpec, project_tune};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SlaveAcl {
@@ -41,6 +42,8 @@ pub struct MasterConfig {
     pub max_connection_attempts_per_minute: u32,
     #[serde(default)]
     pub slaves: Vec<SlaveAcl>,
+    #[serde(default)]
+    pub tune: TuneSpec,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +72,8 @@ pub struct SlaveConfig {
     pub status_interval_seconds: u64,
     #[serde(default)]
     pub checkouts: Vec<CheckoutConfig>,
+    #[serde(default)]
+    pub tune: TuneSpec,
 }
 
 fn default_log_level() -> String {
@@ -173,6 +178,14 @@ pub enum ConfigError {
     BadHostPath { field: String, value: String },
     #[error("insecure mode {mode:o} on {path}")]
     InsecureMode { path: PathBuf, mode: u32 },
+    #[error("tune.hashing.workers {value} not in 1..=256")]
+    WorkersOutOfRange { value: u16 },
+    #[error("tune.fulfill_parked.inflight {value} not in 1..=64")]
+    InflightOutOfRange { value: u16 },
+    #[error("tune.hashing.workers {value} is not \"nproc\" or an integer")]
+    BadWorkers { value: String },
+    #[error("{field} is not valid on {role}")]
+    TuneNotOnRole { field: String, role: &'static str },
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -220,6 +233,7 @@ pub struct LoadedMaster {
     max_checkouts_per_slave: u32,
     max_connections: u32,
     max_connection_attempts_per_minute: u32,
+    tune: Tune,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +256,7 @@ pub struct LoadedSlave {
     rescan_interval_seconds: u64,
     status_interval_seconds: u64,
     max_checkouts_per_slave: u32,
+    tune: Tune,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,6 +346,10 @@ impl LoadedMaster {
 
     pub fn max_connection_attempts_per_minute(&self) -> u32 {
         self.max_connection_attempts_per_minute
+    }
+
+    pub fn tune(&self) -> &Tune {
+        &self.tune
     }
 
     pub fn plan_reload(&self, next: &Self) -> Result<MasterReload, ReloadError> {
@@ -481,6 +500,10 @@ impl LoadedSlave {
         self.max_checkouts_per_slave
     }
 
+    pub fn tune(&self) -> &Tune {
+        &self.tune
+    }
+
     pub fn plan_reload(&self, next: &Self) -> Result<SlaveReload, ReloadError> {
         let mut fields = Vec::new();
         if self.master_addr != next.master_addr {
@@ -570,6 +593,7 @@ fn project_master(config: MasterConfig) -> Result<LoadedMaster, ConfigError> {
     let central_root = expand_host_path("central_root", &config.central_root)?;
     let master_key_path = expand_host_path("master_key_path", &config.master_key_path)?;
     let db_path = expand_host_path("db_path", &config.db_path)?;
+    let tune = project_tune(config.tune, TuneRole::Master)?;
 
     let mut slaves = Vec::with_capacity(config.slaves.len());
     let mut by_key = HashMap::new();
@@ -625,6 +649,7 @@ fn project_master(config: MasterConfig) -> Result<LoadedMaster, ConfigError> {
         max_checkouts_per_slave: config.max_checkouts_per_slave,
         max_connections: config.max_connections,
         max_connection_attempts_per_minute: config.max_connection_attempts_per_minute,
+        tune,
     })
 }
 
@@ -651,6 +676,7 @@ fn project_slave(config: SlaveConfig) -> Result<LoadedSlave, ConfigError> {
     check_log_level(&config.log_level)?;
     check_debounce(config.watcher_debounce_ms)?;
     check_status_interval(config.status_interval_seconds)?;
+    let tune = project_tune(config.tune, TuneRole::Slave)?;
 
     if config.checkouts.len() > config.max_checkouts_per_slave as usize {
         return Err(ConfigError::TooManyCheckouts {
@@ -705,6 +731,7 @@ fn project_slave(config: SlaveConfig) -> Result<LoadedSlave, ConfigError> {
         rescan_interval_seconds: config.rescan_interval_seconds,
         status_interval_seconds: config.status_interval_seconds,
         max_checkouts_per_slave: config.max_checkouts_per_slave,
+        tune,
     })
 }
 

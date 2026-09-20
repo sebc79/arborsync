@@ -70,6 +70,7 @@ mod tests {
     use arborsync_core::protocol::ProtocolMessage;
     use arborsync_core::slave::Slave;
     use arborsync_core::test_support::{MemoryStorage, SyncSandbox};
+    use arborsync_core::tune::TuneSpec;
     use arborsync_core::watch::{WatchKind, to_local_events};
     use arborsync_core::{LoadedSlave, format_hex_key};
 
@@ -185,6 +186,7 @@ mod tests {
                 central: "/src".into(),
                 local: local.to_string_lossy().into_owned(),
             }],
+            tune: TuneSpec::default(),
         };
         let cfg_path = root.join("slave.toml");
         fs::write(&cfg_path, cfg.to_toml().expect("toml")).expect("write slave.toml");
