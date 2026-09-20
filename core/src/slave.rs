@@ -3,9 +3,10 @@ use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::apply;
+use crate::bottleneck::{Stage, Wait, Waiting};
 use crate::config::{ConfigError, LoadedSlave, ReloadError, SlaveReload};
 use crate::crawl::{Crawl, DirListPage, RescanWalk, STEP_BUDGET, WalkError};
 use crate::hash::{ContentHash, FileNode};
@@ -176,14 +177,32 @@ struct PendingApply {
     retried: bool,
 }
 
+/// Queues the slave binary owns and the core cannot see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkState {
+    pub connected: bool,
+    pub waits: Vec<Wait>,
+    pub work_depth: usize,
+}
+
+impl LinkState {
+    pub fn offline(work_depth: usize) -> Self {
+        Self {
+            connected: false,
+            waits: Vec::new(),
+            work_depth,
+        }
+    }
+}
+
 pub struct Slave<S: Storage, C: ContentHook> {
     cfg: LoadedSlave,
     store: S,
     bodies: C,
     checkouts: HashMap<String, Checkout>,
-    pending: HashMap<(String, CanonicalPath), PendingApply>,
-    pending_pulls: HashSet<(String, CanonicalPath)>,
-    pending_renames: HashMap<(String, CanonicalPath), CanonicalPath>,
+    pending: Waiting<(String, CanonicalPath), PendingApply>,
+    pending_pulls: Waiting<(String, CanonicalPath), ()>,
+    pending_renames: Waiting<(String, CanonicalPath), CanonicalPath>,
     denied_centrals: HashSet<CanonicalPath>,
     crawl: Crawl,
     status: StatusLedger,
@@ -214,9 +233,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             store,
             bodies,
             checkouts,
-            pending: HashMap::new(),
-            pending_pulls: HashSet::new(),
-            pending_renames: HashMap::new(),
+            pending: Waiting::new(Stage::OriginBytes),
+            pending_pulls: Waiting::new(Stage::Reconcile),
+            pending_renames: Waiting::new(Stage::Reconcile),
             denied_centrals: HashSet::new(),
             crawl: Crawl::default(),
             status: StatusLedger::default(),
@@ -286,17 +305,32 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.cfg.status_interval_seconds()
     }
 
-    pub fn take_status(&mut self, connected: bool) -> SlaveStatus {
-        self.status.take_slave(
-            connected,
-            Queues {
-                outbox: 0,
-                pending: self.pending.len(),
-                pending_pulls: self.pending_pulls.len(),
-                pending_renames: self.pending_renames.len(),
-                writable: true,
-            },
-        )
+    pub fn take_status(&mut self, link: LinkState) -> SlaveStatus {
+        let mut waits: Vec<Wait> = [
+            self.pending.oldest(),
+            self.pending_pulls.oldest(),
+            self.pending_renames.oldest(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        waits.extend(link.waits);
+        let depth = |stage| {
+            waits
+                .iter()
+                .find(|wait| wait.stage == stage)
+                .map_or(0, |wait| wait.depth)
+        };
+        let queues = Queues {
+            pending: self.pending.len(),
+            pending_pulls: self.pending_pulls.len(),
+            pending_renames: self.pending_renames.len(),
+            parked: depth(Stage::FulfillParked),
+            sending: depth(Stage::FulfillRead),
+            work: link.work_depth,
+            ..Queues::default()
+        };
+        self.status.take_slave(link.connected, queues, &waits)
     }
 
     pub fn crawl_pending(&self) -> bool {
@@ -361,7 +395,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                     .map_err(SlaveError::index)?;
             }
             self.pending.retain(|(checkout, _), _| checkout != id);
-            self.pending_pulls.retain(|(checkout, _)| checkout != id);
+            self.pending_pulls.retain(|(checkout, _), _| checkout != id);
             self.pending_renames
                 .retain(|(checkout, _), _| checkout != id);
             self.crawl.drop_checkout(id);
@@ -627,6 +661,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         if self
             .pending_pulls
             .remove(&(checkout_id.clone(), path.clone()))
+            .is_some()
         {
             return self.apply_new(&checkout_id, path, new);
         }
@@ -855,6 +890,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                             new,
                             retried: false,
                         },
+                        Instant::now(),
                     );
                     return Ok(Reply::Send(vec![transfer::signature_request(
                         checkout_id,
@@ -1375,8 +1411,11 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 if master_dir {
                     self.ensure_local_dir(checkout_id, &child_path)?;
                 } else {
-                    self.pending_pulls
-                        .insert((checkout_id.into(), child_path.clone()));
+                    self.pending_pulls.insert(
+                        (checkout_id.into(), child_path.clone()),
+                        (),
+                        Instant::now(),
+                    );
                 }
                 out.push(ProtocolMessage::DirListRequest {
                     checkout_id: checkout_id.into(),
@@ -1644,8 +1683,11 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         if found.kind == EntryKind::Dir {
             self.reindex_descendants(checkout_id, &to, index::LastSynced::Keep)?;
         }
-        self.pending_renames
-            .insert((checkout_id.into(), from.clone()), to.clone());
+        self.pending_renames.insert(
+            (checkout_id.into(), from.clone()),
+            to.clone(),
+            Instant::now(),
+        );
         Ok(vec![ProtocolMessage::Rename {
             checkout_id: checkout_id.into(),
             from,
@@ -1698,13 +1740,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         {
             return Some((path.clone(), to));
         }
-        let key = self.pending_renames.iter().find_map(|(k, to)| {
-            if k.0 == checkout_id && to == path {
-                Some(k.clone())
-            } else {
-                None
-            }
-        })?;
+        let key = self
+            .pending_renames
+            .oldest_key_where(|key, to| key.0 == checkout_id && to == path)
+            .cloned()?;
         let to = self.pending_renames.remove(&key)?;
         Some((key.1, to))
     }

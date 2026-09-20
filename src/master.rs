@@ -278,6 +278,9 @@ async fn accept_session(
                     break;
                 }
             }
+            frame = conn.recv_datagram() => {
+                master.lock().expect("master").observe_gauge(peer, &frame);
+            }
             Some(err) = write_err_rx.recv() => return Err(err.into()),
             _ = tick.tick() => flush_outbox(&master, peer, &write_tx)?,
         }
