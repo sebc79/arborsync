@@ -31,6 +31,7 @@ Preamble `arborsync-v1` is the hyphae Noise prologue (`with_prologue`), not an a
 |---|---|
 | Control (one, slave-opened) | Framed `Envelope` messages |
 | Bulk (on demand, one transfer) | Framed `BulkHeader` + exactly `size` raw bytes |
+| Datagram (unreliable, slave to master) | One 25-byte `Gauge`: the slave's own `bottleneck=` verdict. Never a `ProtocolMessage`. A peer without datagram support drops to `hint=absent` and the session is unaffected. |
 
 Quinn gives **byte streams**. Control frame:
 
@@ -121,7 +122,7 @@ Rotation procedures: `spec.md` §4.
 
 ## Tests / in-memory
 
-`Transport` is a live session after handshake. `impl Transport for quinn::Connection` is the QUIC path. The master and slave binaries and `core/tests/transport.rs` call the trait. `MemoryTransport::pair` is the in-memory test impl. Unit tests still call `handle` for CAS and reconcile. The v1 production path is QUIC only.
+`Transport` is a live session after handshake. `impl Transport for quinn::Connection` is the QUIC path. The master and slave binaries and `core/tests/transport.rs` call the trait. `MemoryTransport::pair` is the in-memory test impl and has no datagrams. `pair_with_datagrams` is the opt-in that carries gauges. Unit tests still call `handle` for CAS and reconcile. The v1 production path is QUIC only.
 
 ## Struck from earlier drafts
 
