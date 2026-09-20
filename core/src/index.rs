@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Bound;
 
 use crate::hash::{DirNode, SubtreeRoot};
 use crate::merkle::{
-    DirChild, dir_entry_hash_off, dir_node, dir_node_from_concat, empty_dir_node, encode_dir_entry,
-    file_node,
+    DirChild, dir_entry_hash_off, dir_entry_len, dir_node, dir_node_from_concat, empty_dir_node,
+    encode_dir_entry, file_node,
 };
 use crate::meta::{EntryKind, FileMetadata};
 use crate::path::{CanonicalPath, EntryName};
@@ -76,25 +77,62 @@ impl DirKids {
             self.set_hash(&name, node);
             return;
         }
-        self.by_name.remove(&name);
-        self.by_name.insert(
-            name,
-            ChildSlot {
-                path,
-                kind,
-                node: *node,
-                encode_off: 0,
-            },
-        );
-        self.rebuild_concat();
+        if self.by_name.contains_key(&name) {
+            self.splice_out(&name);
+        }
+        self.splice_in(name, path, kind, node);
     }
 
     fn remove_path(&mut self, path: &CanonicalPath) {
         let Ok(name) = EntryName::parse(path.name()) else {
             return;
         };
-        if self.by_name.remove(&name).is_some() {
-            self.rebuild_concat();
+        self.splice_out(&name);
+    }
+
+    fn splice_in(
+        &mut self,
+        name: EntryName,
+        path: CanonicalPath,
+        kind: EntryKind,
+        node: &[u8; 32],
+    ) {
+        let encode_off = self
+            .by_name
+            .range((Bound::Excluded(&name), Bound::Unbounded))
+            .next()
+            .map(|(_, slot)| slot.encode_off)
+            .unwrap_or(self.concat.len());
+        let mut entry = Vec::with_capacity(dir_entry_len(&name));
+        encode_dir_entry(&mut entry, kind, &name, node);
+        let added = entry.len();
+        self.concat.splice(encode_off..encode_off, entry);
+        for (other, slot) in self.by_name.iter_mut() {
+            if other > &name {
+                slot.encode_off += added;
+            }
+        }
+        self.by_name.insert(
+            name,
+            ChildSlot {
+                path,
+                kind,
+                node: *node,
+                encode_off,
+            },
+        );
+    }
+
+    fn splice_out(&mut self, name: &EntryName) {
+        let Some(slot) = self.by_name.remove(name) else {
+            return;
+        };
+        let len = dir_entry_len(name);
+        self.concat.drain(slot.encode_off..slot.encode_off + len);
+        for (other, other_slot) in self.by_name.iter_mut() {
+            if other > name {
+                other_slot.encode_off -= len;
+            }
         }
     }
 
@@ -723,6 +761,61 @@ mod tests {
                     EntryKind::File as u8,
                     "alpha".into(),
                     *file_node(&file(9)).as_bytes(),
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn cached_reverse_insert_then_delete_matches_dir_node() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::new("src");
+        let dir = p("/src");
+        let dir_meta = FileMetadata::directory(0, 0o040755);
+        let names = ["z", "m", "a"];
+        let mut cache = DirChildren::default();
+        commit_leaf_with(
+            &store,
+            &ck,
+            &dir,
+            Some(&dir_meta),
+            LastSynced::Keep,
+            &mut cache,
+        )
+        .unwrap();
+        for (i, name) in names.iter().enumerate() {
+            commit_leaf_with(
+                &store,
+                &ck,
+                &p(&format!("/src/{name}")),
+                Some(&file(i as u8 + 1)),
+                LastSynced::Keep,
+                &mut cache,
+            )
+            .unwrap();
+        }
+        commit_leaf_with(
+            &store,
+            &ck,
+            &p("/src/m"),
+            None,
+            LastSynced::Keep,
+            &mut cache,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.get_dir_node(&ck, &dir).unwrap(),
+            Some(expected_dir_node(vec![
+                (
+                    EntryKind::File as u8,
+                    "a".into(),
+                    *file_node(&file(3)).as_bytes(),
+                ),
+                (
+                    EntryKind::File as u8,
+                    "z".into(),
+                    *file_node(&file(1)).as_bytes(),
                 ),
             ]))
         );
