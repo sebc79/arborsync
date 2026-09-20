@@ -1,7 +1,16 @@
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
+use std::time::{Duration, Instant};
 
+use crate::bottleneck::{Bottleneck, Gauge, Hint, Wait, verdict};
 use crate::protocol::ProtocolMessage;
+
+/// A gauge is believable for three status periods. A slave that has gone quiet
+/// for longer is `unobserved`, not "still parked".
+const GAUGE_PERIODS: u32 = 3;
+/// Staleness still needs a window when status logging is off, because a gauge
+/// arrives on the slave's period, not ours.
+const DEFAULT_STATUS_PERIOD: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Health {
@@ -61,6 +70,9 @@ pub struct Queues {
     pub pending: usize,
     pub pending_pulls: usize,
     pub pending_renames: usize,
+    pub parked: usize,
+    pub sending: usize,
+    pub work: usize,
     pub writable: bool,
 }
 
@@ -71,6 +83,9 @@ impl Default for Queues {
             pending: 0,
             pending_pulls: 0,
             pending_renames: 0,
+            parked: 0,
+            sending: 0,
+            work: 0,
             writable: true,
         }
     }
@@ -104,6 +119,7 @@ pub struct PeerLive {
     pub slave_id: String,
     pub checkouts: usize,
     pub queues: Queues,
+    pub waits: Vec<Wait>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +128,8 @@ pub struct SlavePeerStatus {
     pub connected: bool,
     pub checkouts: usize,
     pub health: Health,
+    pub bottleneck: Bottleneck,
+    pub hint: Hint,
     pub flow: Flow,
     pub queues: Queues,
     pub last_error: Option<LastError>,
@@ -120,6 +138,7 @@ pub struct SlavePeerStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterStatus {
     pub health: Health,
+    pub bottleneck: Bottleneck,
     pub connected: usize,
     pub flow: Flow,
     pub queues: Queues,
@@ -130,10 +149,20 @@ pub struct MasterStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlaveStatus {
     pub health: Health,
+    pub bottleneck: Bottleneck,
     pub connected: bool,
     pub flow: Flow,
     pub queues: Queues,
     pub last_error: Option<LastError>,
+}
+
+fn peer_line(found: Bottleneck, hint: Hint, slave_id: &str) -> Bottleneck {
+    match found {
+        Bottleneck::None if hint != Hint::Fresh => Bottleneck::Unobserved {
+            peer: slave_id.to_string(),
+        },
+        found => found,
+    }
 }
 
 pub fn classify(flow: &Flow, queues: &Queues, error_count: u64) -> Health {
@@ -154,11 +183,17 @@ struct PeerAcc {
     last_error: Option<LastError>,
 }
 
+struct Heard {
+    gauge: Gauge,
+    at: Instant,
+}
+
 #[derive(Default)]
 pub struct StatusLedger {
     aggregate: Flow,
     last_error: Option<LastError>,
     by_slave: HashMap<String, PeerAcc>,
+    gauges: HashMap<String, Heard>,
 }
 
 impl StatusLedger {
@@ -230,22 +265,53 @@ impl StatusLedger {
         }
     }
 
-    pub fn take_master(&mut self, live: Vec<PeerLive>) -> MasterStatus {
+    pub fn observe_gauge(&mut self, slave: &str, gauge: Gauge, now: Instant) {
+        match self.gauges.get_mut(slave) {
+            Some(heard) if gauge.seq <= heard.gauge.seq => {}
+            Some(heard) => *heard = Heard { gauge, at: now },
+            None => {
+                self.gauges
+                    .insert(slave.to_string(), Heard { gauge, at: now });
+            }
+        }
+    }
+
+    /// A gauge describes a session. The next one restarts its sequence at zero,
+    /// so keeping this one would silence the new session.
+    pub fn forget_gauge(&mut self, slave: &str) {
+        self.gauges.remove(slave);
+    }
+
+    pub fn take_master(
+        &mut self,
+        live: Vec<PeerLive>,
+        status_interval_seconds: u64,
+    ) -> MasterStatus {
+        let now = Instant::now();
+        let stale_after = gauge_window(status_interval_seconds);
         let flow = std::mem::take(&mut self.aggregate);
         let last_error = self.last_error.take();
         let mut accs = std::mem::take(&mut self.by_slave);
         let mut slaves = Vec::new();
         let mut queues = Queues::default();
+        let mut all_waits = Vec::new();
 
         for peer in live {
             queues.add_assign(&peer.queues);
             let acc = accs.remove(&peer.slave_id).unwrap_or_default();
             let error_count = acc.last_error.as_ref().map(|e| e.count).unwrap_or(0);
+            let (hint, heard) = self.heard(&peer.slave_id, now, stale_after);
+            let mut waits = peer.waits;
+            waits.extend(heard);
+            let bottleneck = peer_line(verdict(&waits, now), hint, &peer.slave_id);
+            all_waits.extend(waits);
             slaves.push(SlavePeerStatus {
                 health: classify(&acc.flow, &peer.queues, error_count),
                 slave_id: peer.slave_id,
                 connected: true,
                 checkouts: peer.checkouts,
+                bottleneck,
+                hint,
                 flow: acc.flow,
                 queues: peer.queues,
                 last_error: acc.last_error,
@@ -260,6 +326,8 @@ impl StatusLedger {
                 slave_id,
                 connected: false,
                 checkouts: 0,
+                bottleneck: Bottleneck::None,
+                hint: Hint::Absent,
                 flow: acc.flow,
                 queues: empty,
                 last_error: acc.last_error,
@@ -270,6 +338,7 @@ impl StatusLedger {
         let error_count = last_error.as_ref().map(|e| e.count).unwrap_or(0);
         MasterStatus {
             health: classify(&flow, &queues, error_count),
+            bottleneck: verdict(&all_waits, now),
             connected: slaves.iter().filter(|s| s.connected).count(),
             flow,
             queues,
@@ -278,18 +347,29 @@ impl StatusLedger {
         }
     }
 
-    pub fn take_slave(&mut self, connected: bool, queues: Queues) -> SlaveStatus {
+    pub fn take_slave(&mut self, connected: bool, queues: Queues, waits: &[Wait]) -> SlaveStatus {
         let flow = std::mem::take(&mut self.aggregate);
         let last_error = self.last_error.take();
         self.by_slave.clear();
         let error_count = last_error.as_ref().map(|e| e.count).unwrap_or(0);
         SlaveStatus {
             health: classify(&flow, &queues, error_count),
+            bottleneck: verdict(waits, Instant::now()),
             connected,
             flow,
             queues,
             last_error,
         }
+    }
+
+    fn heard(&self, slave: &str, now: Instant, stale_after: Duration) -> (Hint, Option<Wait>) {
+        let Some(heard) = self.gauges.get(slave) else {
+            return (Hint::Absent, None);
+        };
+        if now.saturating_duration_since(heard.at) > stale_after {
+            return (Hint::Stale, None);
+        }
+        (Hint::Fresh, heard.gauge.wait(slave, heard.at, now))
     }
 
     fn touch(&mut self, slave: Option<&str>, f: impl Fn(&mut Flow)) {
@@ -303,8 +383,9 @@ impl StatusLedger {
 impl MasterStatus {
     pub fn lines(&self, period_secs: u64) -> Vec<String> {
         let mut out = vec![format!(
-            "status {period_secs}s health={} connected={} {} {} last_error={}",
+            "status {period_secs}s health={} {} connected={} {} {} last_error={}",
             self.health.as_str(),
+            self.bottleneck.field(),
             self.connected,
             flow_fields(&self.flow),
             queue_fields(&self.queues, true),
@@ -312,9 +393,11 @@ impl MasterStatus {
         )];
         for slave in &self.slaves {
             out.push(format!(
-                "status slave={} health={} connected={} checkouts={} {} {} last_error={}",
+                "status slave={} health={} {} hint={} connected={} checkouts={} {} {} last_error={}",
                 slave.slave_id,
                 slave.health.as_str(),
+                slave.bottleneck.peer_field(),
+                slave.hint.as_str(),
                 slave.connected,
                 slave.checkouts,
                 flow_fields(&slave.flow),
@@ -327,10 +410,33 @@ impl MasterStatus {
 }
 
 impl SlaveStatus {
+    pub fn gauge(&self, seq: u32) -> Gauge {
+        let (stage, age_ms, depth) = match &self.bottleneck {
+            Bottleneck::At {
+                stage, age, depth, ..
+            } => (
+                Some(*stage),
+                u32::try_from(age.as_millis()).unwrap_or(u32::MAX),
+                u32::try_from(*depth).unwrap_or(u32::MAX),
+            ),
+            Bottleneck::None | Bottleneck::Unobserved { .. } => (None, 0, 0),
+        };
+        Gauge {
+            seq,
+            stage,
+            age_ms,
+            depth,
+            parked: u16::try_from(self.queues.parked).unwrap_or(u16::MAX),
+            sending: u16::try_from(self.queues.sending).unwrap_or(u16::MAX),
+            pending: u32::try_from(self.queues.pending).unwrap_or(u32::MAX),
+        }
+    }
+
     pub fn line(&self, period_secs: u64) -> String {
         format!(
-            "status {period_secs}s health={} connected={} {} {} last_error={}",
+            "status {period_secs}s health={} {} connected={} {} {} last_error={}",
             self.health.as_str(),
+            self.bottleneck.peer_field(),
             self.connected,
             flow_fields(&self.flow),
             queue_fields(&self.queues, false),
@@ -349,6 +455,14 @@ impl fmt::Display for SlaveStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.line(0))
     }
+}
+
+fn gauge_window(status_interval_seconds: u64) -> Duration {
+    let period = match status_interval_seconds {
+        0 => DEFAULT_STATUS_PERIOD,
+        seconds => Duration::from_secs(seconds),
+    };
+    period * GAUGE_PERIODS
 }
 
 fn note_kind(flow: &mut Flow, msg: &ProtocolMessage) {
@@ -437,8 +551,13 @@ fn queue_fields(queues: &Queues, master: bool) -> String {
         )
     } else {
         format!(
-            "pending={} pending_pulls={} pending_renames={}",
-            queues.pending, queues.pending_pulls, queues.pending_renames
+            "pending={} pending_pulls={} pending_renames={} parked={} sending={} work={}",
+            queues.pending,
+            queues.pending_pulls,
+            queues.pending_renames,
+            queues.parked,
+            queues.sending,
+            queues.work,
         )
     }
 }

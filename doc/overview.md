@@ -147,7 +147,7 @@ Tightening `allowed_prefixes` drops those checkouts from interest and leaves the
 
 `ContentHook` is how tests skip the network. `MemoryContent` returns bytes immediately. `WholeFileLater` always returns `AskSender`, which is what the daemons use.
 
-`Transport` is a live session after handshake. `impl Transport for quinn::Connection` is the QUIC path. The binaries call that impl. `MemoryTransport::pair` is the in-memory test impl. Unit tests still call `Master::handle` and `Slave::handle`.
+`Transport` is a live session after handshake. `impl Transport for quinn::Connection` is the QUIC path. The binaries call that impl. `MemoryTransport::pair` is the in-memory test impl and has no datagrams. `pair_with_datagrams` is the opt-in that carries gauges. Unit tests still call `Master::handle` and `Slave::handle`.
 
 ## Status
 

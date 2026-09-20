@@ -6,6 +6,7 @@ mod crawl;
 mod index;
 mod inflight;
 
+pub mod bottleneck;
 pub mod config;
 pub mod hash;
 pub mod keys;

@@ -1,7 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arborsync_core::LoadedMaster;
+use arborsync_core::bottleneck::{Gauge, Stage};
 use arborsync_core::config::SlaveAcl;
 use arborsync_core::hash::ContentHash;
 use arborsync_core::keys::{format_hex_key, public_from_secret, write_static_key};
@@ -19,6 +20,18 @@ use quinn::Connection;
 
 fn write_key(dir: &std::path::Path, name: &str) -> [u8; 32] {
     write_static_key(dir.join(name)).unwrap()
+}
+
+fn gauge() -> Gauge {
+    Gauge {
+        seq: 7,
+        stage: Some(Stage::FulfillParked),
+        age_ms: 41_000,
+        depth: 3,
+        parked: 3,
+        sending: 1,
+        pending: 118,
+    }
 }
 
 #[test]
@@ -433,6 +446,74 @@ async fn memory_bulk_roundtrip() {
         }
     );
     assert_eq!(body, b"hello");
+}
+
+#[tokio::test]
+async fn memory_datagrams_are_off_unless_the_pair_asks_for_them() {
+    let (left, right) = MemoryTransport::pair([0x11u8; 32], [0x22u8; 32]);
+
+    assert!(!left.send_datagram(&gauge().encode()));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), right.recv_datagram())
+            .await
+            .is_err(),
+        "recv_datagram must pend, not resolve"
+    );
+}
+
+#[tokio::test]
+async fn memory_datagram_roundtrip_carries_a_gauge() {
+    let (left, right) = MemoryTransport::pair_with_datagrams([0x11u8; 32], [0x22u8; 32]);
+
+    assert!(left.send_datagram(&gauge().encode()));
+    assert_eq!(Gauge::decode(&right.recv_datagram().await), Some(gauge()));
+}
+
+#[tokio::test]
+async fn quic_datagram_roundtrip_carries_a_gauge() {
+    let dir = tempfile::tempdir().unwrap();
+    write_key(dir.path(), "master.key");
+    write_key(dir.path(), "slave.key");
+    let master_secret = arborsync_core::read_static_key(dir.path().join("master.key")).unwrap();
+    let slave_secret = arborsync_core::read_static_key(dir.path().join("slave.key")).unwrap();
+
+    let server = listen(SocketAddr::from(([127, 0, 0, 1], 0)), &master_secret).unwrap();
+    let addr = server.local_addr().unwrap();
+    let client = client_endpoint(&slave_secret).unwrap();
+    let incoming = tokio::spawn(async move {
+        let connecting = server.accept().await.expect("accept");
+        connecting.await.expect("handshake")
+    });
+    let client_conn = connect(&client, addr).await.unwrap();
+    let server_conn = incoming.await.unwrap();
+
+    assert!(Transport::send_datagram(&client_conn, &gauge().encode()));
+    let frame = tokio::time::timeout(Duration::from_secs(5), server_conn.recv_datagram())
+        .await
+        .expect("datagram");
+    assert_eq!(Gauge::decode(&frame), Some(gauge()));
+}
+
+#[tokio::test]
+async fn a_frame_too_large_for_the_path_is_refused_without_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    write_key(dir.path(), "master.key");
+    write_key(dir.path(), "slave.key");
+    let master_secret = arborsync_core::read_static_key(dir.path().join("master.key")).unwrap();
+    let slave_secret = arborsync_core::read_static_key(dir.path().join("slave.key")).unwrap();
+
+    let server = listen(SocketAddr::from(([127, 0, 0, 1], 0)), &master_secret).unwrap();
+    let addr = server.local_addr().unwrap();
+    let client = client_endpoint(&slave_secret).unwrap();
+    let incoming = tokio::spawn(async move {
+        let connecting = server.accept().await.expect("accept");
+        connecting.await.expect("handshake")
+    });
+    let client_conn = connect(&client, addr).await.unwrap();
+    let _server_conn = incoming.await.unwrap();
+
+    let oversized = vec![0u8; 64 * 1024];
+    assert!(!Transport::send_datagram(&client_conn, &oversized));
 }
 
 #[tokio::test]

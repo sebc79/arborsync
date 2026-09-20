@@ -1,6 +1,9 @@
+use std::time::{Duration, Instant};
+
 use arborsync_core::LoadedMaster;
 use arborsync_core::LoadedSlave;
 use arborsync_core::LocalEvent;
+use arborsync_core::bottleneck::{Gauge, Stage};
 use arborsync_core::config::CheckoutConfig;
 use arborsync_core::config::SlaveAcl;
 use arborsync_core::hash::{ContentHash, SubtreeRoot};
@@ -9,8 +12,8 @@ use arborsync_core::master::{Master, MemoryContent, Reply};
 use arborsync_core::merkle::file_node;
 use arborsync_core::meta::{FileMetadata, hash_bytes};
 use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
-use arborsync_core::slave::Slave;
-use arborsync_core::status::{Flow, Health, Queues, classify};
+use arborsync_core::slave::{LinkState, Slave};
+use arborsync_core::status::{Flow, Health, PeerLive, Queues, StatusLedger, classify};
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
 
 const ALICE: [u8; 32] = [0xA1; 32];
@@ -69,6 +72,55 @@ fn alice_slave(
     Slave::open(cfg, MemoryStorage::new(), bodies).unwrap()
 }
 
+/// What a parked slave sends: 41 s behind on the third of three asks.
+fn parked_gauge(seq: u32) -> Gauge {
+    Gauge {
+        seq,
+        stage: Some(Stage::FulfillParked),
+        age_ms: 41_000,
+        depth: 3,
+        parked: 3,
+        sending: 1,
+        pending: 0,
+    }
+}
+
+/// Leaves the master holding an `origin_bytes` wait on `dev-alice`.
+fn ask_alice_for_bytes(master: &mut Master<MemoryStorage, MemoryContent>) {
+    let body = b"bytes the master does not hold";
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/big.bin"),
+                new: FileMetadata::file(body.len() as u64, MTIME, 0o100644, hash_bytes(body)),
+                basis: None,
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::SignatureRequest { .. }) => {}
+        other => panic!("expected SignatureRequest, got {other:?}"),
+    }
+}
+
+fn online() -> LinkState {
+    LinkState {
+        connected: true,
+        waits: Vec::new(),
+        work_depth: 0,
+    }
+}
+
+/// The age of a live wait is whatever the test run produced, so it is the one
+/// field a literal line cannot pin.
+fn without_age(line: &str) -> String {
+    let (head, rest) = line.split_once(" age=").expect("age field");
+    let (_, tail) = rest.split_once(' ').expect("a field after age");
+    format!("{head} age=<n> {tail}")
+}
+
 #[test]
 fn reject_only_window_is_failed_not_busy() {
     let mut flow = Flow::default();
@@ -94,11 +146,11 @@ fn fresh_take_after_subscribe_and_idle_is_idle() {
     assert!(status.slaves[0].connected);
     assert_eq!(
         status.lines(5)[0],
-        "status 5s health=idle connected=1 in=0 out=0 cas_ok=0 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=0 rescan=0 flushed=0 pending=0 outbox=0 writable=true last_error=-"
+        "status 5s health=idle bottleneck=none connected=1 in=0 out=0 cas_ok=0 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=0 rescan=0 flushed=0 pending=0 outbox=0 writable=true last_error=-"
     );
     assert_eq!(
         status.lines(5)[1],
-        "status slave=dev-alice health=idle connected=true checkouts=1 in=0 out=0 cas_ok=0 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=0 rescan=0 flushed=0 pending=0 outbox=0 writable=true last_error=-"
+        "status slave=dev-alice health=idle bottleneck=unobserved hint=absent connected=true checkouts=1 in=0 out=0 cas_ok=0 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=0 rescan=0 flushed=0 pending=0 outbox=0 writable=true last_error=-"
     );
 }
 
@@ -136,7 +188,7 @@ fn file_announce_cas_accept_is_busy_then_idle() {
     assert!(status.flow.cas_accept >= 1);
     assert_eq!(
         status.lines(5)[0],
-        "status 5s health=busy connected=1 in=1 out=1 cas_ok=1 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=0 rescan=0 flushed=0 pending=0 outbox=0 writable=true last_error=-"
+        "status 5s health=busy bottleneck=none connected=1 in=1 out=1 cas_ok=1 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=0 rescan=0 flushed=0 pending=0 outbox=0 writable=true last_error=-"
     );
 
     let idle = master.take_status();
@@ -195,7 +247,7 @@ fn stale_basis_file_announce_records_cas_reject() {
     assert!(error.reason.starts_with("cas_reject:"), "{}", error.reason);
     assert_eq!(
         status.lines(5)[0],
-        "status 5s health=failed connected=1 in=1 out=1 cas_ok=0 cas_rej=1 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=0 rescan=0 flushed=0 pending=0 outbox=0 writable=true last_error=cas_reject:/src/hello.txt"
+        "status 5s health=failed bottleneck=none connected=1 in=1 out=1 cas_ok=0 cas_rej=1 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=0 rescan=0 flushed=0 pending=0 outbox=0 writable=true last_error=cas_reject:/src/hello.txt"
     );
 }
 
@@ -219,16 +271,142 @@ fn unflushed_fanout_is_stuck() {
     assert_eq!(status.health, Health::Stuck);
     assert!(status.queues.outbox > 0);
     assert_eq!(
-        status.lines(5)[0],
-        "status 5s health=stuck connected=1 in=0 out=0 cas_ok=0 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=1 rescan=0 flushed=0 pending=0 outbox=1 writable=true last_error=-"
+        without_age(&status.lines(5)[0]),
+        "status 5s health=stuck bottleneck=fanout@dev-alice age=<n> depth=1 via=local connected=1 in=0 out=0 cas_ok=0 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=1 rescan=0 flushed=0 pending=0 outbox=1 writable=true last_error=-"
     );
+}
+
+#[test]
+fn master_waiting_on_slave_bytes_names_origin_bytes() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    let _handshake = master.take_status();
+    ask_alice_for_bytes(&mut master);
+
+    let status = master.take_status();
+    assert_eq!(
+        without_age(&status.lines(5)[0]),
+        "status 5s health=stuck bottleneck=origin_bytes@dev-alice age=<n> depth=1 via=local connected=1 in=1 out=1 cas_ok=0 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=0 rescan=0 flushed=0 pending=1 outbox=0 writable=true last_error=-"
+    );
+    assert_eq!(
+        without_age(&status.lines(5)[1]),
+        "status slave=dev-alice health=stuck bottleneck=origin_bytes age=<n> depth=1 hint=absent connected=true checkouts=1 in=1 out=1 cas_ok=0 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=0 rescan=0 flushed=0 pending=1 outbox=0 writable=true last_error=-"
+    );
+}
+
+#[test]
+fn a_fresh_slave_gauge_names_the_far_end_of_the_master_wait() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    let _handshake = master.take_status();
+    ask_alice_for_bytes(&mut master);
+
+    master.observe_gauge(ALICE, &parked_gauge(1).encode());
+
+    let status = master.take_status();
+    let aggregate = &status.lines(5)[0];
+    assert!(
+        aggregate.contains("bottleneck=fulfill_parked@dev-alice"),
+        "{aggregate}"
+    );
+    assert!(aggregate.contains("via=gauge"), "{aggregate}");
+    assert_eq!(
+        without_age(&status.lines(5)[1]),
+        "status slave=dev-alice health=stuck bottleneck=fulfill_parked age=<n> depth=3 hint=fresh connected=true checkouts=1 in=1 out=1 cas_ok=0 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=0 rescan=0 flushed=0 pending=1 outbox=0 writable=true last_error=-"
+    );
+}
+
+#[test]
+fn a_replayed_or_garbled_gauge_leaves_the_last_one_standing() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    master.observe_gauge(ALICE, &parked_gauge(4).encode());
+
+    master.observe_gauge(ALICE, b"not a gauge at all");
+    master.observe_gauge(
+        ALICE,
+        &Gauge {
+            stage: Some(Stage::Reconcile),
+            ..parked_gauge(4)
+        }
+        .encode(),
+    );
+
+    let slave_line = master.take_status().lines(5)[1].clone();
+    assert!(
+        slave_line.contains("bottleneck=fulfill_parked"),
+        "{slave_line}"
+    );
+    assert!(slave_line.contains("hint=fresh"), "{slave_line}");
+}
+
+#[test]
+fn a_disconnect_drops_the_peer_gauge() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    master.observe_gauge(ALICE, &parked_gauge(1).encode());
+
+    master.disconnect(ALICE);
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let slave_line = master.take_status().lines(5)[1].clone();
+    assert!(slave_line.contains("bottleneck=unobserved"), "{slave_line}");
+    assert!(slave_line.contains("hint=absent"), "{slave_line}");
+}
+
+#[test]
+fn a_gauge_older_than_three_status_periods_is_stale() {
+    let mut ledger = StatusLedger::default();
+    let live = || {
+        vec![PeerLive {
+            slave_id: "dev-alice".into(),
+            checkouts: 1,
+            queues: Queues::default(),
+            waits: Vec::new(),
+        }]
+    };
+
+    ledger.observe_gauge(
+        "dev-alice",
+        parked_gauge(1),
+        Instant::now() - Duration::from_secs(10),
+    );
+
+    let believed = ledger.take_master(live(), 5);
+    assert!(
+        believed.lines(5)[1].contains("bottleneck=fulfill_parked"),
+        "{}",
+        believed.lines(5)[1]
+    );
+    assert!(believed.lines(5)[1].contains("hint=fresh"));
+    let expired = ledger.take_master(live(), 1);
+    assert!(
+        expired.lines(5)[1].contains("bottleneck=unobserved hint=stale"),
+        "{}",
+        expired.lines(5)[1]
+    );
+    assert!(expired.lines(5)[0].contains("bottleneck=none"));
 }
 
 #[test]
 fn slave_dir_list_and_root_report_increment_counters() {
     let sandbox = SyncSandbox::new();
     let mut slave = alice_slave(&sandbox, MemoryContent::new());
-    let _ = slave.take_status(true);
+    let _ = slave.take_status(online());
 
     match slave
         .handle(ProtocolMessage::RootAck {
@@ -258,11 +436,38 @@ fn slave_dir_list_and_root_report_increment_counters() {
         })
         .unwrap();
 
-    let status = slave.take_status(true);
+    let status = slave.take_status(online());
     assert!(status.flow.root >= 1);
     assert!(status.flow.dir_list >= 1);
     assert_eq!(
         status.line(5),
-        "status 5s health=busy connected=true in=2 out=1 cas_ok=0 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=2 root=1 local=0 rescan=0 flushed=0 pending=0 pending_pulls=0 pending_renames=0 last_error=-"
+        "status 5s health=busy bottleneck=none connected=true in=2 out=1 cas_ok=0 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=2 root=1 local=0 rescan=0 flushed=0 pending=0 pending_pulls=0 pending_renames=0 parked=0 sending=0 work=0 last_error=-"
+    );
+}
+
+#[test]
+fn slave_waiting_on_master_bytes_names_origin_bytes() {
+    let sandbox = SyncSandbox::new();
+    let body = b"bytes the slave does not hold";
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+
+    match slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/big.bin"),
+            new: FileMetadata::file(body.len() as u64, MTIME, 0o100644, hash_bytes(body)),
+            basis: None,
+        })
+        .unwrap()
+    {
+        arborsync_core::slave::Reply::Send(msgs)
+            if matches!(msgs.as_slice(), [ProtocolMessage::SignatureRequest { .. }]) => {}
+        other => panic!("expected SignatureRequest, got {other:?}"),
+    }
+
+    let status = slave.take_status(online());
+    assert_eq!(
+        without_age(&status.line(5)),
+        "status 5s health=stuck bottleneck=origin_bytes age=<n> depth=1 connected=true in=1 out=1 cas_ok=0 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=0 rescan=0 flushed=0 pending=1 pending_pulls=0 pending_renames=0 parked=0 sending=0 work=0 last_error=-"
     );
 }

@@ -409,9 +409,9 @@ Paths in every message are canonical. `checkout_id` is required on slave-scoped 
 - Slave verifies master static key; master maps slave static key → ACL.
 - Unknown keys and ACL misses are disconnects, rate-limited per source IP.
 - Reconnect: exponential backoff, then `Subscribe` + reconcile. No 0-RTT, no replay of announces.
-- `Transport` is a live session after handshake. It exposes the peer static key, one control stream pair, on-demand bulk transfers, and `close`.
+- `Transport` is a live session after handshake. It exposes the peer static key, one control stream pair, on-demand bulk transfers, best-effort datagrams, and `close`.
 - `impl Transport for quinn::Connection` is the QUIC path.
-- `MemoryTransport::pair` is the in-memory test impl.
+- `MemoryTransport::pair` is the in-memory test impl. `pair_with_datagrams` is the opt-in path that carries gauges.
 - The v1 production path is QUIC only. There is no TCP path.
 
 ---
@@ -597,12 +597,13 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §7 / §10 slave crawl yields | `SubscribeAck` rescan and leftover `DirListResponse` pages walk at most 64 names per session turn. A new or changed index row is announced in that turn. `SubscribeAck` sends the current `RootReport` before a long walk finishes. Leftover pages are stepped before a queued rescan. The watch thread queues `request_rescan` and does not drain the walk. `status` and `read_control` stay live. `Slave::rescan` drains the walk for tests. A 300k-file walk that ran inside one `handle` used to mute `status 5s` and stop reading control. Waiting for the whole walk before `RootReport` left leftover files on the slave. |
 | ✅ | §11 master control write is not on the session `select!` | `dispatch_master` and `flush_outbox` enqueue onto a writer task. Master `write_bulk` is spawned. The session keeps `read_control` and `accept_uni` live while the control window is full. |
 | ✅ | §12 one live connection per `slave_id` | Replacing a session `close`s the previous `Connection` and signals the old task. |
-| ✅ | §12 `Transport` trait | `Transport` is a live session. It exposes the peer static key, one control stream pair, on-demand bulk, and `close`. `impl Transport for quinn::Connection` is the QUIC path. The master and slave binaries and `core/tests/transport.rs` call the trait. `MemoryTransport::pair` is the in-memory test impl. Most unit tests still call `handle`. |
+| ✅ | §12 `Transport` trait | `Transport` is a live session. It exposes the peer static key, one control stream pair, on-demand bulk, best-effort datagrams, and `close`. `impl Transport for quinn::Connection` is the QUIC path. The master and slave binaries and `core/tests/transport.rs` call the trait. `MemoryTransport::pair` is the in-memory test impl and has no datagrams. `pair_with_datagrams` is the opt-in. Most unit tests still call `handle`. |
 | ➖ | §14 `quic_*` / `reconnect_*` | Struck in `doc/configuration.md`. Not struct fields. Reconnect is 1 s, doubling, cap 60 s. |
 | ✅ | §11 / §12 keep-alive | Idle timeout stays at the Quinn 30 s default. `listen` and `client_endpoint` set `keep_alive_interval` to 10 s. No application `Heartbeat`. |
 | ✅ | Backpressure (`set_writable`) | `flush_outbox` polls the batch and `set_writable(peer, false)` when the batch is longer than 32. The writer task sets `writable` true after that batch is written. `set_writable(false)` still clears the leftover outbox. |
 | ✅ | In-flight bulk after disconnect | `Master::disconnect` drops pending rows whose `peer` is the disconnected peer. |
-| ✅ | Interval status reports | Master and slave log a `status ` summary each `status_interval_seconds` (default 5, `0` disables, max 3600). Health is `idle`, `busy`, `stuck`, or `failed`. The master adds one line per slave. Reload applies the interval live. No metrics port. |
+| ✅ | Interval status reports | Master and slave log a `status ` summary each `status_interval_seconds` (default 5, `0` disables, max 3600). Health is `idle`, `busy`, `stuck`, or `failed`. Each line also names `bottleneck=` (the hop that is limiting progress), with `age=` and `depth=` when a wait is open. The master adds one line per slave. Reload applies the interval live. No metrics port. |
+| ✅ | Bottleneck side-channel | The slave sends its own `bottleneck=` verdict to the master as a 25-byte QUIC datagram each status period. Not a `ProtocolMessage`. A missing or stale gauge prints `hint=absent` or `hint=stale` on that slave line only. An old peer keeps syncing. |
 
 Topic documents:
 

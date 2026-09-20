@@ -1,18 +1,22 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use arborsync_core::LocalEvent;
+use arborsync_core::bottleneck::{Stage, Wait, Waiting};
 use arborsync_core::hash::ContentHash;
 use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::path::local_to_canonical;
 use arborsync_core::protocol::ProtocolMessage;
-use arborsync_core::slave::{Reply, Slave, SlaveError, WholeFileLater, fulfill_from_host};
+use arborsync_core::slave::{
+    LinkState, Reply, Slave, SlaveError, WholeFileLater, fulfill_from_host,
+};
+use arborsync_core::status::SlaveStatus;
 use arborsync_core::storage::Storage;
 use arborsync_core::transport::{Transport, client_endpoint, connect, read_bulk, stream_err};
 use arborsync_core::watch::to_local_events;
@@ -110,7 +114,7 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
                     tokio::select! {
                         _ = tokio::time::sleep(remain) => break,
                         _ = status_clock.wait(status_every) => {
-                            emit_slave_status(&slave, false);
+                            let _ = emit_slave_status(&slave, LinkState::offline(work_rx.len()));
                         }
                         _ = hangup.recv() => {
                             reload_slave_from_disk(&config_path, &slave, &work_tx, &watch_gen);
@@ -263,6 +267,7 @@ async fn session(
     let mut status_clock = crate::status::Clock::new();
     loop {
         let status_every = slave.lock().expect("slave").status_interval_seconds();
+        let work_depth = work.len();
         tokio::select! {
             msg = Connection::read_control(&mut recv) => {
                 outbound.ingest(slave, &conn, msg?)?;
@@ -328,7 +333,12 @@ async fn session(
                 )?;
             }
             _ = status_clock.wait(status_every) => {
-                emit_slave_status(slave, true);
+                let link = LinkState {
+                    connected: true,
+                    waits: outbound.waits(),
+                    work_depth,
+                };
+                outbound.report_status(slave, &conn, link);
             }
         }
     }
@@ -361,13 +371,15 @@ async fn next_outbound(
     }
 }
 
-fn emit_slave_status(slave: &SharedSlave, connected: bool) {
+fn emit_slave_status(slave: &SharedSlave, link: LinkState) -> Option<SlaveStatus> {
     let mut guard = slave.lock().expect("slave");
     let period = guard.status_interval_seconds();
     if period == 0 {
-        return;
+        return None;
     }
-    log::info!("{}", guard.take_status(connected).line(period));
+    let status = guard.take_status(link);
+    log::info!("{}", status.line(period));
+    Some(status)
 }
 
 fn apply_live_slave_reload(
@@ -396,20 +408,23 @@ fn apply_live_slave_reload(
 const MAX_BULK_INFLIGHT: usize = 4;
 const LARGE_BULK_BYTES: u64 = 16 * 1024 * 1024;
 
+type AskKey = (String, CanonicalPath, ContentHash);
+type IsLarge = bool;
+
 struct BulkDone {
     result: anyhow::Result<()>,
-    large: bool,
+    key: AskKey,
     control: Vec<ProtocolMessage>,
 }
 
 struct Outbound {
     urgent_tx: UnboundedSender<ProtocolMessage>,
     walk_tx: UnboundedSender<ProtocolMessage>,
-    parked: VecDeque<ProtocolMessage>,
-    fulfilled_asks: HashSet<(String, CanonicalPath, ContentHash)>,
+    parked: Waiting<AskKey, ProtocolMessage>,
+    sending: Waiting<AskKey, IsLarge>,
+    fulfilled_asks: HashSet<AskKey>,
     bulk_tx: UnboundedSender<BulkDone>,
-    inflight: usize,
-    large_inflight: usize,
+    gauge_seq: u32,
 }
 
 impl Outbound {
@@ -421,16 +436,31 @@ impl Outbound {
         Self {
             urgent_tx,
             walk_tx,
-            parked: VecDeque::new(),
+            parked: Waiting::new(Stage::FulfillParked),
+            sending: Waiting::new(Stage::FulfillRead),
             fulfilled_asks: HashSet::new(),
             bulk_tx,
-            inflight: 0,
-            large_inflight: 0,
+            gauge_seq: 0,
         }
     }
 
+    fn report_status(&mut self, slave: &SharedSlave, conn: &Connection, link: LinkState) {
+        let Some(status) = emit_slave_status(slave, link) else {
+            return;
+        };
+        Transport::send_datagram(conn, &status.gauge(self.gauge_seq).encode());
+        self.gauge_seq += 1;
+    }
+
     fn serving(&self) -> bool {
-        self.inflight > 0 || !self.parked.is_empty()
+        !self.sending.is_empty() || !self.parked.is_empty()
+    }
+
+    fn waits(&self) -> Vec<Wait> {
+        [self.parked.oldest(), self.sending.oldest()]
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     fn ingest(
@@ -441,16 +471,11 @@ impl Outbound {
     ) -> anyhow::Result<()> {
         if let Some(key) = signature_request_key(&msg) {
             slave.lock().expect("slave").note_inbound(&msg);
-            if self.fulfilled_asks.contains(&key)
-                || self
-                    .parked
-                    .iter()
-                    .any(|queued| signature_request_key(queued).as_ref() == Some(&key))
-            {
+            if self.fulfilled_asks.contains(&key) || self.parked.get(&key).is_some() {
                 return Ok(());
             }
             if !self.can_start(slave, &msg) {
-                self.parked.push_back(msg);
+                self.parked.insert(key, msg, Instant::now());
                 return Ok(());
             }
             return self.start_ask(slave, conn, msg);
@@ -481,10 +506,10 @@ impl Outbound {
     }
 
     fn can_start(&self, slave: &SharedSlave, msg: &ProtocolMessage) -> bool {
-        if self.inflight >= MAX_BULK_INFLIGHT {
+        if self.sending.len() >= MAX_BULK_INFLIGHT {
             return false;
         }
-        !(self.is_large(slave, msg) && self.large_inflight > 0)
+        !(self.is_large(slave, msg) && self.sending.values().any(|large| *large))
     }
 
     fn is_large(&self, slave: &SharedSlave, msg: &ProtocolMessage) -> bool {
@@ -529,12 +554,9 @@ impl Outbound {
             };
             (host, large)
         };
-        self.fulfilled_asks
-            .insert((checkout_id.clone(), path.clone(), want_hash));
-        self.inflight += 1;
-        if large {
-            self.large_inflight += 1;
-        }
+        let key = (checkout_id.clone(), path.clone(), want_hash);
+        self.fulfilled_asks.insert(key.clone());
+        self.sending.insert(key.clone(), large, Instant::now());
         let conn = conn.clone();
         let tx = self.bulk_tx.clone();
         let status = slave.clone();
@@ -553,28 +575,28 @@ impl Outbound {
                         .map_err(|err| anyhow::anyhow!("{err:#}"));
                     BulkDone {
                         result,
-                        large,
+                        key,
                         control: Vec::new(),
                     }
                 }
                 Ok(Ok(Reply::Send(control))) => BulkDone {
                     result: Ok(()),
-                    large,
+                    key,
                     control,
                 },
                 Ok(Ok(Reply::Hangup { reason })) => BulkDone {
                     result: Err(anyhow::anyhow!("{reason}")),
-                    large,
+                    key,
                     control: Vec::new(),
                 },
                 Ok(Err(err)) => BulkDone {
                     result: Err(anyhow::anyhow!("{err}")),
-                    large,
+                    key,
                     control: Vec::new(),
                 },
                 Err(err) => BulkDone {
                     result: Err(anyhow::anyhow!("{err}")),
-                    large,
+                    key,
                     control: Vec::new(),
                 },
             };
@@ -589,11 +611,8 @@ impl Outbound {
         conn: &Connection,
         done: BulkDone,
     ) -> anyhow::Result<()> {
+        self.sending.remove(&done.key);
         done.result?;
-        self.inflight = self.inflight.saturating_sub(1);
-        if done.large {
-            self.large_inflight = self.large_inflight.saturating_sub(1);
-        }
         for msg in &done.control {
             slave.lock().expect("slave").note_outbound(msg);
         }
@@ -603,14 +622,14 @@ impl Outbound {
 
     fn kick(&mut self, slave: &SharedSlave, conn: &Connection) -> anyhow::Result<()> {
         loop {
-            let idx = self
+            let Some(key) = self
                 .parked
-                .iter()
-                .position(|msg| self.can_start(slave, msg));
-            let Some(idx) = idx else {
+                .oldest_key_where(|_, msg| self.can_start(slave, msg))
+                .cloned()
+            else {
                 return Ok(());
             };
-            let msg = self.parked.remove(idx).expect("parked ask");
+            let msg = self.parked.remove(&key).expect("oldest parked ask");
             self.start_ask(slave, conn, msg)?;
         }
     }

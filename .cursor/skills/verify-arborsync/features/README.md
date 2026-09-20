@@ -48,4 +48,5 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Sync a slave write to the master](./sync-from-slave.md) covers a checkout file appearing under `central_root/src`.
 - [Sync a master write to the slave](./sync-from-master.md) covers a central file appearing in the checkout.
 - [Read interval status lines](./interval-status.md) covers the 5 s master and slave summaries.
+- [Name the limiting hop on status lines](./bottleneck-status.md) covers `bottleneck=` and the slave-to-master gauge.
 - [Resume a leftover checkout drop](./leftover-drop.md) covers a tree already on the slave at connect.

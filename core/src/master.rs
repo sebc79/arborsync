@@ -6,9 +6,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::apply;
+use crate::bottleneck::{Gauge, Stage, Waiting};
 use crate::config::{LoadedMaster, MasterReload, ReloadError};
 use crate::hash::{ContentHash, FileNode, SubtreeRoot};
 use crate::index;
@@ -145,7 +146,8 @@ pub fn decide_cas(
 struct LiveSlave {
     peer: [u8; 32],
     checkouts: HashMap<CheckoutName, CanonicalPath>,
-    outbox: Vec<ProtocolMessage>,
+    outbox: Waiting<u64, ProtocolMessage>,
+    next_seq: u64,
     writable: bool,
 }
 
@@ -183,7 +185,8 @@ impl Roster {
             LiveSlave {
                 peer,
                 checkouts,
-                outbox: Vec::new(),
+                outbox: Waiting::new(Stage::Fanout),
+                next_seq: 0,
                 writable: true,
             },
         );
@@ -260,7 +263,8 @@ impl Roster {
             return;
         };
         if live.writable {
-            live.outbox.push(msg);
+            live.outbox.insert(live.next_seq, msg, Instant::now());
+            live.next_seq += 1;
         }
     }
 
@@ -291,7 +295,7 @@ impl Roster {
             return Vec::new();
         };
         match self.by_slave.get_mut(&slave) {
-            Some(live) => std::mem::take(&mut live.outbox),
+            Some(live) => live.outbox.drain_ordered(),
             None => Vec::new(),
         }
     }
@@ -397,7 +401,7 @@ pub struct Master<S: Storage, C: ContentHook> {
     roster: Roster,
     inflight: Inflight,
     bodies: C,
-    pending: HashMap<(String, CanonicalPath), PendingApply>,
+    pending: Waiting<(String, CanonicalPath), PendingApply>,
     dirs: index::DirChildren,
     status: StatusLedger,
 }
@@ -417,7 +421,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             roster: Roster::default(),
             inflight: Inflight::new(debounce),
             bodies,
-            pending: HashMap::new(),
+            pending: Waiting::new(Stage::OriginBytes),
             dirs: index::DirChildren::default(),
             status: StatusLedger::default(),
         };
@@ -683,9 +687,31 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         Ok(())
     }
 
+    /// A slave's own verdict, off the session's datagram channel. Garbage, an
+    /// unknown peer, and an old sequence are all dropped in silence. Nothing
+    /// here can fail a session.
+    pub fn observe_gauge(&mut self, peer: [u8; 32], frame: &[u8]) {
+        let Some(gauge) = Gauge::decode(frame) else {
+            return;
+        };
+        let Some(slave) = self.live_slave_id(&peer) else {
+            return;
+        };
+        self.status.observe_gauge(&slave, gauge, Instant::now());
+    }
+
     pub fn disconnect(&mut self, peer: [u8; 32]) {
+        if let Some(slave) = self.live_slave_id(&peer) {
+            self.status.forget_gauge(&slave);
+        }
         self.roster.disconnect_peer(&peer);
         self.pending.retain(|_, row| row.peer != peer);
+    }
+
+    /// The id of a peer that has subscribed, which is the only peer a gauge can
+    /// belong to. Unlike `status_slave`, an ACL row alone is not enough.
+    fn live_slave_id(&self, peer: &[u8; 32]) -> Option<String> {
+        self.roster.slave_of(peer).map(|id| id.as_str().to_string())
     }
 
     pub fn poll(&mut self, peer: [u8; 32]) -> Vec<ProtocolMessage> {
@@ -725,25 +751,27 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             .by_slave
             .iter()
             .map(|(id, session)| {
-                let pending = self
-                    .pending
-                    .values()
-                    .filter(|row| row.peer == session.peer)
-                    .count();
+                let oldest = self.pending.oldest_where(|_, row| row.peer == session.peer);
+                let pending = oldest.as_ref().map_or(0, |wait| wait.depth);
                 PeerLive {
                     slave_id: id.as_str().to_string(),
                     checkouts: session.checkouts.len(),
                     queues: Queues {
                         outbox: session.outbox.len(),
                         pending,
-                        pending_pulls: 0,
-                        pending_renames: 0,
                         writable: session.writable,
+                        ..Queues::default()
                     },
+                    waits: [oldest, session.outbox.oldest()]
+                        .into_iter()
+                        .flatten()
+                        .map(|wait| wait.about(id.as_str()))
+                        .collect(),
                 }
             })
             .collect();
-        self.status.take_master(live)
+        self.status
+            .take_master(live, self.cfg.status_interval_seconds())
     }
 
     pub fn note_status_error(&mut self, slave: Option<&str>, reason: impl Into<String>) {
@@ -951,6 +979,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                             previous: current,
                             retried: false,
                         },
+                        Instant::now(),
                     );
                     return Ok(transfer::signature_request(
                         checkout_id,
