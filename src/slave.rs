@@ -344,7 +344,7 @@ async fn session(
                 outbound.enqueue(outs)?;
                 hasher.finish(slave);
                 offer_pending_hashes(slave, &mut hasher);
-                if !outbound.serving() && slave.lock().expect("slave").crawl_runnable() {
+                if slave.lock().expect("slave").should_step_crawl(outbound.serving()) {
                     match slave.lock().expect("slave").crawl_step() {
                         Ok(outs) => outbound.enqueue(outs)?,
                         Err(SlaveError::UnknownCheckout(_)) => {}
@@ -419,10 +419,7 @@ async fn session(
 }
 
 async fn wait_if_should_crawl(slave: &SharedSlave, serving: bool) {
-    if serving {
-        std::future::pending::<()>().await;
-    }
-    if slave.lock().expect("slave").crawl_runnable() {
+    if slave.lock().expect("slave").should_step_crawl(serving) {
         return;
     }
     std::future::pending::<()>().await;

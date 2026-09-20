@@ -209,6 +209,7 @@ pub struct Slave<S: Storage, C: ContentHook> {
     crawl: Crawl,
     hashing: Waiting<HashKey, ()>,
     pending_hash: Vec<HashNeed>,
+    dirs: HashMap<CheckoutId, index::DirChildren>,
     status: StatusLedger,
 }
 
@@ -244,6 +245,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             crawl: Crawl::default(),
             hashing: Waiting::new(Stage::Hashing),
             pending_hash: Vec::new(),
+            dirs: HashMap::new(),
             status: StatusLedger::default(),
         })
     }
@@ -352,6 +354,30 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.crawl.runnable()
     }
 
+    /// Leftover dir-list pages must not enqueue more asks while a fulfill is
+    /// in flight. Rescan hashing can still step; those announces are not pages.
+    pub fn should_step_crawl(&self, serving: bool) -> bool {
+        self.crawl.runnable() && !(serving && self.crawl.has_pages())
+    }
+
+    fn write_index(
+        &mut self,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+        leaf: Option<&FileMetadata>,
+        last_synced: index::LastSynced,
+    ) -> Result<(), SlaveError> {
+        index::commit_leaf_with(
+            &self.store,
+            ck,
+            path,
+            leaf,
+            last_synced,
+            self.dirs.entry(ck.clone()).or_default(),
+        )
+        .map_err(SlaveError::index)
+    }
+
     pub fn crawl_step(&mut self) -> Result<Vec<ProtocolMessage>, SlaveError> {
         let plan = self.step_crawl(STEP_BUDGET)?;
         self.pending_hash.extend(plan.hash);
@@ -424,6 +450,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
 
         for id in &plan.removed {
             if let Some(checkout) = self.checkouts.remove(id) {
+                self.dirs.remove(&checkout.id);
                 self.store
                     .delete_checkout(&checkout.id)
                     .map_err(SlaveError::index)?;
@@ -907,17 +934,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             .arm(to.clone(), hash);
         apply::rename_live(&local, &from_rel, &to_rel, &to_new)?;
         let ck = self.checkout(checkout_id)?.id.clone();
-        index::commit_leaf(&self.store, &ck, &from, None, index::LastSynced::AdoptLeaf)
-            .map_err(SlaveError::index)?;
+        self.write_index(&ck, &from, None, index::LastSynced::AdoptLeaf)?;
         self.index_ancestors(checkout_id, &to)?;
-        index::commit_leaf(
-            &self.store,
-            &ck,
-            &to,
-            Some(&to_new),
-            index::LastSynced::AdoptLeaf,
-        )
-        .map_err(SlaveError::index)?;
+        self.write_index(&ck, &to, Some(&to_new), index::LastSynced::AdoptLeaf)?;
         if to_new.kind == EntryKind::Dir {
             self.reindex_descendants(checkout_id, &to, index::LastSynced::AdoptLeaf)?;
         }
@@ -1050,14 +1069,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.index_ancestors(checkout_id, &path)?;
         apply::replace_live(&local, &relative, &new, body, previous.as_ref())?;
         let ck = self.checkout(checkout_id)?.id.clone();
-        index::commit_leaf(
-            &self.store,
-            &ck,
-            &path,
-            Some(&new),
-            index::LastSynced::AdoptLeaf,
-        )
-        .map_err(SlaveError::index)?;
+        self.write_index(&ck, &path, Some(&new), index::LastSynced::AdoptLeaf)?;
         Ok(Reply::Send(Vec::new()))
     }
 
@@ -1144,14 +1156,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             }
         }
         let ck = self.checkout(checkout_id)?.id.clone();
-        index::commit_leaf(
-            &self.store,
-            &ck,
-            path,
-            Some(new),
-            index::LastSynced::AdoptLeaf,
-        )
-        .map_err(SlaveError::index)?;
+        self.write_index(&ck, path, Some(new), index::LastSynced::AdoptLeaf)?;
         Ok(())
     }
 
@@ -1170,8 +1175,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         };
         apply::remove_live(&local, &relative)?;
         let ck = self.checkout(checkout_id)?.id.clone();
-        index::commit_leaf(&self.store, &ck, path, None, index::LastSynced::AdoptLeaf)
-            .map_err(SlaveError::index)?;
+        self.write_index(&ck, path, None, index::LastSynced::AdoptLeaf)?;
         Ok(())
     }
 
@@ -1348,14 +1352,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         let ck = self.checkout(checkout_id)?.id.clone();
         if self.meta(checkout_id, path)?.is_none() {
             self.index_ancestors(checkout_id, path)?;
-            index::commit_leaf(
-                &self.store,
-                &ck,
-                path,
-                Some(&found),
-                index::LastSynced::Keep,
-            )
-            .map_err(SlaveError::index)?;
+            self.write_index(&ck, path, Some(&found), index::LastSynced::Keep)?;
         }
         Ok(())
     }
@@ -1698,14 +1695,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         if self.meta(checkout_id, &path)?.as_ref() != Some(&found) {
             let ck = self.checkout(checkout_id)?.id.clone();
             self.index_ancestors(checkout_id, &path)?;
-            index::commit_leaf(
-                &self.store,
-                &ck,
-                &path,
-                Some(&found),
-                index::LastSynced::Keep,
-            )
-            .map_err(SlaveError::index)?;
+            self.write_index(&ck, &path, Some(&found), index::LastSynced::Keep)?;
         }
         Ok(vec![ProtocolMessage::FileAnnounce {
             checkout_id: checkout_id.into(),
@@ -1767,14 +1757,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         }
         let ck = self.checkout(checkout_id)?.id.clone();
         self.index_ancestors(checkout_id, &path)?;
-        index::commit_leaf(
-            &self.store,
-            &ck,
-            &path,
-            Some(&found),
-            index::LastSynced::Keep,
-        )
-        .map_err(SlaveError::index)?;
+        self.write_index(&ck, &path, Some(&found), index::LastSynced::Keep)?;
         Ok(HashPlan::send(vec![ProtocolMessage::FileAnnounce {
             checkout_id: checkout_id.into(),
             path,
@@ -1841,11 +1824,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         };
 
         let ck = self.checkout(checkout_id)?.id.clone();
-        index::commit_leaf(&self.store, &ck, &from, None, index::LastSynced::Keep)
-            .map_err(SlaveError::index)?;
+        self.write_index(&ck, &from, None, index::LastSynced::Keep)?;
         self.index_ancestors(checkout_id, &to)?;
-        index::commit_leaf(&self.store, &ck, &to, Some(&found), index::LastSynced::Keep)
-            .map_err(SlaveError::index)?;
+        self.write_index(&ck, &to, Some(&found), index::LastSynced::Keep)?;
         if found.kind == EntryKind::Dir {
             self.reindex_descendants(checkout_id, &to, index::LastSynced::Keep)?;
         }
@@ -1877,8 +1858,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             if &path == dir {
                 continue;
             }
-            index::commit_leaf(&self.store, &ck, &path, Some(&found), last_synced)
-                .map_err(SlaveError::index)?;
+            self.write_index(&ck, &path, Some(&found), last_synced)?;
         }
         Ok(())
     }
@@ -1967,8 +1947,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         let last_synced = self.last_synced(checkout_id, path)?;
         let basis = last_synced.unwrap_or_else(|| file_node(&previous));
         let ck = self.checkout(checkout_id)?.id.clone();
-        index::commit_leaf(&self.store, &ck, path, None, index::LastSynced::Keep)
-            .map_err(SlaveError::index)?;
+        self.write_index(&ck, path, None, index::LastSynced::Keep)?;
         Ok(vec![ProtocolMessage::Delete {
             checkout_id: checkout_id.into(),
             path: path.clone(),
@@ -2009,14 +1988,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             let Some(found) = meta::collect_from_path(&host).map_err(SlaveError::io(&host))? else {
                 continue;
             };
-            index::commit_leaf(
-                &self.store,
-                &ck,
-                &dir,
-                Some(&found),
-                index::LastSynced::AdoptLeaf,
-            )
-            .map_err(SlaveError::index)?;
+            self.write_index(&ck, &dir, Some(&found), index::LastSynced::AdoptLeaf)?;
         }
         Ok(())
     }

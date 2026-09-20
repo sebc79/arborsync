@@ -66,7 +66,7 @@ No `slave_subscriptions` table. Active interest is process memory, rebuilt from 
 
 ## Transactions
 
-Specified: one batch per debounce window, per accepted CAS, or per reconcile directory. Slave `rescan` uses one `commit_leaves` batch for every create, update, and local delete the walk found. Watcher events and apply still use one `commit_leaf` per path. The master keeps a `DirChildren` map so each later `commit_leaf` recomputes a directory from loaded children instead of `range_meta` of every descendant. Origin `CasAccept` writes `last_synced` in a following batch. Order inside a `commit_leaf` / `commit_leaves` batch:
+Specified: one batch per debounce window, per accepted CAS, or per reconcile directory. Slave `rescan` uses one `commit_leaves` batch for every create, update, and local delete the walk found. Watcher events and apply still use one `commit_leaf` per path. The master and the slave each keep a `DirChildren` map so each later `commit_leaf` recomputes a directory from loaded children instead of `range_meta` of every descendant. Origin `CasAccept` writes `last_synced` in a following batch. Order inside a `commit_leaf` / `commit_leaves` batch:
 
 1. Apply leaf `meta` / deletes. A directory remove and a non-dir leaf both drop the path prefix so descendants cannot remain.
 2. Recompute and `put_dir_node` for each affected ancestor, root-ward.
