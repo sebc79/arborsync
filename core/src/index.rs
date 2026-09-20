@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Bound;
 
 use crate::hash::{DirNode, SubtreeRoot};
 use crate::merkle::{
-    DirChild, dir_entry_hash_off, dir_entry_len, dir_node, dir_node_from_concat, empty_dir_node,
-    encode_dir_entry, file_node,
+    DirChild, dir_entry_hash_off, dir_node, dir_node_from_concat, empty_dir_node, encode_dir_entry,
+    file_node,
 };
 use crate::meta::{EntryKind, FileMetadata};
 use crate::path::{CanonicalPath, EntryName};
@@ -33,6 +32,7 @@ pub struct DirChildren {
 struct DirKids {
     by_name: BTreeMap<EntryName, ChildSlot>,
     concat: Vec<u8>,
+    concat_stale: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +54,7 @@ impl DirKids {
         for (slot, off) in self.by_name.values_mut().zip(offsets) {
             slot.encode_off = off;
         }
+        self.concat_stale = false;
     }
 
     fn set_hash(&mut self, name: &EntryName, node: &[u8; 32]) {
@@ -61,6 +62,9 @@ impl DirKids {
             return;
         };
         slot.node = *node;
+        if self.concat_stale {
+            return;
+        }
         let hash_off = slot.encode_off + dir_entry_hash_off(name);
         self.concat[hash_off..hash_off + 32].copy_from_slice(node);
     }
@@ -77,62 +81,24 @@ impl DirKids {
             self.set_hash(&name, node);
             return;
         }
-        if self.by_name.contains_key(&name) {
-            self.splice_out(&name);
-        }
-        self.splice_in(name, path, kind, node);
-    }
-
-    fn remove_path(&mut self, path: &CanonicalPath) {
-        let Ok(name) = EntryName::parse(path.name()) else {
-            return;
-        };
-        self.splice_out(&name);
-    }
-
-    fn splice_in(
-        &mut self,
-        name: EntryName,
-        path: CanonicalPath,
-        kind: EntryKind,
-        node: &[u8; 32],
-    ) {
-        let encode_off = self
-            .by_name
-            .range((Bound::Excluded(&name), Bound::Unbounded))
-            .next()
-            .map(|(_, slot)| slot.encode_off)
-            .unwrap_or(self.concat.len());
-        let mut entry = Vec::with_capacity(dir_entry_len(&name));
-        encode_dir_entry(&mut entry, kind, &name, node);
-        let added = entry.len();
-        self.concat.splice(encode_off..encode_off, entry);
-        for (other, slot) in self.by_name.iter_mut() {
-            if other > &name {
-                slot.encode_off += added;
-            }
-        }
         self.by_name.insert(
             name,
             ChildSlot {
                 path,
                 kind,
                 node: *node,
-                encode_off,
+                encode_off: 0,
             },
         );
+        self.concat_stale = true;
     }
 
-    fn splice_out(&mut self, name: &EntryName) {
-        let Some(slot) = self.by_name.remove(name) else {
+    fn remove_path(&mut self, path: &CanonicalPath) {
+        let Ok(name) = EntryName::parse(path.name()) else {
             return;
         };
-        let len = dir_entry_len(name);
-        self.concat.drain(slot.encode_off..slot.encode_off + len);
-        for (other, other_slot) in self.by_name.iter_mut() {
-            if other > name {
-                other_slot.encode_off -= len;
-            }
+        if self.by_name.remove(&name).is_some() {
+            self.concat_stale = true;
         }
     }
 
@@ -216,7 +182,7 @@ impl DirChildren {
             let before = kids.by_name.len();
             kids.by_name.retain(|_, slot| !prefix.covers(&slot.path));
             if kids.by_name.len() != before {
-                kids.rebuild_concat();
+                kids.concat_stale = true;
             }
             true
         });
@@ -227,11 +193,14 @@ impl DirChildren {
         }
     }
 
-    fn hash_dir(&self, dir: &CanonicalPath) -> DirNode {
-        match self.by_parent.get(dir) {
-            Some(kids) => dir_node_from_concat(&kids.concat),
-            None => empty_dir_node(),
+    fn hash_dir(&mut self, dir: &CanonicalPath) -> DirNode {
+        let Some(kids) = self.by_parent.get_mut(dir) else {
+            return empty_dir_node();
+        };
+        if kids.concat_stale {
+            kids.rebuild_concat();
         }
+        dir_node_from_concat(&kids.concat)
     }
 
     fn set_child_node(&mut self, parent: &CanonicalPath, child: &CanonicalPath, node: DirNode) {
@@ -816,6 +785,73 @@ mod tests {
                     EntryKind::File as u8,
                     "z".into(),
                     *file_node(&file(1)).as_bytes(),
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn cached_batch_reverse_inserts_match_dir_node() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::new("src");
+        let dir = p("/src");
+        let dir_meta = FileMetadata::directory(0, 0o040755);
+        let z = p("/src/z");
+        let m = p("/src/m");
+        let a = p("/src/a");
+        let z_meta = file(1);
+        let m_meta = file(2);
+        let a_meta = file(3);
+        let mut cache = DirChildren::default();
+        commit_leaf_with(
+            &store,
+            &ck,
+            &dir,
+            Some(&dir_meta),
+            LastSynced::Keep,
+            &mut cache,
+        )
+        .unwrap();
+        commit_leaves_with(
+            &store,
+            &ck,
+            [
+                LeafChange {
+                    path: &z,
+                    meta: Some(&z_meta),
+                    last_synced: LastSynced::Keep,
+                },
+                LeafChange {
+                    path: &m,
+                    meta: Some(&m_meta),
+                    last_synced: LastSynced::Keep,
+                },
+                LeafChange {
+                    path: &a,
+                    meta: Some(&a_meta),
+                    last_synced: LastSynced::Keep,
+                },
+            ],
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(
+            store.get_dir_node(&ck, &dir).unwrap(),
+            Some(expected_dir_node(vec![
+                (
+                    EntryKind::File as u8,
+                    "a".into(),
+                    *file_node(&a_meta).as_bytes(),
+                ),
+                (
+                    EntryKind::File as u8,
+                    "m".into(),
+                    *file_node(&m_meta).as_bytes(),
+                ),
+                (
+                    EntryKind::File as u8,
+                    "z".into(),
+                    *file_node(&z_meta).as_bytes(),
                 ),
             ]))
         );

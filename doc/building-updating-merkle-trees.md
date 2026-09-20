@@ -57,7 +57,7 @@ On a changed path `P` (file, symlink, or directory metadata):
 
 1. Re-read metadata; recompute `FileNode` or, for a directory, recompute `DirNode` from current children.
 2. Write `meta` (and new `DirNode` if `P` is a dir).
-3. Walk parents from `dirname(P)` to the tree root (checkout `central` on a slave; `/` on the master). For each parent, reload children from the index (not a full FS walk), recompute `DirNode`, write it. Master apply and slave announce keep those child lists in `DirChildren` after the first load so a long inbound copy or rescan does not `range_meta` the whole tree on every file. The cache keeps children ordered by UTF-8 name and keeps the spec concat. A later sibling patches that child's 32-byte hash. Insert and delete splice one encoded entry. The other names stay encoded. Then the parent BLAKE3s the concat.
+3. Walk parents from `dirname(P)` to the tree root (checkout `central` on a slave; `/` on the master). For each parent, reload children from the index (not a full FS walk), recompute `DirNode`, write it. Master apply and slave announce keep those child lists in `DirChildren` after the first load so a long inbound copy or rescan does not `range_meta` the whole tree on every file. The cache keeps children ordered by UTF-8 name and keeps the spec concat. A later sibling patches that child's 32-byte hash. Insert and delete mark the concat stale. The commit rebuilds it once per directory. Then the parent BLAKE3s the concat.
 4. Commit one write batch covering the leaf change and every ancestor `DirNode`. Several hashed slave announces in one session turn share that batch.
 
 Insert: new `meta` row, then ancestor recompute.  

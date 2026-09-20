@@ -123,10 +123,6 @@ pub(crate) fn dir_entry_hash_off(name: &EntryName) -> usize {
     1 + 4 + name.as_str().len()
 }
 
-pub(crate) fn dir_entry_len(name: &EntryName) -> usize {
-    dir_entry_hash_off(name) + 32
-}
-
 pub(crate) fn dir_node_from_concat(buf: &[u8]) -> DirNode {
     DirNode::from_bytes(*blake3::hash(buf).as_bytes())
 }
