@@ -23,9 +23,6 @@ pub struct LeafChange<'a> {
 
 /// Direct children of each loaded directory. Lives across `commit_leaf_with`
 /// calls so later ancestor hashes do not `range_meta` the whole tree.
-/// Kids stay ordered by UTF-8 name. The spec concat lives next to them so a
-/// later sibling announce patches one child hash instead of sorting and
-/// encoding the whole directory again.
 #[derive(Clone, Debug, Default)]
 pub struct DirChildren {
     by_parent: HashMap<CanonicalPath, DirKids>,
