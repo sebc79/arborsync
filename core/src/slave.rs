@@ -29,6 +29,15 @@ use crate::watch::LocalEvent;
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
 
+struct StagedAnnounce {
+    checkout_id: String,
+    ck: CheckoutId,
+    path: CanonicalPath,
+    found: FileMetadata,
+    last_synced: Option<FileNode>,
+    dirty: bool,
+}
+
 #[derive(Debug)]
 pub enum Reply {
     Send(Vec<ProtocolMessage>),
@@ -367,12 +376,25 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         leaf: Option<&FileMetadata>,
         last_synced: index::LastSynced,
     ) -> Result<(), SlaveError> {
-        index::commit_leaf_with(
+        self.write_indexes(
+            ck,
+            [index::LeafChange {
+                path,
+                meta: leaf,
+                last_synced,
+            }],
+        )
+    }
+
+    fn write_indexes<'a>(
+        &mut self,
+        ck: &CheckoutId,
+        changes: impl IntoIterator<Item = index::LeafChange<'a>>,
+    ) -> Result<(), SlaveError> {
+        index::commit_leaves_with(
             &self.store,
             ck,
-            path,
-            leaf,
-            last_synced,
+            changes,
             self.dirs.entry(ck.clone()).or_default(),
         )
         .map_err(SlaveError::index)
@@ -677,30 +699,45 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     }
 
     pub fn commit_hashed(&mut self, done: HashDone) -> Result<Vec<ProtocolMessage>, SlaveError> {
-        self.hashing.remove(&done.key);
-        let HashKey::Checkout { id, path } = done.key else {
-            return Ok(Vec::new());
-        };
-        self.finish_rescan_hash(&id, &path, &done.outcome);
-        match done.outcome {
-            HashOutcome::File(found) => {
-                if self.meta(&id, &path)?.as_ref() == Some(&found) {
-                    return Ok(Vec::new());
+        self.commit_hashed_batch([done])
+    }
+
+    pub fn commit_hashed_batch(
+        &mut self,
+        dones: impl IntoIterator<Item = HashDone>,
+    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        let mut out = Vec::new();
+        let mut staged = Vec::new();
+        for done in dones {
+            self.hashing.remove(&done.key);
+            let HashKey::Checkout { id, path } = done.key else {
+                continue;
+            };
+            self.finish_rescan_hash(&id, &path, &done.outcome);
+            match done.outcome {
+                HashOutcome::File(found) => {
+                    if self.meta(&id, &path)?.as_ref() == Some(&found) {
+                        continue;
+                    }
+                    let current = self.meta(&id, &path)?;
+                    if current.as_ref() != done.previous.as_ref() {
+                        let plan = self.note_changed(&id, path)?;
+                        self.pending_hash.extend(plan.hash);
+                        out.extend(plan.send);
+                        continue;
+                    }
+                    if let Some(row) = self.stage_announce(&id, path, found)? {
+                        staged.push(row);
+                    }
                 }
-                let current = self.meta(&id, &path)?;
-                if current.as_ref() != done.previous.as_ref() {
-                    let plan = self.note_changed(&id, path)?;
-                    self.pending_hash.extend(plan.hash);
-                    return Ok(plan.send);
+                HashOutcome::Absent => out.extend(self.note_removed(&id, &path)?),
+                HashOutcome::Io(kind) => {
+                    log::warn!("hash {}: {kind}", path.as_str());
                 }
-                self.announce_live(&id, path, found)
-            }
-            HashOutcome::Absent => self.note_removed(&id, &path),
-            HashOutcome::Io(kind) => {
-                log::warn!("hash {}: {kind}", path.as_str());
-                Ok(Vec::new())
             }
         }
+        out.extend(self.commit_staged(staged)?);
+        Ok(out)
     }
 
     fn drain_plan(&mut self, plan: HashPlan) -> Result<Vec<ProtocolMessage>, SlaveError> {
@@ -713,14 +750,16 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         let mut out = Vec::new();
         let mut jobs = jobs;
         loop {
-            for need in jobs {
-                self.start_hashed(&need.key);
-                out.extend(self.commit_hashed(need.run())?);
-            }
-            jobs = self.take_hash_jobs();
             if jobs.is_empty() {
                 break;
             }
+            let mut dones = Vec::with_capacity(jobs.len());
+            for need in jobs {
+                self.start_hashed(&need.key);
+                dones.push(need.run());
+            }
+            out.extend(self.commit_hashed_batch(dones)?);
+            jobs = self.take_hash_jobs();
         }
         Ok(out)
     }
@@ -1677,32 +1716,78 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         path: CanonicalPath,
         found: FileMetadata,
     ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        let Some(row) = self.stage_announce(checkout_id, path, found)? else {
+            return Ok(Vec::new());
+        };
+        self.commit_staged(vec![row])
+    }
+
+    fn stage_announce(
+        &mut self,
+        checkout_id: &str,
+        path: CanonicalPath,
+        found: FileMetadata,
+    ) -> Result<Option<StagedAnnounce>, SlaveError> {
         let central = self.checkout(checkout_id)?.central.clone();
         if is_reserved(&central, &path) {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         if self
             .checkout_mut(checkout_id)?
             .inflight
             .consume_if_echo(&path, &found.content_hash)
         {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let last_synced = self.last_synced(checkout_id, &path)?;
         if last_synced == Some(file_node(&found)) {
-            return Ok(Vec::new());
+            return Ok(None);
         }
-        if self.meta(checkout_id, &path)?.as_ref() != Some(&found) {
-            let ck = self.checkout(checkout_id)?.id.clone();
-            self.index_ancestors(checkout_id, &path)?;
-            self.write_index(&ck, &path, Some(&found), index::LastSynced::Keep)?;
-        }
-        Ok(vec![ProtocolMessage::FileAnnounce {
+        let dirty = self.meta(checkout_id, &path)?.as_ref() != Some(&found);
+        let ck = self.checkout(checkout_id)?.id.clone();
+        Ok(Some(StagedAnnounce {
             checkout_id: checkout_id.into(),
+            ck,
             path,
-            new: found,
-            basis: last_synced,
-        }])
+            found,
+            last_synced,
+            dirty,
+        }))
+    }
+
+    fn commit_staged(
+        &mut self,
+        staged: Vec<StagedAnnounce>,
+    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        for row in staged.iter().filter(|row| row.dirty) {
+            self.index_ancestors(&row.checkout_id, &row.path)?;
+        }
+        let mut by_ck: HashMap<CheckoutId, Vec<usize>> = HashMap::new();
+        for (i, row) in staged.iter().enumerate() {
+            if row.dirty {
+                by_ck.entry(row.ck.clone()).or_default().push(i);
+            }
+        }
+        for (ck, idxs) in by_ck {
+            let changes: Vec<index::LeafChange<'_>> = idxs
+                .iter()
+                .map(|&i| index::LeafChange {
+                    path: &staged[i].path,
+                    meta: Some(&staged[i].found),
+                    last_synced: index::LastSynced::Keep,
+                })
+                .collect();
+            self.write_indexes(&ck, changes)?;
+        }
+        Ok(staged
+            .into_iter()
+            .map(|row| ProtocolMessage::FileAnnounce {
+                checkout_id: row.checkout_id,
+                path: row.path,
+                new: row.found,
+                basis: row.last_synced,
+            })
+            .collect())
     }
 
     fn note_metadata(
