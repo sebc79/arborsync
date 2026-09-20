@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::hash::{DirNode, SubtreeRoot};
+use crate::hash::{DirNode, FileNode, SubtreeRoot};
 use crate::merkle::{DirChild, dir_node, empty_dir_node, file_node};
 use crate::meta::{EntryKind, FileMetadata};
 use crate::path::{CanonicalPath, EntryName};
@@ -20,9 +20,35 @@ pub struct LeafChange<'a> {
 
 /// Direct children of each loaded directory. Lives across `commit_leaf_with`
 /// calls so later ancestor hashes do not `range_meta` the whole tree.
+/// Each file or symlink row keeps its `FileNode` and `EntryName` so a later
+/// sibling announce does not BLAKE3 every child again.
 #[derive(Clone, Debug, Default)]
 pub struct DirChildren {
-    by_parent: HashMap<CanonicalPath, HashMap<CanonicalPath, FileMetadata>>,
+    by_parent: HashMap<CanonicalPath, HashMap<CanonicalPath, CachedChild>>,
+}
+
+#[derive(Clone, Debug)]
+enum CachedChild {
+    File { name: EntryName, node: FileNode },
+    Symlink { name: EntryName, node: FileNode },
+    Dir { name: EntryName },
+}
+
+impl CachedChild {
+    fn try_new(path: &CanonicalPath, meta: &FileMetadata) -> Option<Self> {
+        let name = EntryName::parse(path.name()).ok()?;
+        Some(match meta.kind {
+            EntryKind::File => Self::File {
+                name,
+                node: file_node(meta),
+            },
+            EntryKind::Symlink => Self::Symlink {
+                name,
+                node: file_node(meta),
+            },
+            EntryKind::Dir => Self::Dir { name },
+        })
+    }
 }
 
 impl DirChildren {
@@ -39,6 +65,10 @@ impl DirChildren {
             .range_meta(ck, dir)?
             .into_iter()
             .filter(|(path, _)| path.parent().as_ref() == Some(dir))
+            .filter_map(|(path, meta)| {
+                let child = CachedChild::try_new(&path, &meta)?;
+                Some((path, child))
+            })
             .collect();
         self.by_parent.insert(dir.clone(), kids);
         Ok(())
@@ -49,7 +79,9 @@ impl DirChildren {
             Some(meta) if meta.kind == EntryKind::Dir => {
                 if let Some(parent) = path.parent() {
                     if let Some(kids) = self.by_parent.get_mut(&parent) {
-                        kids.insert(path.clone(), meta.clone());
+                        if let Some(child) = CachedChild::try_new(path, meta) {
+                            kids.insert(path.clone(), child);
+                        }
                     }
                 }
                 self.by_parent.entry(path.clone()).or_default();
@@ -58,7 +90,9 @@ impl DirChildren {
                 self.drop_tree(path);
                 if let Some(parent) = path.parent() {
                     if let Some(kids) = self.by_parent.get_mut(&parent) {
-                        kids.insert(path.clone(), meta.clone());
+                        if let Some(child) = CachedChild::try_new(path, meta) {
+                            kids.insert(path.clone(), child);
+                        }
                     }
                 }
             }
@@ -92,21 +126,18 @@ impl DirChildren {
             return Ok(Vec::new());
         };
         let mut entries = Vec::with_capacity(kids.len());
-        for (path, meta) in kids {
-            let Ok(name) = EntryName::parse(path.name()) else {
-                continue;
-            };
-            entries.push(match meta.kind {
-                EntryKind::File => DirChild::File {
-                    name,
-                    node: file_node(meta),
+        for (path, child) in kids {
+            entries.push(match child {
+                CachedChild::File { name, node } => DirChild::File {
+                    name: name.clone(),
+                    node: *node,
                 },
-                EntryKind::Symlink => DirChild::Symlink {
-                    name,
-                    node: file_node(meta),
+                CachedChild::Symlink { name, node } => DirChild::Symlink {
+                    name: name.clone(),
+                    node: *node,
                 },
-                EntryKind::Dir => DirChild::Directory {
-                    name,
+                CachedChild::Dir { name } => DirChild::Directory {
+                    name: name.clone(),
                     node: match computed.get(path) {
                         Some(node) => *node,
                         None => store.get_dir_node(ck, path)?.unwrap_or_else(empty_dir_node),
