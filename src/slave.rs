@@ -27,7 +27,7 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use quinn::Connection;
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::reload::{apply_file_log_level, spawn_config_watch};
 
@@ -48,6 +48,7 @@ enum WatchStop {
 struct HashPump {
     inflight: usize,
     queued: VecDeque<HashNeed>,
+    held: Vec<HashDone>,
     done_tx: UnboundedSender<HashDone>,
 }
 
@@ -74,9 +75,18 @@ impl HashPump {
         }
     }
 
-    fn finish_n(&mut self, slave: &SharedSlave, n: usize) {
-        self.inflight = self.inflight.saturating_sub(n);
-        self.kick(slave);
+    fn absorb_ready(&mut self, first: HashDone, rx: &mut UnboundedReceiver<HashDone>) {
+        self.held.push(first);
+        self.inflight = self.inflight.saturating_sub(1);
+        while self.held.len() < HASH_DONE_BATCH {
+            match rx.try_recv() {
+                Ok(more) => {
+                    self.held.push(more);
+                    self.inflight = self.inflight.saturating_sub(1);
+                }
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -313,6 +323,7 @@ async fn session(
     let mut hasher = HashPump {
         inflight: 0,
         queued: VecDeque::new(),
+        held: Vec::new(),
         done_tx: hash_tx,
     };
     let mut outbound = Outbound::new(urgent_tx, walk_tx.clone(), bulk_tx);
@@ -342,25 +353,24 @@ async fn session(
             }
             Some(err) = write_err_rx.recv() => return Err(err.into()),
             Some(done) = hash_rx.recv() => {
-                let mut dones = vec![done];
-                while dones.len() < HASH_DONE_BATCH {
-                    match hash_rx.try_recv() {
-                        Ok(more) => dones.push(more),
-                        Err(_) => break,
-                    }
-                }
-                let n = dones.len();
-                let outs = slave.lock().expect("slave").commit_hashed_batch(dones)?;
-                outbound.enqueue(outs)?;
-                hasher.finish_n(slave, n);
+                hasher.absorb_ready(done, &mut hash_rx);
+                hasher.kick(slave);
                 offer_pending_hashes(slave, &mut hasher);
-                if slave.lock().expect("slave").should_step_crawl(outbound.serving()) {
-                    match slave.lock().expect("slave").crawl_step() {
-                        Ok(outs) => outbound.enqueue(outs)?,
-                        Err(SlaveError::UnknownCheckout(_)) => {}
-                        Err(err) => return Err(err.into()),
-                    }
+                if !hasher.held.is_empty()
+                    && (hasher.held.len() >= HASH_DONE_BATCH || hasher.inflight == 0)
+                {
+                    let dones = std::mem::take(&mut hasher.held);
+                    let outs = slave.lock().expect("slave").commit_hashed_batch(dones)?;
+                    outbound.enqueue(outs)?;
                     offer_pending_hashes(slave, &mut hasher);
+                    if slave.lock().expect("slave").should_step_crawl(outbound.serving()) {
+                        match slave.lock().expect("slave").crawl_step() {
+                            Ok(outs) => outbound.enqueue(outs)?,
+                            Err(SlaveError::UnknownCheckout(_)) => {}
+                            Err(err) => return Err(err.into()),
+                        }
+                        offer_pending_hashes(slave, &mut hasher);
+                    }
                 }
             }
             _ = wait_if_should_crawl(slave, outbound.serving()) => {
