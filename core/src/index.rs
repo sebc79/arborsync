@@ -18,7 +18,7 @@ pub struct LeafChange<'a> {
     pub last_synced: LastSynced,
 }
 
-/// Direct children of each loaded directory. Lives across `commit_leaf`
+/// Direct children of each loaded directory. Lives across `commit_leaf_with`
 /// calls so later ancestor hashes do not `range_meta` the whole tree.
 #[derive(Clone, Debug, Default)]
 pub struct DirChildren {
@@ -120,23 +120,6 @@ impl DirChildren {
 
 /// Commit one leaf and every directory hash it changes in a single batch.
 /// `leaf` of `None` removes the path and, for a directory, everything under it.
-pub fn commit_leaf<S: Storage>(
-    store: &S,
-    ck: &CheckoutId,
-    path: &CanonicalPath,
-    leaf: Option<&FileMetadata>,
-    last_synced: LastSynced,
-) -> Result<(), S::Error> {
-    commit_leaf_with(
-        store,
-        ck,
-        path,
-        leaf,
-        last_synced,
-        &mut DirChildren::default(),
-    )
-}
-
 pub fn commit_leaf_with<S: Storage>(
     store: &S,
     ck: &CheckoutId,
@@ -374,17 +357,34 @@ mod tests {
         FileMetadata::file(1, 0, 0o100644, ContentHash::from_bytes([byte; 32]))
     }
 
+    fn commit_cold<S: Storage>(
+        store: &S,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+        leaf: Option<&FileMetadata>,
+        last_synced: LastSynced,
+    ) -> Result<(), S::Error> {
+        commit_leaf_with(
+            store,
+            ck,
+            path,
+            leaf,
+            last_synced,
+            &mut DirChildren::default(),
+        )
+    }
+
     #[test]
     fn keep_leaves_last_synced_untouched_when_local_meta_changes() {
         let store = MemoryStorage::new();
         let ck = CheckoutId::new("src");
         let path = p("/src/foo.rs");
         let first = file(1);
-        commit_leaf(&store, &ck, &path, Some(&first), LastSynced::AdoptLeaf).unwrap();
+        commit_cold(&store, &ck, &path, Some(&first), LastSynced::AdoptLeaf).unwrap();
         let committed = store.get_last_synced(&ck, &path).unwrap().unwrap();
 
         let edited = file(2);
-        commit_leaf(&store, &ck, &path, Some(&edited), LastSynced::Keep).unwrap();
+        commit_cold(&store, &ck, &path, Some(&edited), LastSynced::Keep).unwrap();
         assert_eq!(store.get_meta(&ck, &path).unwrap().unwrap(), edited);
         assert_eq!(store.get_last_synced(&ck, &path).unwrap(), Some(committed));
         assert_eq!(
@@ -400,14 +400,14 @@ mod tests {
         let ck = CheckoutId::new("src");
         let path = p("/src/nested");
         let dir = FileMetadata::directory(0, 0o040755);
-        commit_leaf(&store, &ck, &path, Some(&dir), LastSynced::AdoptLeaf).unwrap();
+        commit_cold(&store, &ck, &path, Some(&dir), LastSynced::AdoptLeaf).unwrap();
         assert_eq!(
             store.get_last_synced(&ck, &path).unwrap(),
             Some(file_node(&dir))
         );
 
         let edited = FileMetadata::directory(1, 0o040700);
-        commit_leaf(&store, &ck, &path, Some(&edited), LastSynced::Keep).unwrap();
+        commit_cold(&store, &ck, &path, Some(&edited), LastSynced::Keep).unwrap();
         assert_eq!(store.get_meta(&ck, &path).unwrap().unwrap(), edited);
         assert_eq!(
             store.get_last_synced(&ck, &path).unwrap(),
@@ -422,18 +422,18 @@ mod tests {
         let dir_path = p("/src/nested");
         let child = p("/src/nested/child.txt");
         let dir = FileMetadata::directory(0, 0o040755);
-        commit_leaf(&store, &ck, &dir_path, Some(&dir), LastSynced::AdoptLeaf).unwrap();
-        commit_leaf(&store, &ck, &child, Some(&file(1)), LastSynced::AdoptLeaf).unwrap();
+        commit_cold(&store, &ck, &dir_path, Some(&dir), LastSynced::AdoptLeaf).unwrap();
+        commit_cold(&store, &ck, &child, Some(&file(1)), LastSynced::AdoptLeaf).unwrap();
         assert_eq!(store.get_meta(&ck, &child).unwrap().unwrap(), file(1));
 
         let leaf = file(2);
-        commit_leaf(&store, &ck, &dir_path, Some(&leaf), LastSynced::AdoptLeaf).unwrap();
+        commit_cold(&store, &ck, &dir_path, Some(&leaf), LastSynced::AdoptLeaf).unwrap();
         assert_eq!(store.get_meta(&ck, &child).unwrap(), None);
         assert_eq!(store.get_meta(&ck, &dir_path).unwrap().unwrap(), leaf);
     }
 
     #[test]
-    fn commit_leaves_matches_repeated_commit_leaf() {
+    fn commit_leaves_matches_repeated_cold_commits() {
         let sequential = MemoryStorage::new();
         let batched = MemoryStorage::new();
         let ck = CheckoutId::new("src");
@@ -443,9 +443,9 @@ mod tests {
             .map(|i| (p(&format!("/src/f{i:02}")), file(i as u8 + 1)))
             .collect();
 
-        commit_leaf(&sequential, &ck, &dir, Some(&dir_meta), LastSynced::Keep).unwrap();
+        commit_cold(&sequential, &ck, &dir, Some(&dir_meta), LastSynced::Keep).unwrap();
         for (path, meta) in &files {
-            commit_leaf(&sequential, &ck, path, Some(meta), LastSynced::Keep).unwrap();
+            commit_cold(&sequential, &ck, path, Some(meta), LastSynced::Keep).unwrap();
         }
 
         let mut changes = vec![LeafChange {
@@ -489,9 +489,9 @@ mod tests {
             .map(|i| (p(&format!("/src/f{i:02}")), file(i as u8 + 1)))
             .collect();
 
-        commit_leaf(&cold, &ck, &dir, Some(&dir_meta), LastSynced::Keep).unwrap();
+        commit_cold(&cold, &ck, &dir, Some(&dir_meta), LastSynced::Keep).unwrap();
         for (path, meta) in &files {
-            commit_leaf(&cold, &ck, path, Some(meta), LastSynced::Keep).unwrap();
+            commit_cold(&cold, &ck, path, Some(meta), LastSynced::Keep).unwrap();
         }
 
         let mut cache = DirChildren::default();
