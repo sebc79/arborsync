@@ -101,13 +101,30 @@ pub fn dir_node(entries: &[DirChild]) -> DirNode {
     let mut buf = Vec::new();
     for child in sorted {
         let (kind, name, node_hash) = child.parts();
-        buf.push(u8::from(kind));
-        let name_bytes = name.as_str().as_bytes();
-        buf.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
-        buf.extend_from_slice(name_bytes);
-        buf.extend_from_slice(node_hash);
+        encode_dir_entry(&mut buf, kind, name, node_hash);
     }
-    DirNode::from_bytes(*blake3::hash(&buf).as_bytes())
+    dir_node_from_concat(&buf)
+}
+
+pub(crate) fn encode_dir_entry(
+    buf: &mut Vec<u8>,
+    kind: EntryKind,
+    name: &EntryName,
+    node: &[u8; 32],
+) {
+    buf.push(u8::from(kind));
+    let name_bytes = name.as_str().as_bytes();
+    buf.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(name_bytes);
+    buf.extend_from_slice(node);
+}
+
+pub(crate) fn dir_entry_hash_off(name: &EntryName) -> usize {
+    1 + 4 + name.as_str().len()
+}
+
+pub(crate) fn dir_node_from_concat(buf: &[u8]) -> DirNode {
+    DirNode::from_bytes(*blake3::hash(buf).as_bytes())
 }
 
 /// Empty directory hash is `BLAKE3("")`.
