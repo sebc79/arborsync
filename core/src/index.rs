@@ -1,7 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::hash::{DirNode, FileNode, SubtreeRoot};
-use crate::merkle::{DirChild, dir_node, empty_dir_node, file_node};
+use crate::hash::{DirNode, SubtreeRoot};
+use crate::merkle::{
+    DirChild, dir_entry_hash_off, dir_node, dir_node_from_concat, empty_dir_node, encode_dir_entry,
+    file_node,
+};
 use crate::meta::{EntryKind, FileMetadata};
 use crate::path::{CanonicalPath, EntryName};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
@@ -20,34 +23,84 @@ pub struct LeafChange<'a> {
 
 /// Direct children of each loaded directory. Lives across `commit_leaf_with`
 /// calls so later ancestor hashes do not `range_meta` the whole tree.
-/// Each file or symlink row keeps its `FileNode` and `EntryName` so a later
-/// sibling announce does not BLAKE3 every child again.
 #[derive(Clone, Debug, Default)]
 pub struct DirChildren {
-    by_parent: HashMap<CanonicalPath, HashMap<CanonicalPath, CachedChild>>,
+    by_parent: HashMap<CanonicalPath, DirKids>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DirKids {
+    by_name: BTreeMap<EntryName, ChildSlot>,
+    concat: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
-enum CachedChild {
-    File { name: EntryName, node: FileNode },
-    Symlink { name: EntryName, node: FileNode },
-    Dir { name: EntryName },
+struct ChildSlot {
+    path: CanonicalPath,
+    kind: EntryKind,
+    node: [u8; 32],
+    encode_off: usize,
 }
 
-impl CachedChild {
-    fn try_new(path: &CanonicalPath, meta: &FileMetadata) -> Option<Self> {
+impl DirKids {
+    fn rebuild_concat(&mut self) {
+        self.concat.clear();
+        let mut offsets = Vec::with_capacity(self.by_name.len());
+        for (name, slot) in &self.by_name {
+            offsets.push(self.concat.len());
+            encode_dir_entry(&mut self.concat, slot.kind, name, &slot.node);
+        }
+        for (slot, off) in self.by_name.values_mut().zip(offsets) {
+            slot.encode_off = off;
+        }
+    }
+
+    fn set_hash(&mut self, name: &EntryName, node: &[u8; 32]) {
+        let Some(slot) = self.by_name.get_mut(name) else {
+            return;
+        };
+        slot.node = *node;
+        let hash_off = slot.encode_off + dir_entry_hash_off(name);
+        self.concat[hash_off..hash_off + 32].copy_from_slice(node);
+    }
+
+    fn upsert(&mut self, path: CanonicalPath, kind: EntryKind, node: &[u8; 32]) {
+        let Ok(name) = EntryName::parse(path.name()) else {
+            return;
+        };
+        if self
+            .by_name
+            .get(&name)
+            .is_some_and(|slot| slot.kind == kind)
+        {
+            self.set_hash(&name, node);
+            return;
+        }
+        self.by_name.remove(&name);
+        self.by_name.insert(
+            name,
+            ChildSlot {
+                path,
+                kind,
+                node: *node,
+                encode_off: 0,
+            },
+        );
+        self.rebuild_concat();
+    }
+
+    fn remove_path(&mut self, path: &CanonicalPath) {
+        let Ok(name) = EntryName::parse(path.name()) else {
+            return;
+        };
+        if self.by_name.remove(&name).is_some() {
+            self.rebuild_concat();
+        }
+    }
+
+    fn kind_of(&self, path: &CanonicalPath) -> Option<EntryKind> {
         let name = EntryName::parse(path.name()).ok()?;
-        Some(match meta.kind {
-            EntryKind::File => Self::File {
-                name,
-                node: file_node(meta),
-            },
-            EntryKind::Symlink => Self::Symlink {
-                name,
-                node: file_node(meta),
-            },
-            EntryKind::Dir => Self::Dir { name },
-        })
+        self.by_name.get(&name).map(|slot| slot.kind)
     }
 }
 
@@ -61,15 +114,32 @@ impl DirChildren {
         if self.by_parent.contains_key(dir) {
             return Ok(());
         }
-        let kids = store
-            .range_meta(ck, dir)?
-            .into_iter()
-            .filter(|(path, _)| path.parent().as_ref() == Some(dir))
-            .filter_map(|(path, meta)| {
-                let child = CachedChild::try_new(&path, &meta)?;
-                Some((path, child))
-            })
-            .collect();
+        let mut kids = DirKids::default();
+        for (path, meta) in store.range_meta(ck, dir)? {
+            if path.parent().as_ref() != Some(dir) {
+                continue;
+            }
+            let Ok(name) = EntryName::parse(path.name()) else {
+                continue;
+            };
+            let node = match meta.kind {
+                EntryKind::File | EntryKind::Symlink => *file_node(&meta).as_bytes(),
+                EntryKind::Dir => *store
+                    .get_dir_node(ck, &path)?
+                    .unwrap_or_else(empty_dir_node)
+                    .as_bytes(),
+            };
+            kids.by_name.insert(
+                name,
+                ChildSlot {
+                    path,
+                    kind: meta.kind,
+                    node,
+                    encode_off: 0,
+                },
+            );
+        }
+        kids.rebuild_concat();
         self.by_parent.insert(dir.clone(), kids);
         Ok(())
     }
@@ -79,20 +149,20 @@ impl DirChildren {
             Some(meta) if meta.kind == EntryKind::Dir => {
                 if let Some(parent) = path.parent() {
                     if let Some(kids) = self.by_parent.get_mut(&parent) {
-                        if let Some(child) = CachedChild::try_new(path, meta) {
-                            kids.insert(path.clone(), child);
+                        if kids.kind_of(path) != Some(EntryKind::Dir) {
+                            kids.upsert(path.clone(), EntryKind::Dir, empty_dir_node().as_bytes());
                         }
                     }
                 }
                 self.by_parent.entry(path.clone()).or_default();
             }
             Some(meta) => {
-                self.drop_tree(path);
+                if self.by_parent.contains_key(path) {
+                    self.drop_tree(path);
+                }
                 if let Some(parent) = path.parent() {
                     if let Some(kids) = self.by_parent.get_mut(&parent) {
-                        if let Some(child) = CachedChild::try_new(path, meta) {
-                            kids.insert(path.clone(), child);
-                        }
+                        kids.upsert(path.clone(), meta.kind, file_node(meta).as_bytes());
                     }
                 }
             }
@@ -105,47 +175,35 @@ impl DirChildren {
             if prefix.covers(dir) {
                 return false;
             }
-            kids.retain(|path, _| !prefix.covers(path));
+            let before = kids.by_name.len();
+            kids.by_name.retain(|_, slot| !prefix.covers(&slot.path));
+            if kids.by_name.len() != before {
+                kids.rebuild_concat();
+            }
             true
         });
         if let Some(parent) = prefix.parent() {
             if let Some(kids) = self.by_parent.get_mut(&parent) {
-                kids.remove(prefix);
+                kids.remove_path(prefix);
             }
         }
     }
 
-    fn children<S: Storage>(
-        &self,
-        store: &S,
-        ck: &CheckoutId,
-        dir: &CanonicalPath,
-        computed: &HashMap<CanonicalPath, DirNode>,
-    ) -> Result<Vec<DirChild>, S::Error> {
-        let Some(kids) = self.by_parent.get(dir) else {
-            return Ok(Vec::new());
-        };
-        let mut entries = Vec::with_capacity(kids.len());
-        for (path, child) in kids {
-            entries.push(match child {
-                CachedChild::File { name, node } => DirChild::File {
-                    name: name.clone(),
-                    node: *node,
-                },
-                CachedChild::Symlink { name, node } => DirChild::Symlink {
-                    name: name.clone(),
-                    node: *node,
-                },
-                CachedChild::Dir { name } => DirChild::Directory {
-                    name: name.clone(),
-                    node: match computed.get(path) {
-                        Some(node) => *node,
-                        None => store.get_dir_node(ck, path)?.unwrap_or_else(empty_dir_node),
-                    },
-                },
-            });
+    fn hash_dir(&self, dir: &CanonicalPath) -> DirNode {
+        match self.by_parent.get(dir) {
+            Some(kids) => dir_node_from_concat(&kids.concat),
+            None => empty_dir_node(),
         }
-        Ok(entries)
+    }
+
+    fn set_child_node(&mut self, parent: &CanonicalPath, child: &CanonicalPath, node: DirNode) {
+        let Some(kids) = self.by_parent.get_mut(parent) else {
+            return;
+        };
+        let Ok(name) = EntryName::parse(child.name()) else {
+            return;
+        };
+        kids.set_hash(&name, node.as_bytes());
     }
 }
 
@@ -202,7 +260,6 @@ pub fn commit_leaves_with<'a, S: Storage>(
         cache.ensure_loaded(store, ck, dir)?;
     }
 
-    let mut computed: HashMap<CanonicalPath, DirNode> = HashMap::new();
     let mut batch = store.begin_write()?;
 
     for change in &changes {
@@ -214,8 +271,10 @@ pub fn commit_leaves_with<'a, S: Storage>(
     dirty.sort_by_key(|path| std::cmp::Reverse(depth(path)));
 
     for dir in dirty {
-        let node = dir_node(&cache.children(store, ck, &dir, &computed)?);
-        computed.insert(dir.clone(), node);
+        let node = cache.hash_dir(&dir);
+        if let Some(parent) = dir.parent() {
+            cache.set_child_node(&parent, &dir, node);
+        }
         batch.put_dir_node(ck, &dir, node)?;
     }
     batch.commit()
@@ -382,7 +441,7 @@ fn children_of<S: Storage>(
 mod tests {
     use super::*;
     use crate::hash::ContentHash;
-    use crate::test_support::{MemoryStorage, p};
+    use crate::test_support::{MemoryStorage, expected_dir_node, p};
 
     fn file(byte: u8) -> FileMetadata {
         FileMetadata::file(1, 0, 0o100644, ContentHash::from_bytes([byte; 32]))
@@ -603,6 +662,69 @@ mod tests {
         assert_eq!(
             store.get_meta(&ck, &p("/src/other.txt")).unwrap().unwrap(),
             file(3)
+        );
+    }
+
+    #[test]
+    fn cached_sibling_update_keeps_utf8_order() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::new("src");
+        let dir = p("/src");
+        let dir_meta = FileMetadata::directory(0, 0o040755);
+        let zeta = p("/src/ζed");
+        let alpha = p("/src/alpha");
+        let mut cache = DirChildren::default();
+        commit_leaf_with(
+            &store,
+            &ck,
+            &dir,
+            Some(&dir_meta),
+            LastSynced::Keep,
+            &mut cache,
+        )
+        .unwrap();
+        commit_leaf_with(
+            &store,
+            &ck,
+            &zeta,
+            Some(&file(2)),
+            LastSynced::Keep,
+            &mut cache,
+        )
+        .unwrap();
+        commit_leaf_with(
+            &store,
+            &ck,
+            &alpha,
+            Some(&file(1)),
+            LastSynced::Keep,
+            &mut cache,
+        )
+        .unwrap();
+        commit_leaf_with(
+            &store,
+            &ck,
+            &alpha,
+            Some(&file(9)),
+            LastSynced::Keep,
+            &mut cache,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.get_dir_node(&ck, &dir).unwrap(),
+            Some(expected_dir_node(vec![
+                (
+                    EntryKind::File as u8,
+                    "ζed".into(),
+                    *file_node(&file(2)).as_bytes(),
+                ),
+                (
+                    EntryKind::File as u8,
+                    "alpha".into(),
+                    *file_node(&file(9)).as_bytes(),
+                ),
+            ]))
         );
     }
 }
