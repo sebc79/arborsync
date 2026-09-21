@@ -245,3 +245,54 @@ impl<'de> Deserialize<'de> for WorkerCountSpec {
         deserializer.deserialize_any(WorkerCountVisitor)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::bottleneck::{Stage, Waiting};
+
+    fn admission(n: usize) -> FulfillAdmission {
+        FulfillAdmission::new(FulfillCap(
+            NonZeroUsize::new(n).expect("fulfill cap is at least 1"),
+        ))
+    }
+
+    #[test]
+    fn admits_while_under_the_inflight_cap() {
+        let hop = admission(4);
+        assert!(hop.admits(0, false, Some(1)));
+        assert!(hop.admits(3, false, Some(1)));
+        assert!(!hop.admits(4, false, Some(1)));
+    }
+
+    #[test]
+    fn a_second_large_file_waits_for_the_first() {
+        let hop = admission(4);
+        assert!(!hop.admits(1, true, Some(FulfillAdmission::LARGE_BYTES)));
+        assert!(hop.admits(1, true, Some(1)));
+        assert!(hop.admits(1, false, Some(FulfillAdmission::LARGE_BYTES)));
+    }
+
+    #[test]
+    fn missing_size_is_not_treated_as_large() {
+        let hop = admission(4);
+        assert!(hop.admits(1, true, None));
+    }
+
+    #[test]
+    fn kick_picks_the_oldest_small_ask_from_cached_sizes() {
+        let origin = Instant::now();
+        let hop = admission(4);
+        let mut parked: Waiting<u32, Option<u64>> = Waiting::new(Stage::FulfillParked);
+        parked.insert(0, Some(FulfillAdmission::LARGE_BYTES), origin);
+        for i in 1..=22_000 {
+            parked.insert(i, Some(1), origin + Duration::from_micros(u64::from(i)));
+        }
+        let key = parked
+            .oldest_key_where(|_, size| hop.admits(1, true, *size))
+            .copied();
+        assert_eq!(key, Some(1));
+    }
+}
