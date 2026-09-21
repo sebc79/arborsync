@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -9,7 +9,9 @@ use anyhow::Context;
 use arborsync_core::ReloadError;
 use arborsync_core::hashing::HashNeed;
 use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
-use arborsync_core::master::{FulfillPlan, Master, Reply, WholeFileLater, survey_central};
+use arborsync_core::master::{
+    FulfillPlan, Master, PreparedDelete, Reply, WholeFileLater, reclaim_tree, survey_central,
+};
 use arborsync_core::path::host_to_canonical;
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::storage::Storage;
@@ -20,6 +22,7 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use quinn::{Connection, Incoming};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::reload::{apply_file_log_level, spawn_config_watch};
@@ -274,7 +277,22 @@ async fn accept_session(
         }
     });
     let mut tick = tokio::time::interval(Duration::from_millis(50));
+    let wipe_ready = Arc::new(Notify::new());
+    let mut parked: VecDeque<ProtocolMessage> = VecDeque::new();
+    let drive = SessionDrive {
+        master: &master,
+        peer,
+        slave_id: &slave_id,
+        conn: &conn,
+        write_tx: &write_tx,
+        limiter: &limiter,
+        ip,
+        wipe_ready: &wipe_ready,
+    };
     loop {
+        if drain_parked(&drive, &mut parked).await? {
+            break;
+        }
         tokio::select! {
             _ = stop_rx.changed() => {
                 if *stop_rx.borrow() {
@@ -283,61 +301,10 @@ async fn accept_session(
             }
             msg = Connection::read_control(&mut recv) => {
                 let msg = msg?;
-                if let ProtocolMessage::SignatureRequest {
-                    checkout_id,
-                    path,
-                    want_hash,
-                    signature,
-                } = msg
-                {
-                    let plan = master.lock().expect("master").plan_fulfill(
-                        peer,
-                        checkout_id,
-                        path,
-                        want_hash,
-                        signature,
-                    )?;
-                    match plan {
-                        FulfillPlan::Send(out) => {
-                            if dispatch_master(
-                                &master,
-                                peer,
-                                &slave_id,
-                                &conn,
-                                &write_tx,
-                                Reply::Send(out),
-                                &limiter,
-                                ip,
-                            )? {
-                                break;
-                            }
-                        }
-                        job @ FulfillPlan::BulkHost { .. } => {
-                            let conn = conn.clone();
-                            tokio::spawn(async move {
-                                match tokio::task::spawn_blocking(move || job.run()).await {
-                                    Ok(Ok(Reply::Bulk(xfer))) => {
-                                        if let Err(err) = conn.write_bulk(&xfer).await {
-                                            log::warn!("master bulk send: {err:#}");
-                                        }
-                                    }
-                                    Ok(Ok(Reply::Send(out))) => {
-                                        log::warn!("master fulfill: {out:?}");
-                                    }
-                                    Ok(Ok(Reply::Hangup { reason, .. })) => {
-                                        log::warn!("master fulfill hangup: {reason}");
-                                    }
-                                    Ok(Err(err)) => log::warn!("master fulfill: {err}"),
-                                    Err(err) => log::warn!("master fulfill join: {err}"),
-                                }
-                            });
-                        }
-                    }
-                } else {
-                    let reply = master.lock().expect("master").handle(peer, msg)?;
-                    if dispatch_master(&master, peer, &slave_id, &conn, &write_tx, reply, &limiter, ip)? {
-                        break;
-                    }
+                if control_waits(&master, &msg) {
+                    parked.push_back(msg);
+                } else if drive_control(&drive, &mut parked, msg).await? {
+                    break;
                 }
             }
             incoming = conn.accept_uni() => {
@@ -352,6 +319,7 @@ async fn accept_session(
                 master.lock().expect("master").observe_gauge(peer, &frame);
             }
             Some(err) = write_err_rx.recv() => return Err(err.into()),
+            _ = wipe_ready.notified() => {}
             _ = tick.tick() => flush_outbox(&master, peer, &write_tx)?,
         }
     }
@@ -361,6 +329,186 @@ async fn accept_session(
         master.lock().expect("master").disconnect(peer);
     }
     Ok(())
+}
+
+struct SessionDrive<'a> {
+    master: &'a SharedMaster,
+    peer: [u8; 32],
+    slave_id: &'a str,
+    conn: &'a quinn::Connection,
+    write_tx: &'a UnboundedSender<Vec<ProtocolMessage>>,
+    limiter: &'a Mutex<AttemptLimiter>,
+    ip: std::net::IpAddr,
+    wipe_ready: &'a Arc<Notify>,
+}
+
+fn control_waits(master: &SharedMaster, msg: &ProtocolMessage) -> bool {
+    let guard = master.lock().expect("master");
+    match msg {
+        ProtocolMessage::FileAnnounce { path, .. } | ProtocolMessage::Delete { path, .. } => {
+            guard.overlaps_wipe(path)
+        }
+        ProtocolMessage::Rename { from, to, .. } => {
+            guard.overlaps_wipe(from) || guard.overlaps_wipe(to)
+        }
+        _ => false,
+    }
+}
+
+async fn drain_parked(
+    drive: &SessionDrive<'_>,
+    parked: &mut VecDeque<ProtocolMessage>,
+) -> anyhow::Result<bool> {
+    let mut index = 0;
+    while index < parked.len() {
+        if control_waits(drive.master, &parked[index]) {
+            index += 1;
+            continue;
+        }
+        let msg = parked.remove(index).expect("parked index");
+        if drive_control(drive, parked, msg).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn drive_control(
+    drive: &SessionDrive<'_>,
+    parked: &mut VecDeque<ProtocolMessage>,
+    msg: ProtocolMessage,
+) -> anyhow::Result<bool> {
+    if control_waits(drive.master, &msg) {
+        parked.push_back(msg);
+        return Ok(false);
+    }
+    if let ProtocolMessage::SignatureRequest {
+        checkout_id,
+        path,
+        want_hash,
+        signature,
+    } = msg
+    {
+        let plan = drive.master.lock().expect("master").plan_fulfill(
+            drive.peer,
+            checkout_id,
+            path,
+            want_hash,
+            signature,
+        )?;
+        return match plan {
+            FulfillPlan::Send(out) => dispatch_master(
+                drive.master,
+                drive.peer,
+                drive.slave_id,
+                drive.conn,
+                drive.write_tx,
+                Reply::Send(out),
+                drive.limiter,
+                drive.ip,
+            ),
+            job @ FulfillPlan::BulkHost { .. } => {
+                let conn = drive.conn.clone();
+                tokio::spawn(async move {
+                    match tokio::task::spawn_blocking(move || job.run()).await {
+                        Ok(Ok(Reply::Bulk(xfer))) => {
+                            if let Err(err) = conn.write_bulk(&xfer).await {
+                                log::warn!("master bulk send: {err:#}");
+                            }
+                        }
+                        Ok(Ok(Reply::Send(out))) => {
+                            log::warn!("master fulfill: {out:?}");
+                        }
+                        Ok(Ok(Reply::Hangup { reason, .. })) => {
+                            log::warn!("master fulfill hangup: {reason}");
+                        }
+                        Ok(Err(err)) => log::warn!("master fulfill: {err}"),
+                        Err(err) => log::warn!("master fulfill join: {err}"),
+                    }
+                });
+                Ok(false)
+            }
+        };
+    }
+
+    if let ProtocolMessage::Delete {
+        checkout_id,
+        path,
+        basis,
+    } = msg
+    {
+        let prepared = drive.master.lock().expect("master").prepare_delete(
+            drive.peer,
+            checkout_id,
+            path,
+            basis,
+        )?;
+        return match prepared {
+            PreparedDelete::Later {
+                checkout_id,
+                path,
+                basis,
+            } => {
+                parked.push_back(ProtocolMessage::Delete {
+                    checkout_id,
+                    path,
+                    basis,
+                });
+                Ok(false)
+            }
+            PreparedDelete::Reply(out) => dispatch_master(
+                drive.master,
+                drive.peer,
+                drive.slave_id,
+                drive.conn,
+                drive.write_tx,
+                Reply::Send(out),
+                drive.limiter,
+                drive.ip,
+            ),
+            PreparedDelete::Reclaim { reply, root, path } => {
+                let hangup = dispatch_master(
+                    drive.master,
+                    drive.peer,
+                    drive.slave_id,
+                    drive.conn,
+                    drive.write_tx,
+                    Reply::Send(reply),
+                    drive.limiter,
+                    drive.ip,
+                )?;
+                let master = drive.master.clone();
+                let ready = drive.wipe_ready.clone();
+                let logged = path.clone();
+                tokio::spawn(async move {
+                    match tokio::task::spawn_blocking(move || reclaim_tree(&root, &path)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => log::warn!("reclaim {}: {err}", logged.as_str()),
+                        Err(err) => log::warn!("reclaim {}: {err}", logged.as_str()),
+                    }
+                    master.lock().expect("master").finish_wipe(&logged);
+                    ready.notify_waiters();
+                });
+                Ok(hangup)
+            }
+        };
+    }
+
+    let reply = drive
+        .master
+        .lock()
+        .expect("master")
+        .handle(drive.peer, msg)?;
+    dispatch_master(
+        drive.master,
+        drive.peer,
+        drive.slave_id,
+        drive.conn,
+        drive.write_tx,
+        reply,
+        drive.limiter,
+        drive.ip,
+    )
 }
 
 fn dispatch_master(

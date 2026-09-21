@@ -6,7 +6,8 @@ use arborsync_core::keys::format_hex_key;
 use std::collections::BTreeMap;
 
 use arborsync_core::master::{
-    CasDecision, CentralWalk, Master, MemoryContent, Reply, WholeFileLater, decide_cas,
+    CasDecision, CentralWalk, Master, MemoryContent, PreparedDelete, Reply, WholeFileLater,
+    decide_cas, reclaim_tree,
 };
 use arborsync_core::merkle::{self, DirChild, file_node};
 use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};
@@ -1806,4 +1807,103 @@ fn adopt_survey_drops_a_file_that_is_gone() {
     std::fs::remove_file(sandbox.central_root().join("gone.txt")).unwrap();
     master.adopt_survey(ready_with(&master, &[])).unwrap();
     assert!(master.meta(&p("/gone.txt")).unwrap().is_none());
+}
+
+#[test]
+fn directory_delete_reclaims_off_the_index_commit() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let directory = dir();
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/big"),
+                new: directory.clone(),
+                basis: None,
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept {
+            file_node: node, ..
+        }) => {
+            assert_eq!(node, Some(file_node(&directory)));
+        }
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    std::fs::create_dir(sandbox.central_root().join("src/big/leaf")).unwrap();
+
+    let PreparedDelete::Reclaim { reply, root, path } = master
+        .prepare_delete(ALICE, "src".into(), p("/src/big"), file_node(&directory))
+        .unwrap()
+    else {
+        panic!("expected reclaim");
+    };
+    assert!(matches!(
+        reply,
+        ProtocolMessage::CasAccept {
+            file_node: None,
+            ..
+        }
+    ));
+    assert!(master.meta(&p("/src/big")).unwrap().is_none());
+    assert!(sandbox.central_root().join("src/big/leaf").is_dir());
+
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/other"),
+                new: directory.clone(),
+                basis: None,
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept { .. }) => {}
+        other => panic!("expected sibling CasAccept, got {other:?}"),
+    }
+    assert!(sandbox.central_root().join("src/other").is_dir());
+    assert!(master.overlaps_wipe(&p("/src/big/leaf")));
+    assert!(!master.overlaps_wipe(&p("/src/other")));
+    assert!(matches!(
+        master
+            .prepare_delete(ALICE, "src".into(), p("/src"), file_node(&directory))
+            .unwrap(),
+        PreparedDelete::Later { .. }
+    ));
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/big/again"),
+                new: directory,
+                basis: None,
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::Error { code, .. }) => assert_eq!(code, "wiping"),
+        other => panic!("expected wiping, got {other:?}"),
+    }
+
+    master.rescan().unwrap();
+    assert!(master.meta(&p("/src/big")).unwrap().is_none());
+    assert!(master.meta(&p("/src/big/leaf")).unwrap().is_none());
+    assert!(sandbox.central_root().join("src/big/leaf").is_dir());
+    assert!(master.meta(&p("/src/other")).unwrap().is_some());
+
+    reclaim_tree(&root, &path).unwrap();
+    master.finish_wipe(&path);
+    assert!(!sandbox.central_root().join("src/big").exists());
+    assert!(!master.overlaps_wipe(&p("/src/big")));
+    assert!(master.meta(&p("/src/other")).unwrap().is_some());
 }
