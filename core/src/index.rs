@@ -613,6 +613,39 @@ mod tests {
     }
 
     #[test]
+    fn commit_leaves_of_a_wide_directory_finishes() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::new("src");
+        let dir = p("/src");
+        let dir_meta = FileMetadata::directory(0, 0o040755);
+        let files: Vec<(CanonicalPath, FileMetadata)> = (0..8_000)
+            .map(|i| (p(&format!("/src/f{i:05}")), file((i % 200) as u8 + 1)))
+            .collect();
+        let mut changes = vec![LeafChange {
+            path: &dir,
+            meta: Some(&dir_meta),
+            last_synced: LastSynced::Keep,
+        }];
+        changes.extend(files.iter().map(|(path, meta)| LeafChange {
+            path,
+            meta: Some(meta),
+            last_synced: LastSynced::Keep,
+        }));
+        let started = std::time::Instant::now();
+        commit_leaves(&store, &ck, changes).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "wide directory commit took {elapsed:?}"
+        );
+        assert_ne!(
+            store.get_dir_node(&ck, &dir).unwrap(),
+            Some(empty_dir_node())
+        );
+        assert_eq!(store.range_meta(&ck, &dir).unwrap().len(), 8_001);
+    }
+
+    #[test]
     fn cached_commits_match_cold_commits() {
         let cold = MemoryStorage::new();
         let hot = MemoryStorage::new();
