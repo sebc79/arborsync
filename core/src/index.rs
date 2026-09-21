@@ -81,16 +81,53 @@ impl DirKids {
             self.set_hash(&name, node);
             return;
         }
+        if self.concat_stale || self.by_name.contains_key(&name) {
+            self.by_name.insert(
+                name,
+                ChildSlot {
+                    path,
+                    kind,
+                    node: *node,
+                    encode_off: 0,
+                },
+            );
+            self.concat_stale = true;
+            return;
+        }
+        self.splice_new(name, path, kind, *node);
+    }
+
+    fn splice_new(
+        &mut self,
+        name: EntryName,
+        path: CanonicalPath,
+        kind: EntryKind,
+        node: [u8; 32],
+    ) {
+        let mut encoded = Vec::new();
+        encode_dir_entry(&mut encoded, kind, &name, &node);
+        let added = encoded.len();
+        let off = self
+            .by_name
+            .range(&name..)
+            .next()
+            .map(|(_, slot)| slot.encode_off)
+            .unwrap_or(self.concat.len());
+        self.concat.splice(off..off, encoded);
+        for slot in self.by_name.values_mut() {
+            if slot.encode_off >= off {
+                slot.encode_off += added;
+            }
+        }
         self.by_name.insert(
             name,
             ChildSlot {
                 path,
                 kind,
-                node: *node,
-                encode_off: 0,
+                node,
+                encode_off: off,
             },
         );
-        self.concat_stale = true;
     }
 
     fn remove_path(&mut self, path: &CanonicalPath) {
@@ -732,6 +769,64 @@ mod tests {
                     *file_node(&file(9)).as_bytes(),
                 ),
             ]))
+        );
+    }
+
+    #[test]
+    fn wide_directory_out_of_order_inserts_match_one_batch() {
+        let ck = CheckoutId::new("src");
+        let dir = p("/src");
+        let dir_meta = FileMetadata::directory(0, 0o040755);
+        let metas: Vec<(CanonicalPath, FileMetadata)> = (0..64)
+            .map(|i| {
+                let name = format!("n{:04}", (i * 17) % 64);
+                (
+                    p(&format!("/src/{name}")),
+                    FileMetadata::file(
+                        i as u64 + 1,
+                        i as i64,
+                        0o100644,
+                        ContentHash::from_bytes([i as u8; 32]),
+                    ),
+                )
+            })
+            .collect();
+
+        let mut hot_changes = vec![LeafChange {
+            path: &dir,
+            meta: Some(&dir_meta),
+            last_synced: LastSynced::Keep,
+        }];
+        hot_changes.extend(metas.iter().map(|(path, meta)| LeafChange {
+            path,
+            meta: Some(meta),
+            last_synced: LastSynced::Keep,
+        }));
+        let batched = MemoryStorage::new();
+        commit_leaves(&batched, &ck, hot_changes).unwrap();
+
+        let hot = MemoryStorage::new();
+        let mut cache = DirChildren::default();
+        commit_leaf_with(
+            &hot,
+            &ck,
+            &dir,
+            Some(&dir_meta),
+            LastSynced::Keep,
+            &mut cache,
+        )
+        .unwrap();
+        for (path, meta) in &metas {
+            commit_leaf_with(&hot, &ck, path, Some(meta), LastSynced::Keep, &mut cache).unwrap();
+        }
+
+        assert_eq!(
+            hot.get_dir_node(&ck, &dir).unwrap(),
+            batched.get_dir_node(&ck, &dir).unwrap()
+        );
+        assert_eq!(
+            hot.get_dir_node(&ck, &p("/")).unwrap(),
+            batched.get_dir_node(&ck, &p("/")).unwrap()
         );
     }
 
