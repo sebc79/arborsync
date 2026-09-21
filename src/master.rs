@@ -9,7 +9,7 @@ use anyhow::Context;
 use arborsync_core::ReloadError;
 use arborsync_core::hashing::HashNeed;
 use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
-use arborsync_core::master::{FulfillPlan, Master, Reply, WholeFileLater};
+use arborsync_core::master::{FulfillPlan, Master, Reply, WholeFileLater, survey_central};
 use arborsync_core::path::host_to_canonical;
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::storage::Storage;
@@ -100,8 +100,9 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
             ) {
                 log::warn!("filesystem watcher stopped: {err}");
             }
-            if let Err(err) = watched.lock().expect("master").rescan() {
-                log::warn!("rescan failed: {err}");
+            match rescan_off_lock(&watched) {
+                Ok(plan) => submit_master_hashes(&rt, &watched, &hash_inflight, plan.hash),
+                Err(err) => log::warn!("rescan failed: {err}"),
             }
             log::warn!("rescanning and re-arming");
         }
@@ -426,6 +427,15 @@ fn enqueue_control(
         .map_err(|_| anyhow::anyhow!("control writer closed"))
 }
 
+fn rescan_off_lock(master: &SharedMaster) -> anyhow::Result<arborsync_core::HashPlan> {
+    let (root, store) = {
+        let guard = master.lock().expect("master");
+        (guard.central_root().to_path_buf(), guard.storage_handle())
+    };
+    let walk = survey_central(&root, &store)?;
+    Ok(master.lock().expect("master").adopt_survey(walk)?)
+}
+
 fn watch_central(
     master: &SharedMaster,
     debounce: Duration,
@@ -441,12 +451,7 @@ fn watch_central(
     debouncer
         .watch(&root, RecursiveMode::Recursive)
         .with_context(|| format!("watch {}", root.display()))?;
-    submit_master_hashes(
-        rt,
-        master,
-        hash_inflight,
-        master.lock().expect("master").plan_rescan()?.hash,
-    );
+    submit_master_hashes(rt, master, hash_inflight, rescan_off_lock(master)?.hash);
 
     loop {
         if watch_gen.load(Ordering::Relaxed) != start_gen {
@@ -456,12 +461,7 @@ fn watch_central(
             Ok(Ok(events)) => {
                 let (need_rescan, mapped) = crate::watch::classify(events);
                 if need_rescan {
-                    submit_master_hashes(
-                        rt,
-                        master,
-                        hash_inflight,
-                        master.lock().expect("master").plan_rescan()?.hash,
-                    );
+                    submit_master_hashes(rt, master, hash_inflight, rescan_off_lock(master)?.hash);
                 }
                 let locals = to_local_events(mapped, |host| host_to_canonical(&root, host).ok());
                 for event in locals {
@@ -471,19 +471,11 @@ fn watch_central(
             }
             Ok(Err(errs)) => {
                 log::warn!("watch error, rescanning: {errs:?}");
-                submit_master_hashes(
-                    rt,
-                    master,
-                    hash_inflight,
-                    master.lock().expect("master").plan_rescan()?.hash,
-                );
+                submit_master_hashes(rt, master, hash_inflight, rescan_off_lock(master)?.hash);
             }
-            Err(RecvTimeoutError::Timeout) => submit_master_hashes(
-                rt,
-                master,
-                hash_inflight,
-                master.lock().expect("master").plan_rescan()?.hash,
-            ),
+            Err(RecvTimeoutError::Timeout) => {
+                submit_master_hashes(rt, master, hash_inflight, rescan_off_lock(master)?.hash)
+            }
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }

@@ -3,8 +3,10 @@ use arborsync_core::LocalEvent;
 use arborsync_core::config::{ReloadError, SlaveAcl};
 use arborsync_core::hash::{ContentHash, FileNode};
 use arborsync_core::keys::format_hex_key;
+use std::collections::BTreeMap;
+
 use arborsync_core::master::{
-    CasDecision, Master, MemoryContent, Reply, WholeFileLater, decide_cas,
+    CasDecision, CentralWalk, Master, MemoryContent, Reply, WholeFileLater, decide_cas,
 };
 use arborsync_core::merkle::{self, DirChild, file_node};
 use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};
@@ -1733,4 +1735,75 @@ fn directory_cas_survives_when_dir_metadata_is_eperm() {
     }
     assert!(objects.is_dir());
     assert_eq!(master.meta(&path).unwrap().unwrap().kind, EntryKind::Dir);
+}
+
+fn ready_with(
+    master: &Master<MemoryStorage, MemoryContent>,
+    extra: &[(&str, FileMetadata)],
+) -> CentralWalk {
+    let mut ready = BTreeMap::new();
+    ready.insert(p("/"), master.meta(&p("/")).unwrap().unwrap());
+    for (path, meta) in extra {
+        ready.insert(p(path), meta.clone());
+    }
+    CentralWalk {
+        ready,
+        needs: Vec::new(),
+    }
+}
+
+#[test]
+fn adopt_survey_keeps_a_file_the_survey_missed() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("keep.txt", b"keep");
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("seen.txt", b"seen");
+    master.rescan().unwrap();
+    let seen = master.meta(&p("/seen.txt")).unwrap().unwrap();
+    master
+        .adopt_survey(ready_with(&master, &[("/seen.txt", seen)]))
+        .unwrap();
+    assert!(master.meta(&p("/keep.txt")).unwrap().is_some());
+}
+
+#[test]
+fn adopt_survey_does_not_overwrite_a_newer_row() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("edit.txt", b"old bytes");
+    master.rescan().unwrap();
+    let old = master.meta(&p("/edit.txt")).unwrap().unwrap();
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("edit.txt", b"newer bytes here");
+    master
+        .note_local(LocalEvent::Changed(p("/edit.txt")))
+        .unwrap();
+    let fresh = master.meta(&p("/edit.txt")).unwrap().unwrap();
+    master
+        .adopt_survey(ready_with(&master, &[("/edit.txt", old)]))
+        .unwrap();
+    assert_eq!(
+        master.meta(&p("/edit.txt")).unwrap().unwrap().content_hash,
+        fresh.content_hash
+    );
+}
+
+#[test]
+fn adopt_survey_drops_a_file_that_is_gone() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("gone.txt", b"gone");
+    master.rescan().unwrap();
+    std::fs::remove_file(sandbox.central_root().join("gone.txt")).unwrap();
+    master.adopt_survey(ready_with(&master, &[])).unwrap();
+    assert!(master.meta(&p("/gone.txt")).unwrap().is_none());
 }

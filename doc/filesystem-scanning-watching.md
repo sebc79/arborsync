@@ -52,8 +52,8 @@ Never announce when `FileNode(local) == last_synced`.
 
 The interval is `recv_timeout` on the notify channel (default 60 s). A busy tree postpones rescan.
 
-1. Full `stat` walk of `central_root` or the checkout `local` (`collecting-metadata.md`). Not "changed subtrees only."
-2. Compare to the index: missing on disk → local delete; missing in index → local create; size/mtime/kind differ → treat as write.
+1. Full `stat` walk of `central_root` or the checkout `local` (`collecting-metadata.md`). Not "changed subtrees only." The master watch thread stats and reads the index without the session mutex, then locks only to commit.
+2. Compare to the index: missing on disk → local delete; missing in index → local create; size/mtime/kind differ → treat as write. A master path is deleted only when a stat taken under the lock still says it is gone. A surveyed row is written only when that later stat still matches.
 3. Slave hashes again only when size, mtime, or kind disagree with the stored row (`collect_for_rescan`). Mode is not a miss. Master `walk_central` also uses `collect_for_rescan`.
 4. The session walks at most 64 names per `select!` turn so `status` and `read_control` stay live. A name that is new or changed in the index is `FileAnnounce`d in that turn. The slave holds hashed announces until 64 are ready or hashing workers are idle, then one `commit_leaves` writes them. `SubscribeAck` also sends the current `RootReport` before the walk finishes so leftover `DirList*` can start on rows already in the index. Leftover pages take the next turn when both a rescan and a page are queued. When the walk ends, one `commit_leaves` batch writes deletes and leftover diffs, then a `RootReport` (`spec.md` §10) pulls missed remote changes. `Slave::rescan` still drains the walk for tests. The watch thread only queues a rescan. It does not drain it. An announce after the index row already matches disk does not call `commit_leaf` again.
 
