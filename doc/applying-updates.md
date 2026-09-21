@@ -81,6 +81,8 @@ Do not compute a delta against a remembered remote snapshot. Do not put bodies i
 
 **Delete** applies only if local `FileNode == basis` (or `== last_synced`). Otherwise the slave sidecars local bytes if `content_hash` differs from the last-synced content, then deletes. A meta-only FileNode miss writes no sidecar. If local is already absent: no-op, clear `last_synced`. Dirs never sidecar on delete.
 
+Master `prepare_delete` commits the index and replies `CasAccept` before `remove_live` returns. The binary runs `remove_live` on `spawn_blocking`, off the session mutex. While that walk runs, `Master` keeps the canonical prefix in `wipes`. The watcher and rescan skip a path that prefix covers. `FileAnnounce`, `Delete`, and `Rename` that overlap the prefix stay queued on the connection until `finish_wipe`. Other paths proceed. If `remove_live` returns an error, the master logs it, drops the prefix, and the next rescan indexes files still on disk.
+
 **Rename** applies when `from` and `to` land in the same debounce window and the same checkout. The host path moves with `fs::rename`. Parent directories of `to` are created. Mode and mtime come from `to_new` (`filetime`, symlink times for symlinks). Children of a directory move with the rename. The index then shows those children under `to`.
 
 Master CAS accepts the delete of `from` (`FileNode == from_basis`) and the create of `to` (`to` absent). A miss on `from` is `CasReject { path: from }`. A live `to` is `CasReject { path: to }`. Success replies `CasAccept` on `to` and enqueues `CasAccept` on `from` with `file_node: None`. Fan-out is one `Rename` when a checkout covers both paths, `Delete` when it covers only `from`, and `FileAnnounce` create when it covers only `to`.
