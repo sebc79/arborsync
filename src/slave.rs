@@ -499,6 +499,11 @@ fn apply_live_slave_reload(
 type AskKey = (String, CanonicalPath, ContentHash);
 type IsLarge = bool;
 
+struct ParkedAsk {
+    msg: ProtocolMessage,
+    size: Option<u64>,
+}
+
 struct BulkDone {
     result: anyhow::Result<()>,
     key: AskKey,
@@ -508,7 +513,7 @@ struct BulkDone {
 struct Outbound {
     urgent_tx: UnboundedSender<ProtocolMessage>,
     walk_tx: UnboundedSender<ProtocolMessage>,
-    parked: Waiting<AskKey, ProtocolMessage>,
+    parked: Waiting<AskKey, ParkedAsk>,
     sending: Waiting<AskKey, IsLarge>,
     fulfilled_asks: HashSet<AskKey>,
     bulk_tx: UnboundedSender<BulkDone>,
@@ -558,15 +563,22 @@ impl Outbound {
         msg: ProtocolMessage,
     ) -> anyhow::Result<()> {
         if let Some(key) = signature_request_key(&msg) {
-            slave.lock().expect("slave").note_inbound(&msg);
+            let (admission, size) = {
+                let mut guard = slave.lock().expect("slave");
+                guard.note_inbound(&msg);
+                let size = guard.announced_size(&key.0, &key.1).ok().flatten();
+                let admission = guard.tune().fulfill_admission().expect("slave role");
+                (admission, size)
+            };
             if self.fulfilled_asks.contains(&key) || self.parked.get(&key).is_some() {
                 return Ok(());
             }
-            if !self.can_start(slave, &msg) {
-                self.parked.insert(key, msg, Instant::now());
+            if !self.admits(admission, size) {
+                self.parked
+                    .insert(key, ParkedAsk { msg, size }, Instant::now());
                 return Ok(());
             }
-            return self.start_ask(slave, conn, msg);
+            return self.start_ask(slave, conn, msg, size);
         }
         let reply = slave.lock().expect("slave").handle(msg)?;
         self.push_reply(conn, reply)
@@ -593,19 +605,11 @@ impl Outbound {
         }
     }
 
-    fn can_start(&self, slave: &SharedSlave, msg: &ProtocolMessage) -> bool {
-        let guard = slave.lock().expect("slave");
-        let admission = guard.tune().fulfill_admission().expect("slave role");
-        let next_size = match signature_request_key(msg) {
-            Some((checkout_id, path, _)) => {
-                guard.announced_size(&checkout_id, &path).ok().flatten()
-            }
-            None => Some(FulfillAdmission::LARGE_BYTES),
-        };
+    fn admits(&self, admission: FulfillAdmission, size: Option<u64>) -> bool {
         admission.admits(
             self.sending.len(),
             self.sending.values().any(|large| *large),
-            next_size,
+            size,
         )
     }
 
@@ -614,6 +618,7 @@ impl Outbound {
         slave: &SharedSlave,
         conn: &Connection,
         msg: ProtocolMessage,
+        size: Option<u64>,
     ) -> anyhow::Result<()> {
         let ProtocolMessage::SignatureRequest {
             checkout_id,
@@ -631,11 +636,7 @@ impl Outbound {
                 Err(SlaveError::UnknownCheckout(_)) => return Ok(()),
                 Err(err) => return Err(err.into()),
             };
-            let large = match guard.announced_size(&checkout_id, &path) {
-                Ok(size) => size.is_some_and(FulfillAdmission::is_large),
-                Err(SlaveError::UnknownCheckout(_)) => return Ok(()),
-                Err(err) => return Err(err.into()),
-            };
+            let large = size.is_some_and(FulfillAdmission::is_large);
             (host, large)
         };
         let key = (checkout_id.clone(), path.clone(), want_hash);
@@ -705,18 +706,36 @@ impl Outbound {
     }
 
     fn kick(&mut self, slave: &SharedSlave, conn: &Connection) -> anyhow::Result<()> {
+        let admission = slave
+            .lock()
+            .expect("slave")
+            .tune()
+            .fulfill_admission()
+            .expect("slave role");
         loop {
-            let Some(key) = self
-                .parked
-                .oldest_key_where(|_, msg| self.can_start(slave, msg))
-                .cloned()
-            else {
+            let Some(key) = next_parked_key(
+                &self.parked,
+                self.sending.len(),
+                self.sending.values().any(|large| *large),
+                admission,
+            ) else {
                 return Ok(());
             };
-            let msg = self.parked.remove(&key).expect("oldest parked ask");
-            self.start_ask(slave, conn, msg)?;
+            let ask = self.parked.remove(&key).expect("oldest parked ask");
+            self.start_ask(slave, conn, ask.msg, ask.size)?;
         }
     }
+}
+
+fn next_parked_key(
+    parked: &Waiting<AskKey, ParkedAsk>,
+    sending: usize,
+    any_large: bool,
+    admission: FulfillAdmission,
+) -> Option<AskKey> {
+    parked
+        .oldest_key_where(|_, ask| admission.admits(sending, any_large, ask.size))
+        .cloned()
 }
 
 fn signature_request_key(msg: &ProtocolMessage) -> Option<(String, CanonicalPath, ContentHash)> {

@@ -96,7 +96,7 @@ Reconnect backoff is hardcoded at 1 s, doubling, cap 60 s. `reconnect_initial_ms
 
 `[tune.fulfill_parked].inflight` is an integer from 1 through 64. The default is 4. Slave only. Master TOML that contains this table is `ConfigError::TuneNotOnRole`.
 
-Both knobs apply on SIGHUP. Hash admission and `can_start` read `Loaded*` after the cfg swap. There is no dedicated hash pool. There is no NixOS option for either key.
+Both knobs apply on SIGHUP. Hash admission and leftover `kick` read `Loaded*` after the cfg swap. There is no dedicated hash pool. There is no NixOS option for either key.
 
 `STEP_BUDGET`, `OUTBOX_BACKPRESSURE`, and the 16 MiB large-lane cutoff stay hardcoded.
 
@@ -110,7 +110,7 @@ Both knobs apply on SIGHUP. Hash admission and `can_start` read `Loaded*` after 
 
 ## Reload (SIGHUP)
 
-**Applied live:** `log_level`, `max_connection_attempts_per_minute`, `max_connections` (affects new accepts), `[[slaves]]` (add/remove rows, change `allowed_prefixes`, add rotation keys), slave `master_public_keys`, slave `checkouts` (add/remove per `spec.md` §3), debounce, rescan, and status intervals (the next window uses the new value), `[tune.hashing].workers`, and slave `[tune.fulfill_parked].inflight`. Watcher restart is only for debounce or rescan. A status interval change is read on the next tick. A worker or inflight change is read on the next hash admission or `can_start`.
+**Applied live:** `log_level`, `max_connection_attempts_per_minute`, `max_connections` (affects new accepts), `[[slaves]]` (add/remove rows, change `allowed_prefixes`, add rotation keys), slave `master_public_keys`, slave `checkouts` (add/remove per `spec.md` §3), debounce, rescan, and status intervals (the next window uses the new value), `[tune.hashing].workers`, and slave `[tune.fulfill_parked].inflight`. Watcher restart is only for debounce or rescan. A status interval change is read on the next tick. A worker or inflight change is read on the next hash admission or leftover `kick`.
 
 **Requires restart:** `listen_addr`, `db_path`, `central_root`, `master_addr`, `*_key_path`, and slave `slave_id`.
 
