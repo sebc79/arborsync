@@ -1,6 +1,7 @@
-//! One synchronous writer of `central_root` and the global index.
+//! One synchronous writer of the global index.
 //! The binary serializes QUIC, `notify`, and rate limits into
-//! [`Master::handle`], [`Master::note_local`], and [`Master::poll`].
+//! [`Master::handle`], [`Master::prepare_delete`], [`Master::note_local`],
+//! and [`Master::poll`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -86,6 +87,23 @@ pub enum Reply {
     Send(ProtocolMessage),
     Hangup { reason: String, rate_limit: bool },
     Bulk(BulkTransfer),
+}
+
+/// `Reclaim` means the index commit and `CasAccept` already happened. The
+/// caller deletes the live tree, then [`Master::finish_wipe`].
+#[derive(Debug)]
+pub enum PreparedDelete {
+    Reply(ProtocolMessage),
+    Later {
+        checkout_id: String,
+        path: CanonicalPath,
+        basis: FileNode,
+    },
+    Reclaim {
+        reply: ProtocolMessage,
+        root: PathBuf,
+        path: CanonicalPath,
+    },
 }
 
 pub enum FulfillPlan {
@@ -446,6 +464,40 @@ pub struct CentralWalk {
     pub needs: Vec<HashNeed>,
 }
 
+struct WipeSet {
+    paths: Vec<CanonicalPath>,
+}
+
+impl WipeSet {
+    fn overlaps(&self, path: &CanonicalPath) -> bool {
+        self.paths
+            .iter()
+            .any(|wipe| wipe.covers(path) || path.covers(wipe))
+    }
+
+    fn covers(&self, path: &CanonicalPath) -> bool {
+        self.paths.iter().any(|wipe| wipe.covers(path))
+    }
+
+    fn start(&mut self, path: CanonicalPath) {
+        self.paths.push(path);
+    }
+
+    fn finish(&mut self, path: &CanonicalPath) {
+        self.paths.retain(|wipe| wipe != path);
+    }
+}
+
+enum DeleteClass {
+    Reply(ProtocolMessage),
+    Accepted {
+        path: CanonicalPath,
+        previous: FileMetadata,
+        accept: ProtocolMessage,
+        origin: Origin,
+    },
+}
+
 pub struct Master<S: Storage, C: ContentHook> {
     cfg: LoadedMaster,
     store: S,
@@ -457,6 +509,7 @@ pub struct Master<S: Storage, C: ContentHook> {
     hashing: Waiting<HashKey, ()>,
     dirs: index::DirChildren,
     status: StatusLedger,
+    wipes: WipeSet,
 }
 
 impl<S: Storage, C: ContentHook> Master<S, C> {
@@ -478,6 +531,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             hashing: Waiting::new(Stage::Hashing),
             dirs: index::DirChildren::default(),
             status: StatusLedger::default(),
+            wipes: WipeSet { paths: Vec::new() },
         };
         if index::root_is_dirty(&master.store, &CheckoutId::master()).map_err(MasterError::index)? {
             master.rescan()?;
@@ -626,6 +680,10 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         body: &[u8],
     ) -> Result<Reply, MasterError> {
         let key = (header.checkout_id.clone(), header.path.clone());
+        if self.inside_wipe(&header.path) {
+            self.pending.remove(&key);
+            return Ok(Reply::Send(wiping(&header.path)));
+        }
         let Some(pending) = self.pending.get(&key) else {
             return self.accept_if_live_matches(&header);
         };
@@ -708,6 +766,10 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     }
 
     pub fn plan_local(&mut self, event: LocalEvent) -> Result<HashPlan, MasterError> {
+        if self.event_inside_wipe(&event) {
+            self.status.local(None);
+            return Ok(HashPlan::default());
+        }
         let plan = match event {
             LocalEvent::Changed(path) => self.note_changed(path)?,
             LocalEvent::Metadata(path) => self.note_metadata(path)?,
@@ -731,6 +793,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         let HashKey::Central(path) = done.key else {
             return Ok(HashPlan::default());
         };
+        if self.inside_wipe(&path) {
+            return Ok(HashPlan::default());
+        }
         match done.outcome {
             HashOutcome::File(found) => {
                 if self.meta(&path)?.as_ref() == Some(&found) {
@@ -816,7 +881,8 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             })
             .collect();
         for (path, previous) in indexed {
-            if walk.ready.contains_key(&path) || hashing.contains(&path) {
+            if self.inside_wipe(&path) || walk.ready.contains_key(&path) || hashing.contains(&path)
+            {
                 continue;
             }
             match stat_on_disk(&self.central_root, &path)? {
@@ -829,6 +895,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             self.commit(&Origin::Local, &path, None, Some(&previous))?;
         }
         for (path, found) in &walk.ready {
+            if self.inside_wipe(path) {
+                continue;
+            }
             let host = canonical_to_host(&self.central_root, path);
             match stat_on_disk(&self.central_root, path)? {
                 OnDisk::Gone => {
@@ -861,6 +930,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         let HashKey::Central(path) = &need.key else {
             return Ok(true);
         };
+        if self.inside_wipe(path) {
+            return Ok(false);
+        }
         let host = canonical_to_host(&self.central_root, path);
         match stat_on_disk(&self.central_root, path)? {
             OnDisk::Gone | OnDisk::Unreadable => return Ok(false),
@@ -1137,6 +1209,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         if !session.central.covers(&path) {
             return Ok(outside_central(&path));
         }
+        if self.overlaps_wipe(&path) {
+            return Ok(wiping(&path));
+        }
 
         let current = self.meta(&path)?;
         if let CasDecision::Reject { current } = decide_cas(current.as_ref(), basis, Some(new.kind))
@@ -1214,34 +1289,135 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         path: CanonicalPath,
         basis: FileNode,
     ) -> Result<ProtocolMessage, MasterError> {
+        if self.overlaps_wipe(&path) {
+            return Ok(wiping(&path));
+        }
+        match self.classify_delete(peer, checkout_id, path, basis)? {
+            DeleteClass::Reply(msg) => Ok(msg),
+            DeleteClass::Accepted {
+                path,
+                previous,
+                accept,
+                origin,
+            } => {
+                apply::remove_live(&self.central_root, &path)?;
+                self.commit(&origin, &path, None, Some(&previous))?;
+                Ok(accept)
+            }
+        }
+    }
+
+    /// Accept a slave delete in the index and leave the live tree for the caller.
+    ///
+    /// `Later` means `path` overlaps a reclaim already in progress. The caller
+    /// retries the same `Delete` after [`Master::finish_wipe`].
+    pub fn prepare_delete(
+        &mut self,
+        peer: [u8; 32],
+        checkout_id: String,
+        path: CanonicalPath,
+        basis: FileNode,
+    ) -> Result<PreparedDelete, MasterError> {
+        let slave = self.status_slave(&peer);
+        self.status.inbound(
+            slave.as_deref(),
+            &ProtocolMessage::Delete {
+                checkout_id: checkout_id.clone(),
+                path: path.clone(),
+                basis,
+            },
+        );
+        if self.overlaps_wipe(&path) {
+            return Ok(PreparedDelete::Later {
+                checkout_id,
+                path,
+                basis,
+            });
+        }
+        match self.classify_delete(peer, checkout_id, path, basis)? {
+            DeleteClass::Reply(msg) => {
+                self.record_reply(slave.as_deref(), &Reply::Send(msg.clone()));
+                Ok(PreparedDelete::Reply(msg))
+            }
+            DeleteClass::Accepted {
+                path,
+                previous,
+                accept,
+                origin,
+            } => {
+                self.wipes.start(path.clone());
+                if let Err(err) = self.commit(&origin, &path, None, Some(&previous)) {
+                    self.wipes.finish(&path);
+                    return Err(err);
+                }
+                self.record_reply(slave.as_deref(), &Reply::Send(accept.clone()));
+                Ok(PreparedDelete::Reclaim {
+                    reply: accept,
+                    root: self.central_root.clone(),
+                    path,
+                })
+            }
+        }
+    }
+
+    pub fn finish_wipe(&mut self, path: &CanonicalPath) {
+        self.wipes.finish(path);
+    }
+
+    pub fn overlaps_wipe(&self, path: &CanonicalPath) -> bool {
+        self.wipes.overlaps(path)
+    }
+
+    fn inside_wipe(&self, path: &CanonicalPath) -> bool {
+        self.wipes.covers(path)
+    }
+
+    fn event_inside_wipe(&self, event: &LocalEvent) -> bool {
+        match event {
+            LocalEvent::Changed(path) | LocalEvent::Metadata(path) | LocalEvent::Removed(path) => {
+                self.inside_wipe(path)
+            }
+            LocalEvent::Renamed { from, to } => self.inside_wipe(from) || self.inside_wipe(to),
+        }
+    }
+
+    fn classify_delete(
+        &mut self,
+        peer: [u8; 32],
+        checkout_id: String,
+        path: CanonicalPath,
+        basis: FileNode,
+    ) -> Result<DeleteClass, MasterError> {
         let checkout = CheckoutName::new(checkout_id.clone());
         let session = match self.live_checkout(&peer, &checkout) {
             Ok(session) => session,
-            Err(refusal) => return Ok(refusal.into_error(&checkout)),
+            Err(refusal) => return Ok(DeleteClass::Reply(refusal.into_error(&checkout))),
         };
         if !session.central.covers(&path) {
-            return Ok(outside_central(&path));
+            return Ok(DeleteClass::Reply(outside_central(&path)));
         }
-
         let current = self.meta(&path)?;
         if let CasDecision::Reject { current } = decide_cas(current.as_ref(), Some(basis), None) {
-            return Ok(ProtocolMessage::CasReject {
+            return Ok(DeleteClass::Reply(ProtocolMessage::CasReject {
                 checkout_id,
                 path,
                 current,
-            });
+            }));
         }
-
-        apply::remove_live(&self.central_root, &path)?;
+        let previous = current.expect("delete CAS accepted a live path");
         let origin = Origin::Slave {
             slave: session.slave,
             checkout,
         };
-        self.commit(&origin, &path, None, current.as_ref())?;
-        Ok(ProtocolMessage::CasAccept {
-            checkout_id,
-            path,
-            file_node: None,
+        Ok(DeleteClass::Accepted {
+            path: path.clone(),
+            previous,
+            accept: ProtocolMessage::CasAccept {
+                checkout_id,
+                path,
+                file_node: None,
+            },
+            origin,
         })
     }
 
@@ -1264,6 +1440,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         }
         if !session.central.covers(&to) {
             return Ok(outside_central(&to));
+        }
+        if self.overlaps_wipe(&from) || self.overlaps_wipe(&to) {
+            return Ok(wiping(&from));
         }
 
         let current_from = self.meta(&from)?;
@@ -1638,6 +1817,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         if !session.central.covers(&path) {
             return Ok(FulfillPlan::Send(outside_central(&path)));
         }
+        if self.inside_wipe(&path) {
+            return Ok(FulfillPlan::Send(missing_hash(&path)));
+        }
         Ok(FulfillPlan::BulkHost {
             host: canonical_to_host(&self.central_root, &path),
             checkout_id,
@@ -1798,6 +1980,18 @@ fn stat_on_disk(root: &Path, path: &CanonicalPath) -> Result<OnDisk, MasterError
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(OnDisk::Gone),
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => Ok(OnDisk::Unreadable),
         Err(err) => Err(MasterError::io(&host)(err)),
+    }
+}
+
+pub fn reclaim_tree(root: &Path, path: &CanonicalPath) -> Result<(), MasterError> {
+    apply::remove_live(root, path)?;
+    Ok(())
+}
+
+fn wiping(path: &CanonicalPath) -> ProtocolMessage {
+    ProtocolMessage::Error {
+        code: "wiping".into(),
+        message: path.as_str().into(),
     }
 }
 
