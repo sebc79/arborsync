@@ -172,6 +172,34 @@ fn range_and_prefix_delete_keep_descendants_past_sorting_siblings() {
 }
 
 #[test]
+fn range_meta_of_an_early_dir_returns_only_that_subtree() {
+    let (_dir, store) = open_tmp();
+    let ck = CheckoutId::master();
+    let mut batch = store.begin_write().unwrap();
+    batch
+        .put_meta(&ck, &p("/aaa/d00/f00.txt"), &meta(1))
+        .unwrap();
+    batch
+        .put_meta(&ck, &p("/aaa/d00/f01.txt"), &meta(2))
+        .unwrap();
+    for i in 0..512 {
+        batch
+            .put_meta(&ck, &p(&format!("/zzz/f{i:05}")), &meta(3))
+            .unwrap();
+    }
+    batch.commit().unwrap();
+
+    let under = store.range_meta(&ck, &p("/aaa/d00")).unwrap();
+    assert_eq!(
+        under
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>(),
+        ["/aaa/d00/f00.txt", "/aaa/d00/f01.txt"]
+    );
+}
+
+#[test]
 fn prefix_delete_and_checkout_delete() {
     let (_dir, store) = open_tmp();
     let master = CheckoutId::master();

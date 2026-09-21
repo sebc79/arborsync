@@ -130,6 +130,39 @@ fn measure_range_scan(n: usize) {
     println!("shape=range_meta n={n} src_ms={src_ms} root_ms={root_ms}");
 }
 
+fn measure_early_prefix_vs_later_siblings(later: usize) {
+    let sandbox = SyncSandbox::new();
+    let store = RedbStorage::open(&sandbox.master_db()).unwrap();
+    let ck = CheckoutId::master();
+    let meta = FileMetadata::file(1, MTIME, 0o100644, ContentHash::from_bytes([1; 32]));
+    let early_a = CanonicalPath::parse("/aaa/d00/f00.txt").unwrap();
+    let early_b = CanonicalPath::parse("/aaa/d00/f01.txt").unwrap();
+    let mut batch = store.begin_write().unwrap();
+    batch.put_meta(&ck, &early_a, &meta).unwrap();
+    batch.put_meta(&ck, &early_b, &meta).unwrap();
+    for i in 0..later {
+        let path = CanonicalPath::parse(&format!("/zzz/f{i:05}")).unwrap();
+        batch.put_meta(&ck, &path, &meta).unwrap();
+    }
+    batch.commit().unwrap();
+
+    let prefix = CanonicalPath::parse("/aaa/d00").unwrap();
+    let started = Instant::now();
+    let under = store.range_meta(&ck, &prefix).unwrap();
+    let ms = started.elapsed().as_millis();
+    assert_eq!(
+        under
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>(),
+        ["/aaa/d00/f00.txt", "/aaa/d00/f01.txt"]
+    );
+    println!(
+        "shape=early_prefix later={later} ms={ms} hits={}",
+        under.len()
+    );
+}
+
 #[test]
 #[ignore]
 fn apply_scale_slave_to_master() {
@@ -144,6 +177,13 @@ fn apply_scale_slave_to_master() {
         measure_range_scan(n);
     }
     measure_after_seed(2000, 200);
+    measure_early_prefix_vs_later_siblings(20_000);
+}
+
+#[test]
+#[ignore]
+fn range_meta_early_prefix_scale() {
+    measure_early_prefix_vs_later_siblings(20_000);
 }
 
 fn measure_after_seed(seed: usize, n: usize) {

@@ -437,7 +437,29 @@ fn path_from_key(ck: &CheckoutId, key: &[u8]) -> Option<CanonicalPath> {
         return None;
     }
     let path = std::str::from_utf8(&key[prefix_len..]).ok()?;
-    CanonicalPath::parse(path).ok()
+    Some(CanonicalPath::from_stored(path))
+}
+
+fn descendant_range(ck: &CheckoutId, prefix: &CanonicalPath) -> (Vec<u8>, Vec<u8>) {
+    if prefix.as_str() == "/" {
+        return (storage_key(ck, prefix), checkout_end(ck));
+    }
+    let mut start = storage_key(ck, prefix);
+    start.push(b'/');
+    let mut end = start.clone();
+    increment_key(&mut end);
+    (start, end)
+}
+
+fn increment_key(key: &mut Vec<u8>) {
+    for i in (0..key.len()).rev() {
+        if key[i] != 0xFF {
+            key[i] += 1;
+            key.truncate(i + 1);
+            return;
+        }
+    }
+    key.push(0);
 }
 
 fn decode_dir_node(bytes: &[u8]) -> Result<DirNode, RedbStoreError> {
@@ -563,8 +585,13 @@ fn for_each_in_prefix<T>(
 where
     T: ReadableTable<&'static [u8], &'static [u8]>,
 {
-    let start = storage_key(ck, prefix);
-    let end = checkout_end(ck);
+    if prefix.as_str() != "/" {
+        let exact = storage_key(ck, prefix);
+        if let Some(value) = table.get(exact.as_slice())? {
+            visit(prefix.clone(), value.value())?;
+        }
+    }
+    let (start, end) = descendant_range(ck, prefix);
     for item in table.range(start.as_slice()..end.as_slice())? {
         let (key, value) = item?;
         let Some(path) = path_from_key(ck, key.value()) else {
@@ -621,4 +648,36 @@ fn delete_checkout_table(
         table.remove(key.as_slice())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod prefix_keys {
+    use super::*;
+
+    fn p(value: &str) -> CanonicalPath {
+        CanonicalPath::parse(value).unwrap()
+    }
+
+    fn in_range(ck: &CheckoutId, prefix: &CanonicalPath, path: &CanonicalPath) -> bool {
+        let (start, end) = descendant_range(ck, prefix);
+        let key = storage_key(ck, path);
+        start.as_slice() <= key.as_slice() && key.as_slice() < end.as_slice()
+    }
+
+    #[test]
+    fn descendant_key_range_stops_before_a_sorting_sibling() {
+        let ck = CheckoutId::master();
+        assert!(!in_range(&ck, &p("/src"), &p("/src")));
+        assert!(in_range(&ck, &p("/src"), &p("/src/foo.rs")));
+        assert!(!in_range(&ck, &p("/src"), &p("/src2")));
+        assert!(!in_range(&ck, &p("/src"), &p("/src.foo")));
+        assert!(!in_range(&ck, &p("/src"), &p("/zzz")));
+    }
+
+    #[test]
+    fn root_prefix_covers_the_whole_checkout() {
+        let ck = CheckoutId::master();
+        assert!(in_range(&ck, &p("/"), &p("/")));
+        assert!(in_range(&ck, &p("/"), &p("/zzz/f00000")));
+    }
 }
