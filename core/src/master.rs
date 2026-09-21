@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::apply;
@@ -769,21 +769,32 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
 
     pub fn rescan(&mut self) -> Result<(), MasterError> {
         let walk = self.walk_central_stats()?;
-        self.apply_central_ready(&walk.ready, &walk.needs)?;
-        for need in walk.needs {
+        let plan = self.adopt_survey(walk)?;
+        for need in plan.hash {
             self.hashing.remove(&need.key);
             let next = self.commit_hashed(need.run())?;
             self.drain_plan(next)?;
         }
-        self.status.rescan(None);
         Ok(())
     }
 
     pub fn plan_rescan(&mut self) -> Result<HashPlan, MasterError> {
-        let walk = self.walk_central_stats()?;
-        self.apply_central_ready(&walk.ready, &walk.needs)?;
+        let walk = survey_central(&self.central_root, &self.store)?;
+        self.adopt_survey(walk)
+    }
+
+    /// Commit a survey taken without the session mutex.
+    ///
+    /// A row is removed only when the path is still missing. A surveyed row is
+    /// written only when a fresh stat still matches it. A file that appeared
+    /// or changed while the walk ran is left for the session that wrote it.
+    pub fn adopt_survey(&mut self, walk: CentralWalk) -> Result<HashPlan, MasterError> {
+        self.apply_survey(&walk)?;
         let mut plan = HashPlan::default();
         for need in walk.needs {
+            if !self.still_needs_hash(&need)? {
+                continue;
+            }
             self.hashing.insert(need.key.clone(), (), Instant::now());
             plan.hash.push(need);
         }
@@ -791,17 +802,13 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         Ok(plan)
     }
 
-    fn apply_central_ready(
-        &mut self,
-        disk: &BTreeMap<CanonicalPath, FileMetadata>,
-        needs: &[HashNeed],
-    ) -> Result<(), MasterError> {
+    fn apply_survey(&mut self, walk: &CentralWalk) -> Result<(), MasterError> {
         let indexed = self
             .store
             .range_meta(&CheckoutId::master(), &CanonicalPath::root())
             .map_err(MasterError::index)?;
-
-        let hashing: HashSet<_> = needs
+        let hashing: HashSet<_> = walk
+            .needs
             .iter()
             .filter_map(|need| match &need.key {
                 HashKey::Central(path) => Some(path.clone()),
@@ -809,22 +816,62 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             })
             .collect();
         for (path, previous) in indexed {
-            if disk.contains_key(&path) || hashing.contains(&path) {
+            if walk.ready.contains_key(&path) || hashing.contains(&path) {
                 continue;
+            }
+            match stat_on_disk(&self.central_root, &path)? {
+                OnDisk::Gone => {}
+                OnDisk::Here | OnDisk::Unreadable => continue,
             }
             if self.meta(&path)?.is_none() {
                 continue;
             }
             self.commit(&Origin::Local, &path, None, Some(&previous))?;
         }
-        for (path, found) in disk {
-            let current = self.meta(path)?;
-            if current.as_ref() == Some(found) {
+        for (path, found) in &walk.ready {
+            let host = canonical_to_host(&self.central_root, path);
+            match stat_on_disk(&self.central_root, path)? {
+                OnDisk::Gone => {
+                    if let Some(previous) = self.meta(path)? {
+                        self.commit(&Origin::Local, path, None, Some(&previous))?;
+                    }
+                    continue;
+                }
+                OnDisk::Unreadable => continue,
+                OnDisk::Here => {}
+            }
+            let Inspected::Ready(live) =
+                meta::inspect_for_hash(&host, Some(found)).map_err(MasterError::io(&host))?
+            else {
+                continue;
+            };
+            if &live != found {
                 continue;
             }
-            self.commit(&Origin::Local, path, Some(found), current.as_ref())?;
+            let current = self.meta(path)?;
+            if current.as_ref() == Some(&live) {
+                continue;
+            }
+            self.commit(&Origin::Local, path, Some(&live), current.as_ref())?;
         }
         Ok(())
+    }
+
+    fn still_needs_hash(&self, need: &HashNeed) -> Result<bool, MasterError> {
+        let HashKey::Central(path) = &need.key else {
+            return Ok(true);
+        };
+        let host = canonical_to_host(&self.central_root, path);
+        match stat_on_disk(&self.central_root, path)? {
+            OnDisk::Gone | OnDisk::Unreadable => return Ok(false),
+            OnDisk::Here => {}
+        }
+        match meta::inspect_for_hash(&host, need.previous.as_ref())
+            .map_err(MasterError::io(&host))?
+        {
+            Inspected::NeedHash(_) => Ok(true),
+            Inspected::Ready(_) | Inspected::Absent => Ok(false),
+        }
     }
 
     /// A slave's own verdict, off the session's datagram channel. Garbage, an
@@ -869,6 +916,13 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
 
     pub fn central_root(&self) -> &std::path::Path {
         &self.central_root
+    }
+
+    pub fn storage_handle(&self) -> S
+    where
+        S: Clone,
+    {
+        self.store.clone()
     }
 
     pub fn authorize_peer(&self, peer: &[u8; 32]) -> Option<&str> {
@@ -1607,69 +1661,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     }
 
     fn walk_central_stats(&self) -> Result<CentralWalk, MasterError> {
-        let mut ready = BTreeMap::new();
-        let mut needs = Vec::new();
-        let root_prev = self.meta(&CanonicalPath::root())?;
-        match meta::inspect_for_hash(&self.central_root, root_prev.as_ref())
-            .map_err(MasterError::io(&self.central_root))?
-        {
-            Inspected::Ready(root) => {
-                ready.insert(CanonicalPath::root(), root);
-            }
-            Inspected::NeedHash(host) => {
-                needs.push(HashNeed {
-                    key: HashKey::Central(CanonicalPath::root()),
-                    host,
-                    previous: root_prev,
-                });
-            }
-            Inspected::Absent => {}
-        }
-        let mut pending = vec![CanonicalPath::root()];
-        while let Some(dir) = pending.pop() {
-            let host = canonical_to_host(&self.central_root, &dir);
-            let entries = match fs::read_dir(&host) {
-                Ok(entries) => entries,
-                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-                    log::warn!("skipping {}: permission denied", host.display());
-                    continue;
-                }
-                Err(err) => return Err(MasterError::io(&host)(err)),
-            };
-            for entry in entries {
-                let entry = entry.map_err(MasterError::io(&host))?;
-                let raw = entry.file_name();
-                let Some(name) = raw.to_str() else {
-                    log::warn!("skipping non-UTF-8 name under {}", host.display());
-                    continue;
-                };
-                if dir.as_str() == "/" && is_reserved_root_entry(name) {
-                    continue;
-                }
-                let child = join_central(&dir, name)?;
-                let host_child = entry.path();
-                let previous = self.meta(&child)?;
-                match meta::inspect_for_hash(&host_child, previous.as_ref())
-                    .map_err(MasterError::io(&host_child))?
-                {
-                    Inspected::Ready(meta) => {
-                        if meta.kind == EntryKind::Dir {
-                            pending.push(child.clone());
-                        }
-                        ready.insert(child, meta);
-                    }
-                    Inspected::NeedHash(host) => {
-                        needs.push(HashNeed {
-                            key: HashKey::Central(child),
-                            host,
-                            previous,
-                        });
-                    }
-                    Inspected::Absent => {}
-                }
-            }
-        }
-        Ok(CentralWalk { ready, needs })
+        survey_central(&self.central_root, &self.store)
     }
 
     fn walk_central(&self) -> Result<BTreeMap<CanonicalPath, FileMetadata>, MasterError> {
@@ -1716,6 +1708,96 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             }
         }
         Ok(found)
+    }
+}
+
+/// Stat `central_root` and read index rows. Does not write.
+pub fn survey_central<S: Storage>(root: &Path, store: &S) -> Result<CentralWalk, MasterError> {
+    let mut ready = BTreeMap::new();
+    let mut needs = Vec::new();
+    let root_prev = master_meta(store, &CanonicalPath::root())?;
+    match meta::inspect_for_hash(root, root_prev.as_ref()).map_err(MasterError::io(root))? {
+        Inspected::Ready(found) => {
+            ready.insert(CanonicalPath::root(), found);
+        }
+        Inspected::NeedHash(host) => {
+            needs.push(HashNeed {
+                key: HashKey::Central(CanonicalPath::root()),
+                host,
+                previous: root_prev,
+            });
+        }
+        Inspected::Absent => {}
+    }
+    let mut pending = vec![CanonicalPath::root()];
+    while let Some(dir) = pending.pop() {
+        let host = canonical_to_host(root, &dir);
+        let entries = match fs::read_dir(&host) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                log::warn!("skipping {}: permission denied", host.display());
+                continue;
+            }
+            Err(err) => return Err(MasterError::io(&host)(err)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(MasterError::io(&host))?;
+            let raw = entry.file_name();
+            let Some(name) = raw.to_str() else {
+                log::warn!("skipping non-UTF-8 name under {}", host.display());
+                continue;
+            };
+            if dir.as_str() == "/" && is_reserved_root_entry(name) {
+                continue;
+            }
+            let child = join_central(&dir, name)?;
+            let host_child = entry.path();
+            let previous = master_meta(store, &child)?;
+            match meta::inspect_for_hash(&host_child, previous.as_ref())
+                .map_err(MasterError::io(&host_child))?
+            {
+                Inspected::Ready(found) => {
+                    if found.kind == EntryKind::Dir {
+                        pending.push(child.clone());
+                    }
+                    ready.insert(child, found);
+                }
+                Inspected::NeedHash(host) => {
+                    needs.push(HashNeed {
+                        key: HashKey::Central(child),
+                        host,
+                        previous,
+                    });
+                }
+                Inspected::Absent => {}
+            }
+        }
+    }
+    Ok(CentralWalk { ready, needs })
+}
+
+fn master_meta<S: Storage>(
+    store: &S,
+    path: &CanonicalPath,
+) -> Result<Option<FileMetadata>, MasterError> {
+    store
+        .get_meta(&CheckoutId::master(), path)
+        .map_err(MasterError::index)
+}
+
+enum OnDisk {
+    Here,
+    Gone,
+    Unreadable,
+}
+
+fn stat_on_disk(root: &Path, path: &CanonicalPath) -> Result<OnDisk, MasterError> {
+    let host = canonical_to_host(root, path);
+    match fs::symlink_metadata(&host) {
+        Ok(_) => Ok(OnDisk::Here),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(OnDisk::Gone),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => Ok(OnDisk::Unreadable),
+        Err(err) => Err(MasterError::io(&host)(err)),
     }
 }
 

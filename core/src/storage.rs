@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use redb::{Database, ReadableTable, TableDefinition};
 
@@ -213,8 +214,9 @@ impl From<redb::CommitError> for RedbStoreError {
 }
 
 /// On-disk [`Storage`] backed by a single redb file (`spec.md` §13).
+#[derive(Clone)]
 pub struct RedbStorage {
-    db: Database,
+    db: Arc<Database>,
 }
 
 impl RedbStorage {
@@ -235,7 +237,7 @@ impl Storage for RedbStorage {
     fn open(path: &Path) -> Result<Self, Self::Error> {
         let db = Database::create(path)?;
         Self::ensure_tables(&db)?;
-        Ok(Self { db })
+        Ok(Self { db: Arc::new(db) })
     }
 
     fn get_meta(

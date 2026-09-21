@@ -233,7 +233,7 @@ pub enum EntryKind { File = 1, Dir = 2, Symlink = 3 }
 - Slave: one watch per checkout `local`.
 - Events: Create, Write, Remove, Rename, chmod/mtime (`Modify(Metadata)`).
 - **Rename:** if both `from` and `to` land in the same debounce window *and* both are inside the same checkout, announce `Rename`. Otherwise treat as Delete + Create.
-- **Rescan every 60 s** (configurable): full `stat` walk of the checkout (or `central_root`). Not “changed subtrees only” — the rescan exists because events were missed. Hash only on size/mtime mismatch or missing row. Then reconcile with master.
+- **Rescan every 60 s** (configurable): full `stat` walk of the checkout (or `central_root`). Not “changed subtrees only” — the rescan exists because events were missed. Hash only on size/mtime mismatch or missing row. Then reconcile with master. On the master, the watch thread stats and reads the index without the session mutex and locks only to commit. A path is deleted only when a later stat says it is gone. A surveyed row is written only when a later stat still matches.
 - **Echo suppression:** each side keeps `inflight: (checkout_id, canonical_path) → expected content_hash`. A watcher event whose current content hash equals `inflight` is ignored and the entry cleared. After apply, set the announced mtime *before* releasing inflight, so the write does not look like a new local edit.
 - Never push a path whose local `FileNode` equals `last_synced`.
 
