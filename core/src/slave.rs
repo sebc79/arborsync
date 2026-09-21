@@ -28,6 +28,7 @@ use crate::tune::Tune;
 use crate::watch::LocalEvent;
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
+pub use crate::crawl::{RescanStat, RescanStated};
 
 struct StagedAnnounce {
     checkout_id: String,
@@ -402,6 +403,85 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
 
     pub fn crawl_step(&mut self) -> Result<Vec<ProtocolMessage>, SlaveError> {
         let plan = self.step_crawl(STEP_BUDGET)?;
+        self.pending_hash.extend(plan.hash);
+        for msg in &plan.send {
+            self.status.outbound(None, msg);
+        }
+        Ok(plan.send)
+    }
+
+    pub fn crawl_has_pages(&self) -> bool {
+        self.crawl.has_pages()
+    }
+
+    pub fn rescan_wants_stat(&self) -> bool {
+        self.crawl
+            .front_rescan()
+            .is_some_and(RescanWalk::wants_stat)
+    }
+
+    pub fn take_rescan_stats(&mut self) -> Result<Vec<RescanStat>, SlaveError> {
+        let Some(walk) = self.crawl.front_rescan_mut() else {
+            return Ok(Vec::new());
+        };
+        let ck = walk.ck.clone();
+        walk.take_unstated(STEP_BUDGET, |path| self.store.get_meta(&ck, path))
+            .map_err(into_slave_walk_err)
+    }
+
+    pub fn apply_rescan_stats(
+        &mut self,
+        done: Vec<RescanStated>,
+    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        if self.crawl.front_rescan().is_none() {
+            return Ok(Vec::new());
+        }
+        let front_id = self
+            .crawl
+            .front_rescan()
+            .expect("front checked")
+            .checkout_id
+            .clone();
+        let mut plan = HashPlan::default();
+        let mut first_err: Option<SlaveError> = None;
+        for stated in done {
+            let outcome = {
+                let Some(walk) = self.crawl.front_rescan_mut() else {
+                    break;
+                };
+                if stated.checkout_id() != walk.checkout_id {
+                    None
+                } else {
+                    Some(walk.apply_stated(stated))
+                }
+            };
+            let Some(outcome) = outcome else {
+                continue;
+            };
+            match outcome {
+                Ok(Some(row)) => {
+                    if first_err.is_none() {
+                        match self.absorb_walked(&front_id, std::iter::once(row)) {
+                            Ok(part) => plan.append(part),
+                            Err(err) => first_err = Some(err),
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(into_slave_walk_err(err));
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        if let Some(walk) = self.crawl.take_finished_rescan() {
+            plan.send.extend(self.commit_rescan(walk)?);
+            self.status.rescan(None);
+        }
         self.pending_hash.extend(plan.hash);
         for msg in &plan.send {
             self.status.outbound(None, msg);
@@ -1441,21 +1521,30 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         let newly = walk
             .collect(budget, |path| self.store.get_meta(&ck, path))
             .map_err(into_slave_walk_err)?;
-        let mut plan = HashPlan::default();
-        for row in newly {
-            match row {
-                Walked::Ready(path, found) => {
-                    plan.send
-                        .extend(self.announce_new_to_index(&checkout_id, path, found)?);
-                }
-                Walked::Needs(need) => plan.append(self.enqueue_hash(need)),
-            }
-        }
+        let mut plan = self.absorb_walked(&checkout_id, newly)?;
         let Some(walk) = self.crawl.take_finished_rescan() else {
             return Ok(plan);
         };
         plan.send.extend(self.commit_rescan(walk)?);
         self.status.rescan(None);
+        Ok(plan)
+    }
+
+    fn absorb_walked(
+        &mut self,
+        checkout_id: &str,
+        newly: impl IntoIterator<Item = Walked>,
+    ) -> Result<HashPlan, SlaveError> {
+        let mut plan = HashPlan::default();
+        for row in newly {
+            match row {
+                Walked::Ready(path, found) => {
+                    plan.send
+                        .extend(self.announce_new_to_index(checkout_id, path, found)?);
+                }
+                Walked::Needs(need) => plan.append(self.enqueue_hash(need)),
+            }
+        }
         Ok(plan)
     }
 
@@ -1605,6 +1694,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 }
             }
             WalkAction::AnnounceDelete => {
+                if self.crawl.rescanning(checkout_id) {
+                    return Ok(plan);
+                }
                 plan.send
                     .extend(self.reconcile_delete(checkout_id, &child_path)?);
             }

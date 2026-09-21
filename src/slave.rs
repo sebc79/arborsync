@@ -15,7 +15,8 @@ use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::path::local_to_canonical;
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::slave::{
-    LinkState, Reply, Slave, SlaveError, WholeFileLater, fulfill_from_host,
+    LinkState, Reply, RescanStat, RescanStated, Slave, SlaveError, WholeFileLater,
+    fulfill_from_host,
 };
 use arborsync_core::status::SlaveStatus;
 use arborsync_core::storage::Storage;
@@ -320,6 +321,7 @@ async fn session(
     });
     let (bulk_tx, mut bulk_rx) = unbounded_channel();
     let (hash_tx, mut hash_rx) = unbounded_channel();
+    let (stat_tx, mut stat_rx) = unbounded_channel::<Vec<RescanStated>>();
     let mut hasher = HashPump {
         inflight: 0,
         queued: VecDeque::new(),
@@ -329,6 +331,8 @@ async fn session(
     let mut outbound = Outbound::new(urgent_tx, walk_tx.clone(), bulk_tx);
     outbound.ingest(slave, &conn, Connection::read_control(&mut recv).await?)?;
     offer_pending_hashes(slave, &mut hasher);
+    let mut stat_busy = false;
+    kick_crawl(slave, &mut outbound, &mut hasher, &mut stat_busy, &stat_tx)?;
     log::info!("connected to {addr_text}");
 
     let mut status_clock = crate::status::Clock::new();
@@ -363,23 +367,18 @@ async fn session(
                     let outs = slave.lock().expect("slave").commit_hashed_batch(dones)?;
                     outbound.enqueue(outs)?;
                     offer_pending_hashes(slave, &mut hasher);
-                    if slave.lock().expect("slave").should_step_crawl(outbound.serving()) {
-                        match slave.lock().expect("slave").crawl_step() {
-                            Ok(outs) => outbound.enqueue(outs)?,
-                            Err(SlaveError::UnknownCheckout(_)) => {}
-                            Err(err) => return Err(err.into()),
-                        }
-                        offer_pending_hashes(slave, &mut hasher);
-                    }
+                    kick_crawl(slave, &mut outbound, &mut hasher, &mut stat_busy, &stat_tx)?;
                 }
             }
-            _ = wait_if_should_crawl(slave, outbound.serving()) => {
-                match slave.lock().expect("slave").crawl_step() {
-                    Ok(outs) => outbound.enqueue(outs)?,
-                    Err(SlaveError::UnknownCheckout(_)) => {}
-                    Err(err) => return Err(err.into()),
-                }
+            Some(stated) = stat_rx.recv() => {
+                stat_busy = false;
+                let outs = slave.lock().expect("slave").apply_rescan_stats(stated)?;
+                outbound.enqueue(outs)?;
                 offer_pending_hashes(slave, &mut hasher);
+                kick_crawl(slave, &mut outbound, &mut hasher, &mut stat_busy, &stat_tx)?;
+            }
+            _ = wait_if_should_crawl(slave, outbound.serving(), stat_busy) => {
+                kick_crawl(slave, &mut outbound, &mut hasher, &mut stat_busy, &stat_tx)?;
             }
             work = work.recv() => {
                 let Some(work) = work else {
@@ -438,10 +437,90 @@ async fn session(
     }
 }
 
-async fn wait_if_should_crawl(slave: &SharedSlave, serving: bool) {
-    if slave.lock().expect("slave").should_step_crawl(serving) {
+fn kick_crawl(
+    slave: &SharedSlave,
+    outbound: &mut Outbound,
+    hasher: &mut HashPump,
+    stat_busy: &mut bool,
+    stat_tx: &UnboundedSender<Vec<RescanStated>>,
+) -> anyhow::Result<()> {
+    let serving = outbound.serving();
+    let mut guard = slave.lock().expect("slave");
+    if guard.crawl_has_pages() && guard.should_step_crawl(serving) {
+        match guard.crawl_step() {
+            Ok(outs) => {
+                drop(guard);
+                outbound.enqueue(outs)?;
+                offer_pending_hashes(slave, hasher);
+            }
+            Err(SlaveError::UnknownCheckout(_)) => {}
+            Err(err) => return Err(err.into()),
+        }
+        return Ok(());
+    }
+    if *stat_busy || (serving && guard.crawl_has_pages()) {
+        return Ok(());
+    }
+    if guard.rescan_wants_stat() {
+        let batch = match guard.take_rescan_stats() {
+            Ok(batch) => batch,
+            Err(SlaveError::UnknownCheckout(_)) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        if batch.is_empty() {
+            return Ok(());
+        }
+        *stat_busy = true;
+        drop(guard);
+        let tx = stat_tx.clone();
+        tokio::spawn(async move {
+            let stated = tokio::task::spawn_blocking(move || {
+                batch
+                    .into_iter()
+                    .map(RescanStat::inspect)
+                    .collect::<Vec<_>>()
+            })
+            .await;
+            match stated {
+                Ok(stated) => {
+                    if tx.send(stated).is_err() {
+                        log::warn!("rescan stat channel closed");
+                    }
+                }
+                Err(err) => log::warn!("rescan stat join: {err}"),
+            }
+        });
+        return Ok(());
+    }
+    if !guard.should_step_crawl(serving) {
+        return Ok(());
+    }
+    match guard.crawl_step() {
+        Ok(outs) => {
+            drop(guard);
+            outbound.enqueue(outs)?;
+            offer_pending_hashes(slave, hasher);
+        }
+        Err(SlaveError::UnknownCheckout(_)) => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
+async fn wait_if_should_crawl(slave: &SharedSlave, serving: bool, stat_busy: bool) {
+    let guard = slave.lock().expect("slave");
+    if guard.crawl_has_pages() && guard.should_step_crawl(serving) {
         return;
     }
+    if stat_busy || (serving && guard.crawl_has_pages()) {
+        drop(guard);
+        std::future::pending::<()>().await;
+        return;
+    }
+    if guard.should_step_crawl(serving) || guard.rescan_wants_stat() {
+        return;
+    }
+    drop(guard);
     std::future::pending::<()>().await;
 }
 
