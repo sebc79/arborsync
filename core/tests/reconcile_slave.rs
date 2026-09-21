@@ -271,6 +271,88 @@ fn dir_list_does_not_delete_while_rescan_is_still_walking() {
 }
 
 #[test]
+fn dir_list_skips_delete_when_cas_accept_landed_after_the_request() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    send(
+        slave
+            .handle(ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: new.clone(),
+                basis: None,
+            })
+            .unwrap(),
+    );
+    send(
+        slave
+            .handle(ProtocolMessage::RootAck {
+                checkout_id: "src".into(),
+                path: p("/src"),
+                matched: false,
+                master_root: empty_dir_node().into(),
+            })
+            .unwrap(),
+    );
+    send(
+        slave
+            .handle(ProtocolMessage::CasAccept {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                file_node: Some(file_node(&new)),
+            })
+            .unwrap(),
+    );
+    assert!(
+        send(
+            slave
+                .handle(ProtocolMessage::DirListResponse {
+                    checkout_id: "src".into(),
+                    path: p("/src"),
+                    after: None,
+                    entries: vec![],
+                    more: false,
+                })
+                .unwrap()
+        )
+        .iter()
+        .all(|msg| !matches!(msg, ProtocolMessage::Delete { .. }))
+    );
+    assert!(slave.meta("src", &p("/src/hello.txt")).unwrap().is_some());
+
+    send(
+        slave
+            .handle(ProtocolMessage::RootAck {
+                checkout_id: "src".into(),
+                path: p("/src"),
+                matched: false,
+                master_root: empty_dir_node().into(),
+            })
+            .unwrap(),
+    );
+    match &send(
+        slave
+            .handle(ProtocolMessage::DirListResponse {
+                checkout_id: "src".into(),
+                path: p("/src"),
+                after: None,
+                entries: vec![],
+                more: false,
+            })
+            .unwrap(),
+    )[..]
+    {
+        [ProtocolMessage::Delete { path, .. }] => assert_eq!(path, &p("/src/hello.txt")),
+        other => panic!("expected Delete on a fresh listing, got {other:?}"),
+    }
+}
+
+#[test]
 fn root_ack_matched_true_emits_no_dir_list() {
     let sandbox = SyncSandbox::new();
     let mut slave = alice_slave(&sandbox, MemoryContent::new());
