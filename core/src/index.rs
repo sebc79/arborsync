@@ -69,7 +69,7 @@ impl DirKids {
         self.concat[hash_off..hash_off + 32].copy_from_slice(node);
     }
 
-    fn upsert(&mut self, path: CanonicalPath, kind: EntryKind, node: &[u8; 32]) {
+    fn upsert(&mut self, path: CanonicalPath, kind: EntryKind, node: &[u8; 32], mark_stale: bool) {
         let Ok(name) = EntryName::parse(path.name()) else {
             return;
         };
@@ -81,7 +81,7 @@ impl DirKids {
             self.set_hash(&name, node);
             return;
         }
-        if self.concat_stale || self.by_name.contains_key(&name) {
+        if mark_stale || self.concat_stale || self.by_name.contains_key(&name) {
             self.by_name.insert(
                 name,
                 ChildSlot {
@@ -185,13 +185,18 @@ impl DirChildren {
         Ok(())
     }
 
-    fn apply(&mut self, path: &CanonicalPath, meta: Option<&FileMetadata>) {
+    fn apply(&mut self, path: &CanonicalPath, meta: Option<&FileMetadata>, mark_stale: bool) {
         match meta {
             Some(meta) if meta.kind == EntryKind::Dir => {
                 if let Some(parent) = path.parent() {
                     if let Some(kids) = self.by_parent.get_mut(&parent) {
                         if kids.kind_of(path) != Some(EntryKind::Dir) {
-                            kids.upsert(path.clone(), EntryKind::Dir, empty_dir_node().as_bytes());
+                            kids.upsert(
+                                path.clone(),
+                                EntryKind::Dir,
+                                empty_dir_node().as_bytes(),
+                                mark_stale,
+                            );
                         }
                     }
                 }
@@ -203,7 +208,12 @@ impl DirChildren {
                 }
                 if let Some(parent) = path.parent() {
                     if let Some(kids) = self.by_parent.get_mut(&parent) {
-                        kids.upsert(path.clone(), meta.kind, file_node(meta).as_bytes());
+                        kids.upsert(
+                            path.clone(),
+                            meta.kind,
+                            file_node(meta).as_bytes(),
+                            mark_stale,
+                        );
                     }
                 }
             }
@@ -305,10 +315,11 @@ pub fn commit_leaves_with<'a, S: Storage>(
     }
 
     let mut batch = store.begin_write()?;
+    let mark_stale = changes.len() > 1;
 
     for change in &changes {
         apply_leaf(store, &mut batch, ck, change)?;
-        cache.apply(change.path, change.meta);
+        cache.apply(change.path, change.meta, mark_stale);
     }
 
     let mut dirty: Vec<CanonicalPath> = dirty.into_iter().collect();
@@ -610,6 +621,39 @@ mod tests {
             sequential.get_dir_node(&ck, &dir).unwrap(),
             Some(empty_dir_node())
         );
+    }
+
+    #[test]
+    fn commit_leaves_of_a_wide_directory_finishes() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::new("src");
+        let dir = p("/src");
+        let dir_meta = FileMetadata::directory(0, 0o040755);
+        let files: Vec<(CanonicalPath, FileMetadata)> = (0..8_000)
+            .map(|i| (p(&format!("/src/f{i:05}")), file((i % 200) as u8 + 1)))
+            .collect();
+        let mut changes = vec![LeafChange {
+            path: &dir,
+            meta: Some(&dir_meta),
+            last_synced: LastSynced::Keep,
+        }];
+        changes.extend(files.iter().map(|(path, meta)| LeafChange {
+            path,
+            meta: Some(meta),
+            last_synced: LastSynced::Keep,
+        }));
+        let started = std::time::Instant::now();
+        commit_leaves(&store, &ck, changes).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "wide directory commit took {elapsed:?}"
+        );
+        assert_ne!(
+            store.get_dir_node(&ck, &dir).unwrap(),
+            Some(empty_dir_node())
+        );
+        assert_eq!(store.range_meta(&ck, &dir).unwrap().len(), 8_001);
     }
 
     #[test]
