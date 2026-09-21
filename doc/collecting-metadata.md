@@ -67,7 +67,7 @@ Do not resolve in-tree links during scan, index, or apply. Resolving duplicates 
 
 ## Batching
 
-Specified: rescans commit per directory, and one debounce window is one batch. Slave `rescan` writes every changed leaf and recomputes each dirty `DirNode` once in one `commit_leaves` batch. The slave holds hashed announces until 64 are ready or hashing workers are idle, then one `commit_leaves` batch writes them. Watcher events and master apply still call `commit_leaf` per path. Both keep a `DirChildren` cache so ancestor hashes do not re-list the tree. A cache miss `range_meta` stops at that directory's descendants. Loaded children stay ordered. A sibling announce patches that child's hash. Insert and delete rebuild the cached concat once per directory at commit, instead of encoding on every name. `CasAccept` on the origin slave writes `last_synced` in a second batch.
+Specified: rescans commit per directory, and one debounce window is one batch. Slave `rescan` writes every changed leaf and recomputes each dirty `DirNode` once in one `commit_leaves` batch. The slave holds hashed announces until 64 are ready or hashing workers are idle, then one `commit_leaves` batch writes them. Watcher events and master apply still call `commit_leaf` per path. Both keep a `DirChildren` cache so ancestor hashes do not re-list the tree. A cache miss `range_meta` stops at that directory's descendants. Loaded children stay ordered. A sibling announce patches that child's hash. One new child is spliced into the cached concat. A `commit_leaves` of more than one path, a delete, or a kind change rebuilds that concat once per directory at commit. `CasAccept` on the origin slave writes `last_synced` in a second batch.
 
 ## Hardlinks
 
