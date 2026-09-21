@@ -615,6 +615,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | Interval status reports | Master and slave log a `status ` summary each `status_interval_seconds` (default 5, `0` disables, max 3600). Health is `idle`, `busy`, `stuck`, or `failed`. Each line also names `bottleneck=` (the hop that is limiting progress), with `age=` and `depth=` when a wait is open. The master adds one line per slave and prints `fanout_dropped=` on the master queue fields. Reload applies the interval live. No metrics port. |
 | ✅ | §14 `[tune.hashing]` / `[tune.fulfill_parked]` | `workers` is `"nproc"` or 1 through 256 on both roles. Slave `inflight` is 1 through 64. Defaults are `"nproc"` and 4. `0` and `[tune.origin_bytes]` fail parse. Master `[tune.fulfill_parked]` is `TuneNotOnRole`. Both knobs apply on SIGHUP. Hash work and master fulfill run on `spawn_blocking`. Slave leftover inflight is `FulfillAdmission`. No NixOS option. |
 | ✅ | Bottleneck side-channel | The slave sends its own `bottleneck=` verdict to the master as a 25-byte QUIC datagram each status period. Not a `ProtocolMessage`. A missing or stale gauge prints `hint=absent` or `hint=stale` on that slave line only. An old peer keeps syncing. |
+| ✅ | §13 `range_meta` stops at the prefix | `for_each_in_prefix` ends at the exclusive descendant bound, not `checkout_end`. Stored keys use `CanonicalPath::from_stored`. Loading `/src/drop/d00` during leftover hashing no longer walks later siblings such as `/zzz`. |
 
 Topic documents:
 

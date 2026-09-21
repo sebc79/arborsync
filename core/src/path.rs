@@ -50,6 +50,11 @@ impl CanonicalPath {
         Ok(Self(normalized))
     }
 
+    pub(crate) fn from_stored(value: &str) -> Self {
+        debug_assert_eq!(Self::parse(value).as_ref().map(Self::as_str), Ok(value));
+        Self(value.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -277,6 +282,20 @@ pub fn conflict_sidecar_path(
     checkout_local
         .join(RESERVED_CONFLICTS)
         .join(format!("{relative}--{hex16}"))
+}
+
+#[cfg(test)]
+mod stored {
+    use super::*;
+
+    #[test]
+    fn from_stored_matches_parse_for_a_canonical_path() {
+        assert_eq!(
+            CanonicalPath::from_stored("/src/foo.rs"),
+            CanonicalPath::parse("/src/foo.rs").unwrap()
+        );
+        assert_eq!(CanonicalPath::from_stored("/"), CanonicalPath::root());
+    }
 }
 
 fn hex_prefix(bytes: &[u8], hex_chars: usize) -> String {
