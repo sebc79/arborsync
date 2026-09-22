@@ -6,7 +6,7 @@ use arborsync_core::merkle::{DirChild, empty_dir_node, file_node};
 use arborsync_core::meta::{FileMetadata, hash_bytes};
 use arborsync_core::path::{RESERVED_TMP, conflict_sidecar_path};
 use arborsync_core::protocol::{CheckoutAck, ProtocolMessage};
-use arborsync_core::slave::{MemoryContent, Reply, Slave};
+use arborsync_core::slave::{MemoryContent, Reply, RescanStat, Slave};
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
 
 const MASTER_PIN: [u8; 32] = [0x11; 32];
@@ -107,6 +107,249 @@ fn subscribe_ack_rescans_leftover_disk_file_into_meta() {
             .content_hash,
         hash_bytes(b"mine")
     );
+}
+
+#[test]
+fn take_rescan_stats_batches_unstated_names_before_apply() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("leftover.txt", b"mine");
+
+    slave.request_rescan("src").unwrap();
+    let batch = slave.take_rescan_stats().unwrap();
+    assert!(
+        batch
+            .iter()
+            .any(|need| need.host().file_name().and_then(|n| n.to_str()) == Some("leftover.txt")),
+        "expected leftover.txt in batch, got {:?}",
+        batch.iter().map(|n| n.host()).collect::<Vec<_>>()
+    );
+    assert!(slave.take_rescan_stats().unwrap().is_empty());
+    assert!(
+        slave
+            .meta("src", &p("/src/leftover.txt"))
+            .unwrap()
+            .is_none()
+    );
+
+    let stated = batch.into_iter().map(RescanStat::inspect).collect();
+    slave.apply_rescan_stats(stated).unwrap();
+    let hashed = slave.drain_hashes().unwrap();
+    assert!(
+        hashed.iter().any(|msg| matches!(
+            msg,
+            ProtocolMessage::FileAnnounce { path, .. } if path == &p("/src/leftover.txt")
+        )),
+        "expected leftover FileAnnounce, got {hashed:?}"
+    );
+    assert_eq!(
+        slave
+            .meta("src", &p("/src/leftover.txt"))
+            .unwrap()
+            .unwrap()
+            .content_hash,
+        hash_bytes(b"mine")
+    );
+    match &slave.crawl_step().unwrap()[..] {
+        [
+            ProtocolMessage::RootReport {
+                checkout_id, path, ..
+            },
+        ] => {
+            assert_eq!(checkout_id, "src");
+            assert_eq!(path, &p("/src"));
+        }
+        other => panic!("expected RootReport after hash, got {other:?}"),
+    }
+}
+
+#[test]
+fn take_rescan_stats_announces_every_file_in_a_wide_directory() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    for i in 0..200 {
+        sandbox.tree(&local).file(&format!("f{i:03}"), b"x");
+    }
+
+    slave.request_rescan("src").unwrap();
+    let mut announced = 0;
+    loop {
+        let batch = slave.take_rescan_stats().unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        let stated = batch.into_iter().map(RescanStat::inspect).collect();
+        slave.apply_rescan_stats(stated).unwrap();
+        announced += slave
+            .drain_hashes()
+            .unwrap()
+            .iter()
+            .filter(|msg| {
+                matches!(msg, ProtocolMessage::FileAnnounce { path, .. } if path.as_str().contains("/f"))
+            })
+            .count();
+    }
+    let _ = slave.crawl_step().unwrap();
+    assert_eq!(announced, 200);
+    for i in 0..200 {
+        assert!(
+            slave
+                .meta("src", &p(&format!("/src/f{i:03}")))
+                .unwrap()
+                .is_some(),
+            "missing /src/f{i:03}"
+        );
+    }
+}
+
+#[test]
+fn dir_list_does_not_delete_while_rescan_is_still_walking() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    send(
+        slave
+            .handle(ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: new.clone(),
+                basis: None,
+            })
+            .unwrap(),
+    );
+    slave.request_rescan("src").unwrap();
+    assert!(
+        send(
+            slave
+                .handle(ProtocolMessage::DirListResponse {
+                    checkout_id: "src".into(),
+                    path: p("/src"),
+                    after: None,
+                    entries: vec![],
+                    more: false,
+                })
+                .unwrap()
+        )
+        .iter()
+        .all(|msg| !matches!(msg, ProtocolMessage::Delete { .. })),
+        "dir list deleted while rescan was still walking"
+    );
+    assert!(slave.meta("src", &p("/src/hello.txt")).unwrap().is_some());
+
+    loop {
+        let batch = slave.take_rescan_stats().unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        let stated = batch.into_iter().map(RescanStat::inspect).collect();
+        slave.apply_rescan_stats(stated).unwrap();
+        let _ = slave.drain_hashes().unwrap();
+    }
+    let _ = slave.crawl_step().unwrap();
+
+    match &send(
+        slave
+            .handle(ProtocolMessage::DirListResponse {
+                checkout_id: "src".into(),
+                path: p("/src"),
+                after: None,
+                entries: vec![],
+                more: false,
+            })
+            .unwrap(),
+    )[..]
+    {
+        [ProtocolMessage::Delete { path, .. }] => assert_eq!(path, &p("/src/hello.txt")),
+        other => panic!("expected Delete after the walk, got {other:?}"),
+    }
+}
+
+#[test]
+fn dir_list_skips_delete_when_cas_accept_landed_after_the_request() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    send(
+        slave
+            .handle(ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new: new.clone(),
+                basis: None,
+            })
+            .unwrap(),
+    );
+    send(
+        slave
+            .handle(ProtocolMessage::RootAck {
+                checkout_id: "src".into(),
+                path: p("/src"),
+                matched: false,
+                master_root: empty_dir_node().into(),
+            })
+            .unwrap(),
+    );
+    send(
+        slave
+            .handle(ProtocolMessage::CasAccept {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                file_node: Some(file_node(&new)),
+            })
+            .unwrap(),
+    );
+    assert!(
+        send(
+            slave
+                .handle(ProtocolMessage::DirListResponse {
+                    checkout_id: "src".into(),
+                    path: p("/src"),
+                    after: None,
+                    entries: vec![],
+                    more: false,
+                })
+                .unwrap()
+        )
+        .iter()
+        .all(|msg| !matches!(msg, ProtocolMessage::Delete { .. }))
+    );
+    assert!(slave.meta("src", &p("/src/hello.txt")).unwrap().is_some());
+
+    send(
+        slave
+            .handle(ProtocolMessage::RootAck {
+                checkout_id: "src".into(),
+                path: p("/src"),
+                matched: false,
+                master_root: empty_dir_node().into(),
+            })
+            .unwrap(),
+    );
+    match &send(
+        slave
+            .handle(ProtocolMessage::DirListResponse {
+                checkout_id: "src".into(),
+                path: p("/src"),
+                after: None,
+                entries: vec![],
+                more: false,
+            })
+            .unwrap(),
+    )[..]
+    {
+        [ProtocolMessage::Delete { path, .. }] => assert_eq!(path, &p("/src/hello.txt")),
+        other => panic!("expected Delete on a fresh listing, got {other:?}"),
+    }
 }
 
 #[test]

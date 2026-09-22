@@ -28,6 +28,7 @@ use crate::tune::Tune;
 use crate::watch::LocalEvent;
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
+pub use crate::crawl::{RescanStat, RescanStated};
 
 struct StagedAnnounce {
     checkout_id: String,
@@ -220,6 +221,7 @@ pub struct Slave<S: Storage, C: ContentHook> {
     pending_hash: Vec<HashNeed>,
     dirs: HashMap<CheckoutId, index::DirChildren>,
     status: StatusLedger,
+    cas_since_dir_list: HashMap<String, u64>,
 }
 
 impl<S: Storage, C: ContentHook> Slave<S, C> {
@@ -256,6 +258,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             pending_hash: Vec::new(),
             dirs: HashMap::new(),
             status: StatusLedger::default(),
+            cas_since_dir_list: HashMap::new(),
         })
     }
 
@@ -402,6 +405,85 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
 
     pub fn crawl_step(&mut self) -> Result<Vec<ProtocolMessage>, SlaveError> {
         let plan = self.step_crawl(STEP_BUDGET)?;
+        self.pending_hash.extend(plan.hash);
+        for msg in &plan.send {
+            self.status.outbound(None, msg);
+        }
+        Ok(plan.send)
+    }
+
+    pub fn crawl_has_pages(&self) -> bool {
+        self.crawl.has_pages()
+    }
+
+    pub fn rescan_wants_stat(&self) -> bool {
+        self.crawl
+            .front_rescan()
+            .is_some_and(RescanWalk::wants_stat)
+    }
+
+    pub fn take_rescan_stats(&mut self) -> Result<Vec<RescanStat>, SlaveError> {
+        let Some(walk) = self.crawl.front_rescan_mut() else {
+            return Ok(Vec::new());
+        };
+        let ck = walk.ck.clone();
+        walk.take_unstated(STEP_BUDGET, |path| self.store.get_meta(&ck, path))
+            .map_err(into_slave_walk_err)
+    }
+
+    pub fn apply_rescan_stats(
+        &mut self,
+        done: Vec<RescanStated>,
+    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        if self.crawl.front_rescan().is_none() {
+            return Ok(Vec::new());
+        }
+        let front_id = self
+            .crawl
+            .front_rescan()
+            .expect("front checked")
+            .checkout_id
+            .clone();
+        let mut plan = HashPlan::default();
+        let mut first_err: Option<SlaveError> = None;
+        for stated in done {
+            let outcome = {
+                let Some(walk) = self.crawl.front_rescan_mut() else {
+                    break;
+                };
+                if stated.checkout_id() != walk.checkout_id {
+                    None
+                } else {
+                    Some(walk.apply_stated(stated))
+                }
+            };
+            let Some(outcome) = outcome else {
+                continue;
+            };
+            match outcome {
+                Ok(Some(row)) => {
+                    if first_err.is_none() {
+                        match self.absorb_walked(&front_id, std::iter::once(row)) {
+                            Ok(part) => plan.append(part),
+                            Err(err) => first_err = Some(err),
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(into_slave_walk_err(err));
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        if let Some(walk) = self.crawl.take_finished_rescan() {
+            plan.send.extend(self.commit_rescan(walk)?);
+            self.status.rescan(None);
+        }
         self.pending_hash.extend(plan.hash);
         for msg in &plan.send {
             self.status.outbound(None, msg);
@@ -996,6 +1078,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         };
         self.write_last_synced(checkout_id, path, node, content)?;
         self.clear_pending_rename(checkout_id, path);
+        *self
+            .cas_since_dir_list
+            .entry(checkout_id.to_string())
+            .or_insert(0) += 1;
         Ok(())
     }
 
@@ -1325,11 +1411,25 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         } else {
             checkout.central.clone()
         };
-        Ok(Reply::Send(vec![ProtocolMessage::DirListRequest {
+        Ok(Reply::Send(vec![self.dir_list_request(
+            checkout_id,
+            path,
+            None,
+        )]))
+    }
+
+    fn dir_list_request(
+        &mut self,
+        checkout_id: &str,
+        path: CanonicalPath,
+        after: Option<EntryName>,
+    ) -> ProtocolMessage {
+        self.cas_since_dir_list.insert(checkout_id.to_string(), 0);
+        ProtocolMessage::DirListRequest {
             checkout_id: checkout_id.into(),
             path,
-            after: None,
-        }]))
+            after,
+        }
     }
 
     fn on_dir_list(
@@ -1357,12 +1457,17 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 .or_insert((None, Some(child.clone())));
         }
 
+        let deletes_stale = self
+            .cas_since_dir_list
+            .get(&checkout_id)
+            .is_some_and(|n| *n > 0);
         self.crawl.push_page(DirListPage::from_merge(
             checkout_id,
             path,
             after,
             more,
             page_end,
+            deletes_stale,
             by_name,
         ));
         let plan = self.step_crawl(STEP_BUDGET)?;
@@ -1441,21 +1546,30 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         let newly = walk
             .collect(budget, |path| self.store.get_meta(&ck, path))
             .map_err(into_slave_walk_err)?;
-        let mut plan = HashPlan::default();
-        for row in newly {
-            match row {
-                Walked::Ready(path, found) => {
-                    plan.send
-                        .extend(self.announce_new_to_index(&checkout_id, path, found)?);
-                }
-                Walked::Needs(need) => plan.append(self.enqueue_hash(need)),
-            }
-        }
+        let mut plan = self.absorb_walked(&checkout_id, newly)?;
         let Some(walk) = self.crawl.take_finished_rescan() else {
             return Ok(plan);
         };
         plan.send.extend(self.commit_rescan(walk)?);
         self.status.rescan(None);
+        Ok(plan)
+    }
+
+    fn absorb_walked(
+        &mut self,
+        checkout_id: &str,
+        newly: impl IntoIterator<Item = Walked>,
+    ) -> Result<HashPlan, SlaveError> {
+        let mut plan = HashPlan::default();
+        for row in newly {
+            match row {
+                Walked::Ready(path, found) => {
+                    plan.send
+                        .extend(self.announce_new_to_index(checkout_id, path, found)?);
+                }
+                Walked::Needs(need) => plan.append(self.enqueue_hash(need)),
+            }
+        }
         Ok(plan)
     }
 
@@ -1492,7 +1606,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     }
 
     fn step_dir_list(&mut self, budget: usize) -> Result<HashPlan, SlaveError> {
-        let (checkout_id, parent, batch, next) = {
+        let (checkout_id, parent, batch, next, deletes_stale) = {
             let Some(page) = self.crawl.front_page_mut() else {
                 return Ok(HashPlan::default());
             };
@@ -1501,6 +1615,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             let after = page.after.clone();
             let more = page.more;
             let page_end = page.page_end.clone();
+            let deletes_stale = page.deletes_stale;
             let mut batch = Vec::new();
             let mut used = 0;
             while used < budget {
@@ -1529,7 +1644,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             } else {
                 None
             };
-            (checkout_id, parent, batch, next)
+            (checkout_id, parent, batch, next, deletes_stale)
         };
         self.crawl.pop_page_if_empty();
         let mut plan = HashPlan::default();
@@ -1540,10 +1655,17 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 &entry,
                 slave_child.as_ref(),
                 master_child.as_ref(),
+                deletes_stale,
             )?);
         }
-        if let Some(msg) = next {
-            plan.send.push(msg);
+        if let Some(ProtocolMessage::DirListRequest {
+            checkout_id,
+            path,
+            after,
+        }) = next
+        {
+            plan.send
+                .push(self.dir_list_request(&checkout_id, path, after));
         }
         Ok(plan)
     }
@@ -1555,6 +1677,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         entry: &str,
         slave_child: Option<&DirChild>,
         master_child: Option<&DirChild>,
+        deletes_stale: bool,
     ) -> Result<HashPlan, SlaveError> {
         let child_path = join_central(path, entry)?;
         let last_synced = self.last_synced(checkout_id, &child_path)?;
@@ -1563,11 +1686,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         let mut plan = HashPlan::default();
         match decide_child(slave_child, master_child, last_synced, local_file) {
             WalkAction::Matched => {}
-            WalkAction::Recurse => plan.send.push(ProtocolMessage::DirListRequest {
-                checkout_id: checkout_id.into(),
-                path: child_path,
-                after: None,
-            }),
+            WalkAction::Recurse => {
+                plan.send
+                    .push(self.dir_list_request(checkout_id, child_path, None))
+            }
             WalkAction::Pull => {
                 let master_dir = matches!(master_child, Some(DirChild::Directory { .. }));
                 let slave_dir = matches!(slave_child, Some(DirChild::Directory { .. }));
@@ -1583,11 +1705,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                         Instant::now(),
                     );
                 }
-                plan.send.push(ProtocolMessage::DirListRequest {
-                    checkout_id: checkout_id.into(),
-                    path: child_path,
-                    after: None,
-                });
+                plan.send
+                    .push(self.dir_list_request(checkout_id, child_path.clone(), None));
             }
             WalkAction::AnnounceCreate | WalkAction::AnnounceCas => {
                 let walk_dir = local_meta
@@ -1595,16 +1714,16 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                     .is_some_and(|meta| meta.kind == EntryKind::Dir);
                 if walk_dir {
                     plan.append(self.note_changed(checkout_id, child_path.clone())?);
-                    plan.send.push(ProtocolMessage::DirListRequest {
-                        checkout_id: checkout_id.into(),
-                        path: child_path,
-                        after: None,
-                    });
+                    plan.send
+                        .push(self.dir_list_request(checkout_id, child_path.clone(), None));
                 } else {
                     plan.append(self.note_changed(checkout_id, child_path)?);
                 }
             }
             WalkAction::AnnounceDelete => {
+                if deletes_stale || self.crawl.rescanning(checkout_id) {
+                    return Ok(plan);
+                }
                 plan.send
                     .extend(self.reconcile_delete(checkout_id, &child_path)?);
             }

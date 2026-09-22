@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::hashing::{HashKey, HashNeed};
 use crate::merkle::DirChild;
@@ -38,6 +38,7 @@ pub(crate) struct RescanWalk {
     pub central: CanonicalPath,
     pending: Vec<CanonicalPath>,
     open: Option<OpenDir>,
+    inflight_stat: usize,
     pub found: BTreeMap<CanonicalPath, FileMetadata>,
     pub awaiting_hash: HashSet<CanonicalPath>,
 }
@@ -47,12 +48,47 @@ struct OpenDir {
     remaining: Vec<(String, PathBuf)>,
 }
 
+pub struct RescanStat {
+    checkout_id: String,
+    child: CanonicalPath,
+    rel_child: CanonicalPath,
+    host: PathBuf,
+    prior: Option<FileMetadata>,
+}
+
+pub struct RescanStated {
+    stat: RescanStat,
+    result: Result<Inspected, io::Error>,
+}
+
+impl RescanStat {
+    pub fn host(&self) -> &Path {
+        &self.host
+    }
+
+    pub fn checkout_id(&self) -> &str {
+        &self.checkout_id
+    }
+
+    pub fn inspect(self) -> RescanStated {
+        let result = meta::inspect_for_hash(&self.host, self.prior.as_ref());
+        RescanStated { stat: self, result }
+    }
+}
+
+impl RescanStated {
+    pub fn checkout_id(&self) -> &str {
+        self.stat.checkout_id()
+    }
+}
+
 pub(crate) struct DirListPage {
     pub checkout_id: String,
     pub path: CanonicalPath,
     pub after: Option<EntryName>,
     pub more: bool,
     pub page_end: Option<String>,
+    pub deletes_stale: bool,
     pub remaining: VecDeque<(String, (Option<DirChild>, Option<DirChild>))>,
 }
 
@@ -99,6 +135,10 @@ impl Crawl {
     pub(crate) fn drop_checkout(&mut self, checkout_id: &str) {
         self.rescans.retain(|walk| walk.checkout_id != checkout_id);
         self.pages.retain(|page| page.checkout_id != checkout_id);
+    }
+
+    pub(crate) fn front_rescan(&self) -> Option<&RescanWalk> {
+        self.rescans.front()
     }
 
     pub(crate) fn front_rescan_mut(&mut self) -> Option<&mut RescanWalk> {
@@ -155,64 +195,77 @@ impl RescanWalk {
             central,
             pending,
             open: None,
+            inflight_stat: 0,
             found,
             awaiting_hash: HashSet::new(),
         })
     }
 
     pub(crate) fn collect_done(&self) -> bool {
-        self.open.is_none() && self.pending.is_empty()
+        self.open.is_none() && self.pending.is_empty() && self.inflight_stat == 0
     }
 
-    pub(crate) fn collect<E>(
+    pub(crate) fn wants_stat(&self) -> bool {
+        self.inflight_stat == 0
+            && (self
+                .open
+                .as_ref()
+                .is_some_and(|open| !open.remaining.is_empty())
+                || !self.pending.is_empty())
+    }
+
+    pub(crate) fn take_unstated<E>(
         &mut self,
         budget: usize,
         mut previous: impl FnMut(&CanonicalPath) -> Result<Option<FileMetadata>, E>,
-    ) -> Result<Vec<Walked>, WalkError<E>> {
+    ) -> Result<Vec<RescanStat>, WalkError<E>> {
+        if self.inflight_stat > 0 {
+            return Ok(Vec::new());
+        }
         let mut used = 0;
-        let mut newly = Vec::new();
+        let mut needs = Vec::new();
         while used < budget {
             if let Some(open) = &mut self.open {
                 if let Some((name, host_child)) = open.remaining.pop() {
-                    let rel_child = join_central(&open.rel, &name).map_err(WalkError::Path)?;
-                    let child =
-                        join_central(&self.central, rel_child.as_str().trim_start_matches('/'))
-                            .map_err(WalkError::Path)?;
-                    let prior = previous(&child).map_err(WalkError::Index)?;
-                    match meta::inspect_for_hash(&host_child, prior.as_ref()) {
-                        Ok(Inspected::Ready(meta)) => {
-                            if meta.kind == EntryKind::Dir {
-                                self.pending.push(rel_child);
-                            }
-                            self.found.insert(child.clone(), meta.clone());
-                            newly.push(Walked::Ready(child, meta));
+                    let rel_child = match join_central(&open.rel, &name) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            self.inflight_stat = self.inflight_stat.saturating_sub(needs.len());
+                            return Err(WalkError::Path(err));
                         }
-                        Ok(Inspected::NeedHash(host)) => {
-                            self.awaiting_hash.insert(child.clone());
-                            newly.push(Walked::Needs(HashNeed {
-                                key: HashKey::Checkout {
-                                    id: self.checkout_id.clone(),
-                                    path: child,
-                                },
-                                host,
-                                previous: prior,
-                            }));
+                    };
+                    let child = match join_central(
+                        &self.central,
+                        rel_child.as_str().trim_start_matches('/'),
+                    ) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            self.inflight_stat = self.inflight_stat.saturating_sub(needs.len());
+                            return Err(WalkError::Path(err));
                         }
-                        Ok(Inspected::Absent) => {}
-                        Err(source) => {
-                            return Err(WalkError::Io {
-                                path: host_child,
-                                source,
-                            });
+                    };
+                    let prior = match previous(&child) {
+                        Ok(prior) => prior,
+                        Err(err) => {
+                            self.inflight_stat = self.inflight_stat.saturating_sub(needs.len());
+                            return Err(WalkError::Index(err));
                         }
-                    }
+                    };
+                    needs.push(RescanStat {
+                        checkout_id: self.checkout_id.clone(),
+                        child,
+                        rel_child,
+                        host: host_child,
+                        prior,
+                    });
+                    self.inflight_stat += 1;
                     used += 1;
                     continue;
                 }
                 self.open = None;
             }
             let Some(rel_dir) = self.pending.pop() else {
-                return Ok(newly);
+                return Ok(needs);
             };
             let host = canonical_to_host(&self.local, &rel_dir);
             let remaining = match read_dir_names(&host, rel_dir.as_str() == "/") {
@@ -227,6 +280,7 @@ impl RescanWalk {
                     continue;
                 }
                 Err(source) => {
+                    self.inflight_stat = self.inflight_stat.saturating_sub(needs.len());
                     return Err(WalkError::Io { path: host, source });
                 }
             };
@@ -234,6 +288,78 @@ impl RescanWalk {
                 rel: rel_dir,
                 remaining,
             });
+        }
+        Ok(needs)
+    }
+
+    pub(crate) fn apply_stated(
+        &mut self,
+        stated: RescanStated,
+    ) -> Result<Option<Walked>, WalkError<io::Error>> {
+        self.inflight_stat = self.inflight_stat.saturating_sub(1);
+        let RescanStated { stat, result } = stated;
+        let inspected = result.map_err(|source| WalkError::Io {
+            path: stat.host.clone(),
+            source,
+        })?;
+        match inspected {
+            Inspected::Ready(meta) => {
+                if meta.kind == EntryKind::Dir {
+                    self.pending.push(stat.rel_child);
+                }
+                self.found.insert(stat.child.clone(), meta.clone());
+                Ok(Some(Walked::Ready(stat.child, meta)))
+            }
+            Inspected::NeedHash(host) => {
+                self.awaiting_hash.insert(stat.child.clone());
+                Ok(Some(Walked::Needs(HashNeed {
+                    key: HashKey::Checkout {
+                        id: stat.checkout_id,
+                        path: stat.child,
+                    },
+                    host,
+                    previous: stat.prior,
+                })))
+            }
+            Inspected::Absent => Ok(None),
+        }
+    }
+
+    pub(crate) fn collect<E>(
+        &mut self,
+        budget: usize,
+        mut previous: impl FnMut(&CanonicalPath) -> Result<Option<FileMetadata>, E>,
+    ) -> Result<Vec<Walked>, WalkError<E>> {
+        let mut newly = Vec::new();
+        let mut used = 0;
+        while used < budget {
+            let needs = self.take_unstated(budget - used, &mut previous)?;
+            if needs.is_empty() {
+                break;
+            }
+            let total = needs.len();
+            for (i, need) in needs.into_iter().enumerate() {
+                let stated = need.inspect();
+                if let Err(source) = stated.result {
+                    let remaining = total - i;
+                    self.inflight_stat = self.inflight_stat.saturating_sub(remaining);
+                    return Err(WalkError::Io {
+                        path: stated.stat.host,
+                        source,
+                    });
+                }
+                match self.apply_stated(stated) {
+                    Ok(Some(row)) => newly.push(row),
+                    Ok(None) => {}
+                    Err(WalkError::Io { path, source }) => {
+                        let remaining = total - i - 1;
+                        self.inflight_stat = self.inflight_stat.saturating_sub(remaining);
+                        return Err(WalkError::Io { path, source });
+                    }
+                    Err(WalkError::Index(_)) | Err(WalkError::Path(_)) => unreachable!(),
+                }
+                used += 1;
+            }
         }
         Ok(newly)
     }
@@ -266,6 +392,7 @@ impl DirListPage {
         after: Option<EntryName>,
         more: bool,
         page_end: Option<String>,
+        deletes_stale: bool,
         by_name: BTreeMap<String, (Option<DirChild>, Option<DirChild>)>,
     ) -> Self {
         Self {
@@ -274,6 +401,7 @@ impl DirListPage {
             after,
             more,
             page_end,
+            deletes_stale,
             remaining: by_name.into_iter().collect(),
         }
     }
