@@ -1,10 +1,9 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use arborsync_core::{format_hex_key, write_static_key};
 
-pub fn run(out: Option<PathBuf>) -> anyhow::Result<()> {
-    let path = out.ok_or_else(|| anyhow::anyhow!("--out is required"))?;
-    let public = write_static_key(&path)?;
+pub fn run(out: &Path) -> anyhow::Result<()> {
+    let public = write_static_key(out)?;
     println!("{}", format_hex_key(&public));
     Ok(())
 }

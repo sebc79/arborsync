@@ -79,8 +79,11 @@ impl AttemptLimiter {
     }
 
     pub fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
+        self.prune(now);
+        if self.max == 0 {
+            return false;
+        }
         let hits = self.hits.entry(ip).or_default();
-        hits.retain(|t| now.duration_since(*t) < self.window);
         if hits.len() as u32 >= self.max {
             return false;
         }
@@ -88,13 +91,18 @@ impl AttemptLimiter {
         true
     }
 
-    pub fn limited(&self, ip: IpAddr, now: Instant) -> bool {
-        self.hits.get(&ip).is_some_and(|hits| {
-            hits.iter()
-                .filter(|t| now.duration_since(**t) < self.window)
-                .count() as u32
-                >= self.max
-        })
+    fn prune(&mut self, now: Instant) {
+        self.hits.retain(|_, hits| {
+            hits.retain(|t| now.duration_since(*t) < self.window);
+            !hits.is_empty()
+        });
+    }
+
+    pub fn limited(&mut self, ip: IpAddr, now: Instant) -> bool {
+        self.prune(now);
+        self.hits
+            .get(&ip)
+            .is_some_and(|hits| hits.len() as u32 >= self.max)
     }
 }
 
@@ -562,5 +570,28 @@ impl Transport for Connection {
             Ok(frame) => frame.to_vec(),
             Err(_) => std::future::pending().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod attempt_limiter_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::{Duration, Instant};
+
+    use super::AttemptLimiter;
+
+    #[test]
+    fn drops_an_address_once_its_hits_leave_the_window() {
+        let mut limiter = AttemptLimiter::new(2);
+        let idle = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let t0 = Instant::now();
+        assert!(limiter.allow(idle, t0));
+        assert_eq!(limiter.hits.len(), 1);
+        let later = t0 + Duration::from_secs(60);
+        let other = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        assert!(limiter.allow(other, later));
+        assert!(!limiter.hits.contains_key(&idle));
+        assert_eq!(limiter.hits.len(), 1);
+        assert!(!limiter.limited(idle, later));
     }
 }

@@ -30,7 +30,7 @@ pub enum Command {
     /// Write a 32-byte X25519 secret and print the public key
     Keygen {
         #[arg(long)]
-        out: Option<PathBuf>,
+        out: PathBuf,
     },
 }
 
@@ -39,7 +39,7 @@ impl Cli {
         match self.command {
             Command::Master { config } => master::run(resolve_config(config)),
             Command::Slave { config } => slave::run(resolve_config(config)),
-            Command::Keygen { out } => keygen::run(out),
+            Command::Keygen { out } => keygen::run(&out),
         }
     }
 }

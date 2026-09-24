@@ -160,6 +160,26 @@ fn status_interval_0_is_ok() {
 }
 
 #[test]
+fn rescan_interval_zero_is_rejected() {
+    let master = valid_master().replace(
+        "watcher_debounce_ms = 200",
+        "watcher_debounce_ms = 200\nrescan_interval_seconds = 0",
+    );
+    match LoadedMaster::parse(&master) {
+        Err(ConfigError::RescanIntervalZero) => {}
+        other => panic!("expected RescanIntervalZero, got {other:?}"),
+    }
+    let slave = slave_toml("checkouts = []").replace(
+        "watcher_debounce_ms = 200",
+        "watcher_debounce_ms = 200\nrescan_interval_seconds = 0",
+    );
+    match LoadedSlave::parse(&slave) {
+        Err(ConfigError::RescanIntervalZero) => {}
+        other => panic!("expected RescanIntervalZero, got {other:?}"),
+    }
+}
+
+#[test]
 fn status_interval_3601_is_out_of_range() {
     let master = valid_master().replace(
         "watcher_debounce_ms = 200",

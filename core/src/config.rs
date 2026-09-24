@@ -144,6 +144,8 @@ pub enum ConfigError {
     BadLogLevel { value: String },
     #[error("status_interval_seconds {value} exceeds 3600")]
     StatusIntervalOutOfRange { value: u64 },
+    #[error("rescan_interval_seconds must be at least 1")]
+    RescanIntervalZero,
     #[error("invalid pin at {field}")]
     BadPin { field: String },
     #[error("invalid prefix at {field}: {source}")]
@@ -581,6 +583,7 @@ impl LoadedCheckout {
 
 fn project_master(config: MasterConfig) -> Result<LoadedMaster, ConfigError> {
     check_debounce(config.watcher_debounce_ms)?;
+    check_rescan_interval(config.rescan_interval_seconds)?;
     check_status_interval(config.status_interval_seconds)?;
     check_log_level(&config.log_level)?;
     let listen_addr =
@@ -675,6 +678,7 @@ fn project_slave(config: SlaveConfig) -> Result<LoadedSlave, ConfigError> {
     let db_path = expand_host_path("db_path", &config.db_path)?;
     check_log_level(&config.log_level)?;
     check_debounce(config.watcher_debounce_ms)?;
+    check_rescan_interval(config.rescan_interval_seconds)?;
     check_status_interval(config.status_interval_seconds)?;
     let tune = project_tune(config.tune, TuneRole::Slave)?;
 
@@ -825,6 +829,14 @@ fn check_debounce(ms: u64) -> Result<(), ConfigError> {
         Ok(())
     } else {
         Err(ConfigError::DebounceOutOfRange { value: ms })
+    }
+}
+
+fn check_rescan_interval(seconds: u64) -> Result<(), ConfigError> {
+    if seconds == 0 {
+        Err(ConfigError::RescanIntervalZero)
+    } else {
+        Ok(())
     }
 }
 

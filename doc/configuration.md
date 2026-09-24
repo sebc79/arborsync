@@ -29,7 +29,7 @@ master_key_path = "/etc/arborsync/master.key"
 db_path = "/var/lib/arborsync/index.redb"
 log_level = "info"                    # error | warn | info | debug | trace
 watcher_debounce_ms = 200             # 200–500
-rescan_interval_seconds = 60
+rescan_interval_seconds = 60          # at least 1
 status_interval_seconds = 5           # 0 disables, max 3600
 max_checkouts_per_slave = 100
 max_connections = 100
@@ -64,7 +64,7 @@ db_path = "/var/cache/arborsync/cache.redb"
 log_level = "info"
 max_checkouts_per_slave = 100         # same name and default as the master
 watcher_debounce_ms = 200
-rescan_interval_seconds = 60
+rescan_interval_seconds = 60          # at least 1
 status_interval_seconds = 5           # 0 disables, max 3600
 
 # [tune.hashing]
