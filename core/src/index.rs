@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::hash::{DirNode, SubtreeRoot};
 use crate::merkle::{
-    DirChild, dir_entry_hash_off, dir_node, dir_node_from_concat, empty_dir_node, encode_dir_entry,
-    file_node,
+    dir_entry_hash_off, dir_node, dir_node_from_concat, empty_dir_node, encode_dir_entry,
+    file_node, DirChild,
 };
 use crate::meta::{EntryKind, FileMetadata};
 use crate::path::{CanonicalPath, EntryName};
@@ -426,6 +426,108 @@ fn depth(path: &CanonicalPath) -> usize {
     }
 }
 
+/// Rewrite directory hashes that do not match their indexed children.
+///
+/// A rescan that finds every file already in `meta` commits nothing, so a hash
+/// left behind by an earlier partial commit stays in place and the root keeps
+/// matching a tree that does not contain those files. Files in such a directory
+/// lose `last_synced` so reconcile announces them instead of treating the gap
+/// as a delete.
+pub fn repair_dir_nodes<S: Storage>(
+    store: &S,
+    ck: &CheckoutId,
+    root: &CanonicalPath,
+) -> Result<bool, S::Error> {
+    let rows = store.range_meta(ck, root)?;
+    let mut by_parent: HashMap<CanonicalPath, Vec<(CanonicalPath, FileMetadata)>> = HashMap::new();
+    for (path, meta) in &rows {
+        if let Some(parent) = path.parent() {
+            by_parent
+                .entry(parent)
+                .or_default()
+                .push((path.clone(), meta.clone()));
+        }
+    }
+    let mut dirs: Vec<CanonicalPath> = rows
+        .iter()
+        .filter(|(_, meta)| meta.kind == EntryKind::Dir)
+        .map(|(path, _)| path.clone())
+        .collect();
+    if !dirs.iter().any(|dir| dir == root) {
+        dirs.push(root.clone());
+    }
+    dirs.sort_by_key(|path| std::cmp::Reverse(depth(path)));
+
+    let mut computed: HashMap<CanonicalPath, DirNode> = HashMap::new();
+    let mut stale_files: Vec<CanonicalPath> = Vec::new();
+    let mut writes: Vec<(CanonicalPath, DirNode)> = Vec::new();
+    for dir in &dirs {
+        let fresh = hash_children(by_parent.get(dir), &computed, store, ck)?;
+        let stored = store.get_dir_node(ck, dir)?;
+        if stored != Some(fresh) {
+            let against_stored = hash_children(by_parent.get(dir), &HashMap::new(), store, ck)?;
+            if stored != Some(against_stored) {
+                if let Some(kids) = by_parent.get(dir) {
+                    for (path, meta) in kids {
+                        if meta.kind == EntryKind::File {
+                            stale_files.push(path.clone());
+                        }
+                    }
+                }
+            }
+            writes.push((dir.clone(), fresh));
+        }
+        computed.insert(dir.clone(), fresh);
+    }
+    if writes.is_empty() {
+        return Ok(false);
+    }
+    let mut batch = store.begin_write()?;
+    for path in &stale_files {
+        batch.del_last_synced(ck, path)?;
+    }
+    for (dir, node) in &writes {
+        batch.put_dir_node(ck, dir, *node)?;
+    }
+    batch.commit()?;
+    Ok(true)
+}
+
+fn hash_children<S: Storage>(
+    kids: Option<&Vec<(CanonicalPath, FileMetadata)>>,
+    computed: &HashMap<CanonicalPath, DirNode>,
+    store: &S,
+    ck: &CheckoutId,
+) -> Result<DirNode, S::Error> {
+    let Some(kids) = kids else {
+        return Ok(empty_dir_node());
+    };
+    let mut entries = Vec::with_capacity(kids.len());
+    for (path, meta) in kids {
+        let Ok(name) = EntryName::parse(path.name()) else {
+            continue;
+        };
+        entries.push(match meta.kind {
+            EntryKind::File => DirChild::File {
+                name,
+                node: file_node(meta),
+            },
+            EntryKind::Symlink => DirChild::Symlink {
+                name,
+                node: file_node(meta),
+            },
+            EntryKind::Dir => DirChild::Directory {
+                name,
+                node: match computed.get(path) {
+                    Some(node) => *node,
+                    None => store.get_dir_node(ck, path)?.unwrap_or_else(empty_dir_node),
+                },
+            },
+        });
+    }
+    Ok(dir_node(&entries))
+}
+
 fn recompute<S: Storage>(
     store: &S,
     ck: &CheckoutId,
@@ -496,7 +598,7 @@ fn children_of<S: Storage>(
 mod tests {
     use super::*;
     use crate::hash::ContentHash;
-    use crate::test_support::{MemoryStorage, expected_dir_node, p};
+    use crate::test_support::{expected_dir_node, p, MemoryStorage};
 
     fn file(byte: u8) -> FileMetadata {
         FileMetadata::file(1, 0, 0o100644, ContentHash::from_bytes([byte; 32]))
@@ -575,6 +677,62 @@ mod tests {
         commit_cold(&store, &ck, &dir_path, Some(&leaf), LastSynced::AdoptLeaf).unwrap();
         assert_eq!(store.get_meta(&ck, &child).unwrap(), None);
         assert_eq!(store.get_meta(&ck, &dir_path).unwrap().unwrap(), leaf);
+    }
+
+    #[test]
+    fn repair_dir_nodes_rebuilds_a_stale_hash_and_drops_last_synced() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::master();
+        let dir = p("/src");
+        let file_path = p("/src/a");
+        let leaf = file(1);
+        commit_cold(
+            &store,
+            &ck,
+            &dir,
+            Some(&FileMetadata::directory(0, 0o040755)),
+            LastSynced::AdoptLeaf,
+        )
+        .unwrap();
+        commit_cold(&store, &ck, &file_path, Some(&leaf), LastSynced::AdoptLeaf).unwrap();
+        let good = store.get_dir_node(&ck, &dir).unwrap().unwrap();
+        assert!(store.get_last_synced(&ck, &file_path).unwrap().is_some());
+
+        let mut batch = store.begin_write().unwrap();
+        batch.put_dir_node(&ck, &dir, empty_dir_node()).unwrap();
+        batch.commit().unwrap();
+
+        assert!(repair_dir_nodes(&store, &ck, &dir).unwrap());
+        assert_eq!(store.get_dir_node(&ck, &dir).unwrap(), Some(good));
+        assert!(store.get_last_synced(&ck, &file_path).unwrap().is_none());
+        assert!(!repair_dir_nodes(&store, &ck, &dir).unwrap());
+    }
+
+    #[test]
+    fn repair_dir_nodes_keeps_last_synced_when_the_hash_matches() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::master();
+        let dir = p("/src");
+        let file_path = p("/src/a");
+        commit_cold(
+            &store,
+            &ck,
+            &dir,
+            Some(&FileMetadata::directory(0, 0o040755)),
+            LastSynced::AdoptLeaf,
+        )
+        .unwrap();
+        commit_cold(
+            &store,
+            &ck,
+            &file_path,
+            Some(&file(1)),
+            LastSynced::AdoptLeaf,
+        )
+        .unwrap();
+        let synced = store.get_last_synced(&ck, &file_path).unwrap();
+        assert!(!repair_dir_nodes(&store, &ck, &dir).unwrap());
+        assert_eq!(store.get_last_synced(&ck, &file_path).unwrap(), synced);
     }
 
     #[test]
