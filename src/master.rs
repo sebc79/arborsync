@@ -10,7 +10,8 @@ use arborsync_core::ReloadError;
 use arborsync_core::hashing::HashNeed;
 use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::master::{
-    FulfillPlan, Master, PreparedDelete, Reply, WholeFileLater, reclaim_tree, survey_central,
+    ContentHook, FulfillPlan, Master, PreparedDelete, Reply, WholeFileLater, reclaim_tree,
+    survey_central,
 };
 use arborsync_core::path::host_to_canonical;
 use arborsync_core::protocol::ProtocolMessage;
@@ -289,46 +290,67 @@ async fn accept_session(
         ip,
         wipe_ready: &wipe_ready,
     };
-    loop {
-        if drain_parked(&drive, &mut parked).await? {
-            break;
+    let session = async {
+        loop {
+            if drain_parked(&drive, &mut parked).await? {
+                break;
+            }
+            tokio::select! {
+                _ = stop_rx.changed() => {
+                    if *stop_rx.borrow() {
+                        break;
+                    }
+                }
+                msg = Connection::read_control(&mut recv) => {
+                    let msg = msg?;
+                    if control_waits(&master, &msg) {
+                        parked.push_back(msg);
+                    } else if drive_control(&drive, &mut parked, msg).await? {
+                        break;
+                    }
+                }
+                incoming = conn.accept_uni() => {
+                    let mut recv = incoming.map_err(stream_err)?;
+                    let (header, body) = read_bulk(&mut recv).await?;
+                    let reply = master.lock().expect("master").apply_bulk(peer, header, &body)?;
+                    if dispatch_master(&master, peer, &slave_id, &conn, &write_tx, reply, &limiter, ip)? {
+                        break;
+                    }
+                }
+                frame = conn.recv_datagram() => {
+                    master.lock().expect("master").observe_gauge(peer, &frame);
+                }
+                Some(err) = write_err_rx.recv() => return Err(err.into()),
+                _ = wipe_ready.notified() => {}
+                _ = tick.tick() => flush_outbox(&master, peer, &write_tx)?,
+            }
         }
-        tokio::select! {
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
-                    break;
-                }
-            }
-            msg = Connection::read_control(&mut recv) => {
-                let msg = msg?;
-                if control_waits(&master, &msg) {
-                    parked.push_back(msg);
-                } else if drive_control(&drive, &mut parked, msg).await? {
-                    break;
-                }
-            }
-            incoming = conn.accept_uni() => {
-                let mut recv = incoming.map_err(stream_err)?;
-                let (header, body) = read_bulk(&mut recv).await?;
-                let reply = master.lock().expect("master").apply_bulk(peer, header, &body)?;
-                if dispatch_master(&master, peer, &slave_id, &conn, &write_tx, reply, &limiter, ip)? {
-                    break;
-                }
-            }
-            frame = conn.recv_datagram() => {
-                master.lock().expect("master").observe_gauge(peer, &frame);
-            }
-            Some(err) = write_err_rx.recv() => return Err(err.into()),
-            _ = wipe_ready.notified() => {}
-            _ = tick.tick() => flush_outbox(&master, peer, &write_tx)?,
-        }
+        Ok(())
     }
+    .await;
 
-    if !*stop_rx.borrow() {
-        sessions.lock().expect("sessions").remove(&slave_id);
-        master.lock().expect("master").disconnect(peer);
+    release_session(
+        &sessions,
+        &*master,
+        &slave_id,
+        peer,
+        *stop_rx.borrow(),
+    );
+    session
+}
+
+fn release_session<S: Storage, C: ContentHook>(
+    sessions: &Mutex<HashMap<String, SessionHandle>>,
+    master: &Mutex<Master<S, C>>,
+    slave_id: &str,
+    peer: [u8; 32],
+    replaced: bool,
+) {
+    if replaced {
+        return;
     }
-    Ok(())
+    sessions.lock().expect("sessions").remove(slave_id);
+    master.lock().expect("master").disconnect(peer);
 }
 
 struct SessionDrive<'a> {
@@ -697,8 +719,15 @@ fn submit_master_hashes(
 
 #[cfg(test)]
 mod tests {
-    use super::fulfill_control;
-    use arborsync_core::protocol::ProtocolMessage;
+    use std::sync::Mutex;
+
+    use super::{fulfill_control, release_session};
+    use arborsync_core::LoadedMaster;
+    use arborsync_core::config::SlaveAcl;
+    use arborsync_core::keys::format_hex_key;
+    use arborsync_core::master::{Master, MemoryContent};
+    use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
+    use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
     use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
@@ -713,6 +742,56 @@ mod tests {
             rx.try_recv().ok(),
             Some(vec![msg]),
             "the asker was not told the fulfill failed"
+        );
+    }
+
+    const ALICE: [u8; 32] = [0xA1; 32];
+
+    fn subscribed_master() -> Mutex<Master<MemoryStorage, MemoryContent>> {
+        let sandbox = SyncSandbox::new();
+        let cfg_path = sandbox.write_master_config(vec![SlaveAcl {
+            id: "dev-alice".into(),
+            public_keys: vec![format_hex_key(&ALICE)],
+            allowed_prefixes: vec!["/src".into()],
+        }]);
+        let cfg = LoadedMaster::load(&cfg_path).unwrap();
+        let mut master = Master::open(cfg, MemoryStorage::new(), MemoryContent::new()).unwrap();
+        master
+            .handle(
+                ALICE,
+                ProtocolMessage::Subscribe {
+                    slave_id: "dev-alice".into(),
+                    checkouts: vec![CheckoutRef {
+                        id: "src".into(),
+                        central: p("/src"),
+                    }],
+                },
+            )
+            .unwrap();
+        Mutex::new(master)
+    }
+
+    #[test]
+    fn ending_a_session_drops_the_slave_from_the_roster() {
+        let master = subscribed_master();
+        let sessions = Mutex::new(std::collections::HashMap::new());
+        release_session(&sessions, &master, "dev-alice", ALICE, false);
+        assert_eq!(
+            master.lock().expect("master").take_status().connected,
+            0,
+            "a finished session still counted as connected"
+        );
+    }
+
+    #[test]
+    fn a_replaced_session_keeps_the_new_roster_entry() {
+        let master = subscribed_master();
+        let sessions = Mutex::new(std::collections::HashMap::new());
+        release_session(&sessions, &master, "dev-alice", ALICE, true);
+        assert_eq!(
+            master.lock().expect("master").take_status().connected,
+            1,
+            "the replacement was dropped with the old task"
         );
     }
 }
