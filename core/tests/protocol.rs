@@ -337,3 +337,19 @@ fn decode_bulk_rejects_a_truncated_body() {
     frame.pop();
     assert_eq!(decode_bulk(&frame).unwrap_err(), FrameError::Truncated);
 }
+
+#[test]
+fn decode_bulk_rejects_a_body_larger_than_the_cap() {
+    let header = BulkHeader {
+        path: p("/src/hello.txt"),
+        checkout_id: "src".into(),
+        want_hash: ContentHash::from_bytes([7; 32]),
+        encoding: BulkEncoding::Whole,
+        size: u64::MAX,
+    };
+    let payload =
+        bincode::serde::encode_to_vec(&header, bincode::config::standard()).expect("header");
+    let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+    frame.extend(payload);
+    assert_eq!(decode_bulk(&frame).unwrap_err(), FrameError::TooLarge);
+}
