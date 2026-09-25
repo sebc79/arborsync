@@ -16,8 +16,8 @@ use crate::inflight::Inflight;
 use crate::merkle::{DirChild, file_node};
 use crate::meta::{self, EntryKind, FileMetadata, Inspected, hash_bytes};
 use crate::path::{
-    CanonicalPath, EntryName, PathError, canonical_to_host, conflict_sidecar_path, join_central,
-    local_paths_overlap, strip_central,
+    CanonicalPath, EntryName, PathError, canonical_to_host, confine_host, conflict_sidecar_path,
+    join_central, local_paths_overlap, strip_central,
 };
 use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
 use crate::reconcile::{WalkAction, decide_child};
@@ -1487,7 +1487,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 strip_central(&checkout.central, path)?,
             )
         };
-        let host = canonical_to_host(&local, &relative);
+        let host = confine_host(&local, &relative)?;
         fs::create_dir_all(&host).map_err(SlaveError::io(&host))?;
         let found = meta::collect_from_path(&host)
             .map_err(SlaveError::io(&host))?
@@ -2109,8 +2109,11 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         from: &CanonicalPath,
         to: &CanonicalPath,
     ) -> Result<(), SlaveError> {
-        let from_host = self.host_for(checkout_id, from)?;
-        let to_host = self.host_for(checkout_id, to)?;
+        let checkout = self.checkout(checkout_id)?;
+        let from_rel = strip_central(&checkout.central, from)?;
+        let to_rel = strip_central(&checkout.central, to)?;
+        let from_host = confine_host(&checkout.local, &from_rel)?;
+        let to_host = confine_host(&checkout.local, &to_rel)?;
         let to_exists = match fs::symlink_metadata(&to_host) {
             Ok(_) => true,
             Err(err) if err.kind() == io::ErrorKind::NotFound => false,
@@ -2192,7 +2195,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 continue;
             }
             let relative = strip_central(&central, &dir)?;
-            let host = canonical_to_host(&local, &relative);
+            let host = confine_host(&local, &relative)?;
             fs::create_dir_all(&host).map_err(SlaveError::io(&host))?;
             let Some(found) = meta::collect_from_path(&host).map_err(SlaveError::io(&host))? else {
                 continue;

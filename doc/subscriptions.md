@@ -68,7 +68,7 @@ Master keeps an in-memory trie of `(slave_id, checkout_id, central)` for connect
 
 - Reject `central` that is not absolute, that contains `.` / `..` components after normalization, or that is not valid UTF-8.
 - After normalization, `central` must start with `/`.
-- Master never writes outside `central_root`. Slave never writes outside `local` (join + canonicalize, then prefix-check).
+- Master never writes outside `central_root`. Slave never writes outside `local`. `confine_host` canonicalizes each existing ancestor and rejects a symlink that leaves the root. `canonical_to_host` remains the lexical join.
 
 ## Examples
 
