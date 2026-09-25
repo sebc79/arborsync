@@ -20,7 +20,8 @@ use crate::keys::format_hex_key;
 use crate::merkle::file_node;
 use crate::meta::{self, EntryKind, FileMetadata, Inspected, hash_bytes};
 use crate::path::{
-    CanonicalPath, EntryName, PathError, canonical_to_host, is_reserved_root_entry, join_central,
+    CanonicalPath, EntryName, PathError, canonical_to_host, confine_host, is_reserved_root_entry,
+    join_central,
 };
 use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage, page_dir_list};
 use crate::status::{MasterStatus, PeerLive, Queues, StatusLedger};
@@ -1667,7 +1668,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             if self.meta(&dir)?.is_some() {
                 continue;
             }
-            let host = canonical_to_host(&self.central_root, &dir);
+            let host = confine_host(&self.central_root, &dir)?;
             fs::create_dir_all(&host).map_err(MasterError::io(&host))?;
             let Some(found) = meta::collect_from_path(&host).map_err(MasterError::io(&host))?
             else {

@@ -1,3 +1,5 @@
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -206,6 +208,45 @@ pub fn canonical_to_host(central_root: &Path, path: &CanonicalPath) -> PathBuf {
         return central_root.to_path_buf();
     }
     central_root.join(relative)
+}
+
+/// Join `root` and `path`, then refuse the result when an existing ancestor
+/// is a symlink whose target leaves `root`. Missing components stay lexical.
+pub fn confine_host(root: &Path, path: &CanonicalPath) -> Result<PathBuf, PathError> {
+    let relative = path.as_str().trim_start_matches('/');
+    if relative.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    let mut current = root.to_path_buf();
+    let parts: Vec<&str> = relative
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    for (i, part) in parts.iter().enumerate() {
+        let next = current.join(part);
+        if i + 1 == parts.len() {
+            return Ok(next);
+        }
+        match fs::symlink_metadata(&next) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let mut host = next;
+                for rest in &parts[i + 1..] {
+                    host.push(rest);
+                }
+                return Ok(host);
+            }
+            Err(_) => return Err(PathError::EscapesRoot),
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let resolved = fs::canonicalize(&next).map_err(|_| PathError::EscapesRoot)?;
+                if !resolved.starts_with(root) {
+                    return Err(PathError::EscapesRoot);
+                }
+                current = resolved;
+            }
+            Ok(_) => current = next,
+        }
+    }
+    Ok(current)
 }
 
 pub fn strip_central(

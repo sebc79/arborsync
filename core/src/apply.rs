@@ -12,7 +12,7 @@ use filetime::FileTime;
 
 use crate::hash::ContentHash;
 use crate::meta::{EntryKind, FileMetadata, hash_bytes};
-use crate::path::{CanonicalPath, RESERVED_TMP, canonical_to_host};
+use crate::path::{CanonicalPath, RESERVED_TMP, confine_host};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -24,6 +24,12 @@ pub enum ApplyError {
     },
     #[error("staged bytes do not hash to the announced content hash")]
     ContentMismatch,
+    #[error("path leaves the checkout root")]
+    EscapesRoot,
+}
+
+fn host_in_root(root: &Path, path: &CanonicalPath) -> Result<PathBuf, ApplyError> {
+    confine_host(root, path).map_err(|_| ApplyError::EscapesRoot)
 }
 
 fn at(path: &Path) -> impl Fn(io::Error) -> ApplyError + '_ {
@@ -133,7 +139,7 @@ pub fn atomic_put(
     meta: &FileMetadata,
     bytes: &[u8],
 ) -> Result<(), ApplyError> {
-    let target = canonical_to_host(central_root, path);
+    let target = host_in_root(central_root, path)?;
     StagedContent::write(central_root, bytes)?
         .verify(meta.content_hash)?
         .publish(&target, meta)
@@ -148,7 +154,7 @@ pub fn atomic_symlink(
     if hash_bytes(target_bytes) != meta.content_hash {
         return Err(ApplyError::ContentMismatch);
     }
-    let link = canonical_to_host(central_root, path);
+    let link = host_in_root(central_root, path)?;
     if let Some(parent) = link.parent() {
         fs::create_dir_all(parent).map_err(at(parent))?;
     }
@@ -163,7 +169,7 @@ pub fn mkdir_live(
     path: &CanonicalPath,
     meta: &FileMetadata,
 ) -> Result<(), ApplyError> {
-    let dir = canonical_to_host(central_root, path);
+    let dir = host_in_root(central_root, path)?;
     fs::create_dir_all(&dir).map_err(at(&dir))?;
     apply_mode_and_mtime(&dir, meta)
 }
@@ -174,8 +180,8 @@ pub fn rename_live(
     to: &CanonicalPath,
     meta: &FileMetadata,
 ) -> Result<(), ApplyError> {
-    let from_host = canonical_to_host(root, from);
-    let to_host = canonical_to_host(root, to);
+    let from_host = host_in_root(root, from)?;
+    let to_host = host_in_root(root, to)?;
     if let Some(parent) = to_host.parent() {
         fs::create_dir_all(parent).map_err(at(parent))?;
     }
@@ -190,7 +196,7 @@ pub fn rename_live(
 }
 
 pub fn remove_live(central_root: &Path, path: &CanonicalPath) -> Result<(), ApplyError> {
-    let host = canonical_to_host(central_root, path);
+    let host = host_in_root(central_root, path)?;
     match fs::symlink_metadata(&host) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(at(&host)(err)),
@@ -345,7 +351,7 @@ mod tests {
             !outside.join("pwned").exists(),
             "wrote outside the checkout root"
         );
-        assert!(result.is_err());
+        assert!(matches!(result, Err(ApplyError::EscapesRoot)));
         let _ = fs::remove_dir_all(&base);
     }
 }
