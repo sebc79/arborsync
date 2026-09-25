@@ -25,6 +25,8 @@ pub enum FrameError {
     Truncated,
     #[error("unsupported envelope version {0}")]
     UnsupportedVersion(u16),
+    #[error("trailing bytes inside control frame")]
+    TrailingBytes,
     #[error("bincode error: {0}")]
     Bincode(String),
     #[error("bulk body length {got} does not match header size {want}")]
@@ -254,7 +256,8 @@ pub fn encode_control(msg: &ProtocolMessage) -> Result<Vec<u8>, FrameError> {
 }
 
 /// Decode one control frame. Returns the message and the number of bytes
-/// consumed from `buf` (4 + length).
+/// consumed from `buf` (4 + length). The length prefix must cover exactly
+/// `bincode(version) || bincode(msg)` with no trailing bytes inside it.
 pub fn decode_control(buf: &[u8]) -> Result<(ProtocolMessage, usize), FrameError> {
     if buf.len() < 4 {
         return Err(FrameError::Truncated);
@@ -268,11 +271,14 @@ pub fn decode_control(buf: &[u8]) -> Result<(ProtocolMessage, usize), FrameError
         return Err(FrameError::Truncated);
     }
     let payload = &buf[4..total];
-    let (version, consumed): (u16, usize) = decode_wire(payload).map_err(FrameError::Bincode)?;
+    let (version, ver_len): (u16, usize) = decode_wire(payload).map_err(FrameError::Bincode)?;
     if version != PROTOCOL_VERSION {
         return Err(FrameError::UnsupportedVersion(version));
     }
-    let (msg, _) = decode_wire(&payload[consumed..]).map_err(FrameError::Bincode)?;
+    let (msg, msg_len) = decode_wire(&payload[ver_len..]).map_err(FrameError::Bincode)?;
+    if ver_len + msg_len != payload.len() {
+        return Err(FrameError::TrailingBytes);
+    }
     Ok((msg, total))
 }
 
@@ -280,12 +286,26 @@ pub fn decode_control(buf: &[u8]) -> Result<(ProtocolMessage, usize), FrameError
 /// Each chunk is `u32be len || bytes`, `len` at most [`MAX_BULK_CHUNK`].
 /// The concatenation of the chunks is `header.size` bytes.
 pub fn encode_bulk(header: &BulkHeader, body: &[u8]) -> Result<Vec<u8>, FrameError> {
-    encode_bulk_chunks(header, body, MAX_BULK_CHUNK)
+    encode_bulk_owned(header, body.to_vec())
+}
+
+/// Like [`encode_bulk`], but takes ownership of `body` and moves it into the
+/// frame so a whole-file send does not keep a second full copy.
+pub fn encode_bulk_owned(header: &BulkHeader, body: Vec<u8>) -> Result<Vec<u8>, FrameError> {
+    encode_bulk_chunks_owned(header, body, MAX_BULK_CHUNK)
 }
 
 pub fn encode_bulk_chunks(
     header: &BulkHeader,
     body: &[u8],
+    chunk_max: usize,
+) -> Result<Vec<u8>, FrameError> {
+    encode_bulk_chunks_owned(header, body.to_vec(), chunk_max)
+}
+
+fn encode_bulk_chunks_owned(
+    header: &BulkHeader,
+    mut body: Vec<u8>,
     chunk_max: usize,
 ) -> Result<Vec<u8>, FrameError> {
     if chunk_max == 0 || chunk_max > MAX_BULK_CHUNK {
@@ -298,9 +318,10 @@ pub fn encode_bulk_chunks(
         });
     }
     let mut frame = bulk_header_frame(header)?;
-    for chunk in body.chunks(chunk_max) {
-        frame.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
-        frame.extend_from_slice(chunk);
+    while !body.is_empty() {
+        let n = body.len().min(chunk_max);
+        frame.extend_from_slice(&(n as u32).to_be_bytes());
+        frame.extend(body.drain(..n));
     }
     Ok(frame)
 }

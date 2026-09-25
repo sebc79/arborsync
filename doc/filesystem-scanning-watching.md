@@ -40,7 +40,7 @@ A `need_rescan()` event runs the existing rescan path. It is not mapped as a fil
 
 ## Echo
 
-After a successful file or symlink apply, set `inflight[(checkout_id, path)] = incoming content_hash`. On a watcher event, `stat` plus hash (or target hash for a symlink). If it equals `inflight`, clear `inflight` and stop. Timeout: 2× debounce, then clear anyway.
+After a successful file or symlink apply, set `inflight[(checkout_id, path)] = incoming content_hash`. On a watcher event, `stat` plus hash (or target hash for a symlink). If it equals `inflight`, clear `inflight` and stop. Timeout: 2× debounce, then clear anyway. Arm before the live `rename`, `mkdir`, or replace; disarm if that apply fails so a failed write is not treated as an echo.
 
 Dirs and meta-only apply arm `inflight` (`ContentHash::ZERO` for dirs). Applied dirs keep `last_synced` as that `FileNode`. Incoming rename arms `inflight` on `to`.
 
@@ -55,7 +55,7 @@ The interval is `recv_timeout` on the notify channel (default 60 s). A busy tree
 1. Full `stat` walk of `central_root` or the checkout `local` (`collecting-metadata.md`). Not "changed subtrees only." The master watch thread stats and reads the index without the session mutex, then locks only to commit.
 2. Compare to the index: missing on disk → local delete; missing in index → local create; size/mtime/kind differ → treat as write. A master path is deleted only when a stat taken under the lock still says it is gone. A surveyed row is written only when that later stat still matches.
 3. Slave hashes again only when size, mtime, or kind disagree with the stored row (`collect_for_rescan`). Mode is not a miss. Master `walk_central` also uses `collect_for_rescan`.
-4. Rescan `lstat` runs off the session task, 64 names at a time, so `status`, `read_control`, and the hash pump stay live while those stats are in flight. A partial directory is not a delete. A path missing from the walk is deleted only when a later stat returns not found. A dir-list `Delete` waits until that rescan finishes. A name that is new or changed in the index is `FileAnnounce`d when its stat returns. The slave holds hashed announces until 64 are ready or hashing workers are idle, then one `commit_leaves` writes them. `SubscribeAck` also sends the current `RootReport` before the walk finishes so leftover `DirList*` can start on rows already in the index. Known index rows still reconcile via that `RootReport`. Leftover pages take the next turn when both a rescan and a page are queued. When the walk ends, one `commit_leaves` batch writes deletes and leftover diffs, then the live directory cache for that checkout is dropped so the next write reloads children from the index. A `RootReport` (`spec.md` §10) pulls missed remote changes. `Slave::rescan` still drains the walk for tests. The watch thread only queues a rescan. It does not drain it. An announce after the index row already matches disk does not call `commit_leaf` again.
+4. Rescan `lstat` runs off the session task, 64 names at a time, so `status`, `read_control`, and the hash pump stay live while those stats are in flight. A partial directory is not a delete. A path missing from the walk is deleted only when a later stat returns not found. A dir-list `Delete` waits until that rescan finishes. A name that is new or changed in the index is `FileAnnounce`d when its stat returns. The slave holds hashed announces until 64 are ready or hashing workers are idle, then one `commit_leaves` writes them. `SubscribeAck` also sends the current `RootReport` before the walk finishes so leftover `DirList*` can start on rows already in the index. Known index rows still reconcile via that `RootReport`. Leftover pages take the next turn when both a rescan and a page are queued. When the walk ends, one `commit_leaves` batch writes deletes and leftover diffs, then the live directory cache for that checkout is dropped so the next write reloads children from the index. A `RootReport` (`spec.md` §10) pulls missed remote changes. `Slave::rescan` still drains the walk for tests. The watch thread only queues a rescan. It does not drain it. An announce after the index row already matches disk does not call `commit_leaf` again. While a leftover `DirListResponse` page is still walking, `apply_dir_child` reads the live `cas_since_dir_list` counter so a `CasAccept` that lands mid-page suppresses a stale `AnnounceDelete` for the path that accept just committed.
 
 Rescan exists because inotify/kqueue/NFS drop events. It cannot know dirty subtrees without walking.
 
@@ -71,7 +71,7 @@ Triggers: after each rescan, after `SubscribeAck`, after reconnect. Not “after
 
 ## Watcher death
 
-If the watch handle dies (unmount, overflow): log, drop the handle, rescan immediately, re-arm the watch. The daemon does not exit. Overflow is why rescan exists.
+If the watch handle dies (unmount, overflow): log, drop the handle, rescan immediately, re-arm the watch. The daemon does not exit. Overflow is why rescan exists. If re-arm fails again immediately, sleep one second before the next attempt so a broken watch cannot spin the CPU.
 
 ## Integration
 

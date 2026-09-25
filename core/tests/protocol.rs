@@ -4,8 +4,7 @@ use arborsync_core::path::{CanonicalPath, EntryName};
 use arborsync_core::protocol::{
     BulkEncoding, BulkHeader, DirEntry, Envelope, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE,
     PROTOCOL_VERSION, ProtocolMessage, decode_bulk, decode_control, encode_bulk, encode_bulk_chunks,
-    encode_control,
-    page_dir_list,
+    encode_bulk_owned, encode_control, page_dir_list,
 };
 use arborsync_core::test_support::{name, p};
 
@@ -221,6 +220,31 @@ fn decode_reports_consumed_and_leaves_trailing_bytes() {
 }
 
 #[test]
+fn decode_rejects_trailing_bytes_inside_the_length_prefix() {
+    let msg = ProtocolMessage::Disconnect { reason: "x".into() };
+    let mut frame = encode_control(&msg).unwrap();
+    let len = u32::from_be_bytes(frame[0..4].try_into().unwrap()) as usize;
+    frame.extend_from_slice(&[0xAA, 0xBB]);
+    frame[0..4].copy_from_slice(&((len + 2) as u32).to_be_bytes());
+    assert_eq!(
+        decode_control(&frame).unwrap_err(),
+        FrameError::TrailingBytes
+    );
+}
+
+#[test]
+fn decode_accepts_a_tight_control_frame() {
+    let msg = ProtocolMessage::Error {
+        code: "ok".into(),
+        message: "tight".into(),
+    };
+    let frame = encode_control(&msg).unwrap();
+    let (decoded, consumed) = decode_control(&frame).unwrap();
+    assert_eq!(decoded, msg);
+    assert_eq!(consumed, frame.len());
+}
+
+#[test]
 fn decode_rejects_unsupported_envelope_version() {
     let env = Envelope {
         version: 2,
@@ -262,6 +286,20 @@ fn bulk_frame_is_header_then_exact_size_bytes() {
     assert_eq!(decoded, header);
     assert_eq!(body, b"hello");
     assert_eq!(consumed, frame.len());
+}
+
+#[test]
+fn encode_bulk_owned_matches_encode_bulk_bytes() {
+    let header = BulkHeader {
+        path: p("/src/hello.txt"),
+        checkout_id: "src".into(),
+        want_hash: ContentHash::from_bytes([7; 32]),
+        encoding: BulkEncoding::Whole,
+        size: 5,
+    };
+    let from_slice = encode_bulk(&header, b"hello").unwrap();
+    let from_owned = encode_bulk_owned(&header, b"hello".to_vec()).unwrap();
+    assert_eq!(from_owned, from_slice);
 }
 
 #[test]

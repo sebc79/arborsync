@@ -10,8 +10,8 @@ use arborsync_core::ReloadError;
 use arborsync_core::hashing::HashNeed;
 use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::master::{
-    ContentHook, FulfillPlan, Master, PreparedDelete, Reply, WholeFileLater, reclaim_tree,
-    survey_central,
+    ApplyBulkPlan, ContentHook, FulfillPlan, Master, PreparedDelete, Reply, WholeFileLater,
+    reclaim_tree, survey_central,
 };
 use arborsync_core::path::host_to_canonical;
 use arborsync_core::protocol::ProtocolMessage;
@@ -312,7 +312,28 @@ async fn accept_session(
                 incoming = conn.accept_uni() => {
                     let mut recv = incoming.map_err(stream_err)?;
                     let (header, body) = read_bulk(&mut recv).await?;
-                    let reply = master.lock().expect("master").apply_bulk(peer, header, &body)?;
+                    let plan = {
+                        let mut guard = master.lock().expect("master");
+                        guard.begin_apply_bulk(peer, body.len() as u64);
+                        guard.prepare_apply_bulk(peer, header)?
+                    };
+                    let reply = match plan {
+                        ApplyBulkPlan::Done(reply) => reply,
+                        ApplyBulkPlan::Reconstruct(job) => {
+                            let outcome =
+                                tokio::task::spawn_blocking(move || job.reconstruct(&body))
+                                    .await
+                                    .map_err(|err| anyhow::anyhow!("apply join: {err}"))?;
+                            master
+                                .lock()
+                                .expect("master")
+                                .finish_apply_bulk(peer, outcome)?
+                        }
+                    };
+                    master
+                        .lock()
+                        .expect("master")
+                        .end_apply_bulk(peer, &reply);
                     if dispatch_master(&master, peer, &slave_id, &conn, &write_tx, reply, &limiter, ip)? {
                         break;
                     }
@@ -444,6 +465,7 @@ async fn drive_control(
                                 log::warn!("master fulfill: {err:#}");
                             }
                         }
+                        Ok(Ok(Reply::Quiet)) => {}
                         Ok(Ok(Reply::Hangup { reason, .. })) => {
                             log::warn!("master fulfill hangup: {reason}");
                         }
@@ -554,6 +576,10 @@ fn dispatch_master(
             log::info!("hangup {slave_id}: {reason}");
             master.lock().expect("master").disconnect(peer);
             Ok(true)
+        }
+        Reply::Quiet => {
+            flush_outbox(master, peer, write_tx)?;
+            Ok(false)
         }
         Reply::Send(out) => {
             enqueue_control(write_tx, vec![out])?;

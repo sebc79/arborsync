@@ -23,6 +23,7 @@ pub struct LeafChange<'a> {
 
 /// Direct children of each loaded directory. Lives across `commit_leaf_with`
 /// calls so later ancestor hashes do not `range_meta` the whole tree.
+/// First load uses `range_meta_children` (direct children only).
 #[derive(Clone, Debug, Default)]
 pub struct DirChildren {
     by_parent: HashMap<CanonicalPath, DirKids>,
@@ -156,10 +157,7 @@ impl DirChildren {
             return Ok(());
         }
         let mut kids = DirKids::default();
-        for (path, meta) in store.range_meta(ck, dir)? {
-            if path.parent().as_ref() != Some(dir) {
-                continue;
-            }
+        for (path, meta) in store.range_meta_children(ck, dir)? {
             let Ok(name) = EntryName::parse(path.name()) else {
                 continue;
             };
@@ -587,9 +585,9 @@ fn children_of<S: Storage>(
     computed: &HashMap<CanonicalPath, DirNode>,
 ) -> Result<Vec<DirChild>, S::Error> {
     let mut children: Vec<(CanonicalPath, FileMetadata)> = store
-        .range_meta(ck, dir)?
+        .range_meta_children(ck, dir)?
         .into_iter()
-        .filter(|(path, _)| path.parent().as_ref() == Some(dir) && !overlay.contains_key(path))
+        .filter(|(path, _)| !overlay.contains_key(path))
         .collect();
     for (path, meta) in overlay {
         if let (Some(meta), Some(parent)) = (meta, path.parent()) {
@@ -1244,5 +1242,37 @@ mod tests {
                 ),
             ]))
         );
+    }
+
+    #[test]
+    fn directory_cache_loads_only_direct_children() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::master();
+        let src = p("/src");
+        let child_dir = p("/src/a");
+        let nested = p("/src/a/nested.txt");
+        let sibling = p("/src/b.txt");
+        let src_meta = FileMetadata::directory(0, 0o040755);
+        let child_meta = FileMetadata::directory(0, 0o040755);
+        let nested_meta = file(1);
+        let sibling_meta = file(2);
+
+        commit_cold(&store, &ck, &src, Some(&src_meta), LastSynced::Keep).unwrap();
+        commit_cold(&store, &ck, &child_dir, Some(&child_meta), LastSynced::Keep).unwrap();
+        commit_cold(&store, &ck, &nested, Some(&nested_meta), LastSynced::Keep).unwrap();
+        commit_cold(&store, &ck, &sibling, Some(&sibling_meta), LastSynced::Keep).unwrap();
+
+        let listed = list_children(&store, &ck, &src).unwrap();
+        let names: Vec<_> = listed.iter().map(|child| child.name().as_str()).collect();
+        assert_eq!(names, ["a", "b.txt"]);
+
+        let mut cache = DirChildren::default();
+        cache.ensure_loaded(&store, &ck, &src).unwrap();
+        let kids = cache.by_parent.get(&src).expect("src loaded");
+        assert_eq!(
+            kids.by_name.keys().map(|n| n.as_str()).collect::<Vec<_>>(),
+            ["a", "b.txt"]
+        );
+        assert!(!kids.by_name.contains_key(&EntryName::parse("nested.txt").unwrap()));
     }
 }

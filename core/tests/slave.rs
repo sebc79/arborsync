@@ -14,7 +14,7 @@ use arborsync_core::slave::{
     DeleteAction, MemoryContent, ReplicaAction, Reply, Slave, SlaveError, decide_incoming,
     decide_master_won_delete,
 };
-use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
+use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
 
 const MASTER: [u8; 32] = [0x11; 32];
 const MTIME: i64 = 1_700_000_000_000;
@@ -1344,5 +1344,215 @@ fn cas_reject_adopts_a_winner_of_a_different_kind() {
     assert_eq!(
         slave.meta("src", &p("/src/hello.txt")).unwrap(),
         Some(winner)
+    );
+}
+
+#[test]
+fn cas_accept_during_dir_list_walk_skips_stale_delete() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    match slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/zzz.txt"),
+            new: new.clone(),
+            basis: None,
+        })
+        .unwrap()
+    {
+        Reply::Send(msgs) => assert!(msgs.is_empty()),
+        other => panic!("expected empty Send, got {other:?}"),
+    }
+    assert_eq!(
+        slave.last_synced("src", &p("/src/zzz.txt")).unwrap(),
+        Some(file_node(&new))
+    );
+
+    let fillers: Vec<_> = (0..64)
+        .map(|i| arborsync_core::merkle::DirChild::File {
+            name: name(&format!("a{i:02}")),
+            node: file_node(&FileMetadata::file(
+                1,
+                MTIME,
+                0o100644,
+                ContentHash::from_bytes([i as u8; 32]),
+            )),
+        })
+        .collect();
+    match slave
+        .handle(ProtocolMessage::DirListResponse {
+            checkout_id: "src".into(),
+            path: p("/src"),
+            after: None,
+            entries: fillers,
+            more: false,
+        })
+        .unwrap()
+    {
+        Reply::Send(_) => {}
+        other => panic!("expected Send, got {other:?}"),
+    }
+
+    slave
+        .handle(ProtocolMessage::CasAccept {
+            checkout_id: "src".into(),
+            path: p("/src/zzz.txt"),
+            file_node: Some(file_node(&new)),
+        })
+        .unwrap();
+
+    let rest = slave.crawl_step().unwrap();
+    assert!(
+        !rest.iter().any(|msg| {
+            matches!(msg, ProtocolMessage::Delete { path, .. } if path == &p("/src/zzz.txt"))
+        }),
+        "CasAccept during the walk must keep deletes_stale live; got {rest:?}"
+    );
+}
+
+#[test]
+fn reload_overlap_failure_keeps_index_and_cfg() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let src = slave.checkout_local("src").unwrap().to_path_buf();
+    let docs = sandbox.add_checkout("dev-alice", "docs");
+    sandbox.tree(&src).file("hello.txt", b"keep");
+    slave
+        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap();
+    let with_docs = LoadedSlave::load(&sandbox.write_slave_config(
+        "dev-alice",
+        vec![
+            CheckoutConfig {
+                id: "src".into(),
+                central: "/src".into(),
+                local: src.to_string_lossy().into_owned(),
+            },
+            CheckoutConfig {
+                id: "docs".into(),
+                central: "/docs".into(),
+                local: docs.to_string_lossy().into_owned(),
+            },
+        ],
+        vec![format_hex_key(&MASTER)],
+    ))
+    .unwrap();
+    slave.reload(with_docs).unwrap();
+    sandbox.tree(&docs).file("a.txt", b"docs");
+    slave
+        .note_local("docs", LocalEvent::Changed(p("/docs/a.txt")))
+        .unwrap();
+    assert!(slave.meta("docs", &p("/docs/a.txt")).unwrap().is_some());
+
+    let link = sandbox
+        .slave_root("dev-alice")
+        .join("checkouts")
+        .join("via-link");
+    // Path must not exist at load so parse keeps the unreolved spelling.
+    let bad = LoadedSlave::load(&sandbox.write_slave_config(
+        "dev-alice",
+        vec![
+            CheckoutConfig {
+                id: "src".into(),
+                central: "/src".into(),
+                local: src.to_string_lossy().into_owned(),
+            },
+            CheckoutConfig {
+                id: "evil".into(),
+                central: "/evil".into(),
+                local: link.to_string_lossy().into_owned(),
+            },
+        ],
+        vec![format_hex_key(&MASTER)],
+    ))
+    .unwrap();
+    std::os::unix::fs::symlink(&src, &link).unwrap();
+    match slave.reload(bad) {
+        Err(SlaveError::Config(arborsync_core::ConfigError::LocalOverlap { .. })) => {}
+        other => panic!("expected LocalOverlap, got {other:?}"),
+    }
+    let docs_canon = docs.canonicalize().unwrap();
+    assert_eq!(slave.checkout_local("docs"), Some(docs_canon.as_path()));
+    assert!(slave.meta("docs", &p("/docs/a.txt")).unwrap().is_some());
+    assert_eq!(slave.checkout_local("evil"), None);
+    assert!(slave.meta("src", &p("/src/hello.txt")).unwrap().is_some());
+}
+
+#[test]
+fn failed_apply_disarms_inflight() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    let blocker = local.join("hello.txt");
+    std::fs::create_dir_all(&blocker).unwrap();
+    std::fs::set_permissions(&blocker, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    let err = slave.handle(ProtocolMessage::FileAnnounce {
+        checkout_id: "src".into(),
+        path: p("/src/hello.txt"),
+        new,
+        basis: None,
+    });
+    assert!(err.is_err(), "replace over a directory must fail");
+
+    std::fs::set_permissions(&blocker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_dir(&blocker).unwrap();
+    sandbox.tree(&local).file("hello.txt", hello);
+    let out = slave
+        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap();
+    assert!(
+        out.iter().any(|msg| {
+            matches!(
+                msg,
+                ProtocolMessage::FileAnnounce { path, .. } if path == &p("/src/hello.txt")
+            )
+        }),
+        "failed apply must disarm inflight so a real write announces; got {out:?}"
+    );
+}
+
+#[test]
+fn open_rescans_when_checkout_root_is_dirty() {
+    use arborsync_core::hash::DirNode;
+    use arborsync_core::storage::{CheckoutId, Storage, WriteBatch};
+
+    let sandbox = SyncSandbox::new();
+    let local = sandbox.add_checkout("dev-alice", "src");
+    sandbox.tree(&local).file("hello.txt", b"hello");
+    let cfg_path = sandbox.write_slave_config(
+        "dev-alice",
+        vec![CheckoutConfig {
+            id: "src".into(),
+            central: "/src".into(),
+            local: local.to_string_lossy().into_owned(),
+        }],
+        vec![format_hex_key(&MASTER)],
+    );
+    let cfg = LoadedSlave::load(&cfg_path).unwrap();
+    let store = MemoryStorage::new();
+    let ck = CheckoutId::new("src");
+    {
+        let mut batch = store.begin_write().unwrap();
+        batch
+            .put_dir_node(&ck, &p("/"), DirNode::from_bytes([0xAB; 32]))
+            .unwrap();
+        batch.commit().unwrap();
+    }
+    let slave = Slave::open(cfg, store, MemoryContent::new()).unwrap();
+    let found = slave.meta("src", &p("/src/hello.txt")).unwrap();
+    assert!(
+        found.is_some(),
+        "dirty root on open must rescan before network CAS"
     );
 }

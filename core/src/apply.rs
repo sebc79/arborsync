@@ -170,8 +170,33 @@ pub fn mkdir_live(
     meta: &FileMetadata,
 ) -> Result<(), ApplyError> {
     let dir = host_in_root(central_root, path)?;
-    fs::create_dir_all(&dir).map_err(at(&dir))?;
+    create_dir_all_with_mode(&dir, meta.mode & 0o7777)?;
     apply_mode_and_mtime(&dir, meta)
+}
+
+/// Create `dir` and any missing parents, then set `mode` on each directory
+/// this call created so umask does not win over an announced mode.
+fn create_dir_all_with_mode(dir: &Path, mode: u32) -> Result<(), ApplyError> {
+    let mut missing = Vec::new();
+    let mut cur = dir.to_path_buf();
+    loop {
+        match fs::symlink_metadata(&cur) {
+            Ok(_) => break,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                missing.push(cur.clone());
+                match cur.parent() {
+                    Some(parent) if parent != cur => cur = parent.to_path_buf(),
+                    _ => break,
+                }
+            }
+            Err(err) => return Err(at(&cur)(err)),
+        }
+    }
+    fs::create_dir_all(dir).map_err(at(dir))?;
+    for created in missing.iter().rev() {
+        fs::set_permissions(created, Permissions::from_mode(mode)).map_err(at(created))?;
+    }
+    Ok(())
 }
 
 pub fn rename_live(
@@ -328,9 +353,13 @@ fn unique_name() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, symlink};
 
     use super::*;
+
+    unsafe extern "C" {
+        fn umask(mask: u32) -> u32;
+    }
 
     #[test]
     fn atomic_put_does_not_write_through_a_symlink_that_leaves_the_root() {
@@ -352,6 +381,36 @@ mod tests {
             "wrote outside the checkout root"
         );
         assert!(matches!(result, Err(ApplyError::EscapesRoot)));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn mkdir_live_uses_announced_mode_not_umask() {
+        let unique = unique_name();
+        let base = std::env::temp_dir().join(format!("arborsync-mkdir-mode-{unique}"));
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let path = CanonicalPath::parse("/nested/dir").unwrap();
+        let meta = FileMetadata::directory(1_700_000_000_000, 0o40750);
+
+        let old = unsafe { umask(0o077) };
+        let result = mkdir_live(&root, &path, &meta);
+        unsafe {
+            umask(old);
+        }
+        result.unwrap();
+
+        let host = root.join("nested/dir");
+        let mode = fs::symlink_metadata(&host).unwrap().mode() & 0o7777;
+        assert_eq!(mode, 0o0750, "leaf must keep the announced mode");
+        let parent_mode = fs::symlink_metadata(root.join("nested"))
+            .unwrap()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            parent_mode, 0o0750,
+            "dirs created for this announce must keep the announced mode"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }

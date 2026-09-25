@@ -46,6 +46,46 @@ pub enum Reply {
     Bulk(BulkTransfer),
 }
 
+/// Work that can run without the slave mutex: copia reconstruct + BLAKE3.
+pub enum ApplyBulkPlan {
+    Done(Reply),
+    Reconstruct(ApplyBulkJob),
+}
+
+pub struct ApplyBulkJob {
+    key: (String, CanonicalPath),
+    encoding: crate::protocol::BulkEncoding,
+    basis: Option<Vec<u8>>,
+    want_hash: ContentHash,
+}
+
+pub enum ApplyBulkOutcome {
+    Ready {
+        key: (String, CanonicalPath),
+        bytes: Vec<u8>,
+    },
+    Failed {
+        key: (String, CanonicalPath),
+        path: CanonicalPath,
+    },
+}
+
+impl ApplyBulkJob {
+    pub fn reconstruct(self, body: &[u8]) -> ApplyBulkOutcome {
+        let path = self.key.1.clone();
+        match transfer::reconstruct(self.encoding, body, self.basis.as_deref()) {
+            Ok(bytes) if hash_bytes(&bytes) == self.want_hash => ApplyBulkOutcome::Ready {
+                key: self.key,
+                bytes,
+            },
+            _ => ApplyBulkOutcome::Failed {
+                key: self.key,
+                path,
+            },
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SlaveError {
     #[error("{path}: {source}")]
@@ -244,7 +284,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             );
         }
         reject_resolved_overlap(&checkouts)?;
-        Ok(Self {
+        let mut slave = Self {
             cfg,
             store,
             bodies,
@@ -259,7 +299,16 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             dirs: HashMap::new(),
             status: StatusLedger::default(),
             cas_since_dir_list: HashMap::new(),
-        })
+        };
+        let mut ids: Vec<String> = slave.checkouts.keys().cloned().collect();
+        ids.sort();
+        for id in ids {
+            let ck = slave.checkout(&id)?.id.clone();
+            if index::root_is_dirty(&slave.store, &ck).map_err(SlaveError::index)? {
+                slave.rescan(&id)?;
+            }
+        }
+        Ok(slave)
     }
 
     pub fn pin_check(&self, peer: [u8; 32]) -> Result<(), Reply> {
@@ -552,6 +601,36 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         let debounce = Duration::from_millis(next.watcher_debounce_ms());
         let debounce_changed = next.watcher_debounce_ms() != self.cfg.watcher_debounce_ms();
 
+        let mut next_locals: HashMap<String, PathBuf> = self
+            .checkouts
+            .iter()
+            .filter(|(id, _)| !plan.removed.iter().any(|removed| removed == *id))
+            .map(|(id, checkout)| (id.clone(), checkout.local.clone()))
+            .collect();
+        let mut added: Vec<(String, Checkout)> = Vec::new();
+        for id in &plan.added {
+            let loaded = next
+                .checkout(id)
+                .ok_or_else(|| SlaveError::UnknownCheckout(id.clone()))?;
+            let configured = loaded.local().to_path_buf();
+            fs::create_dir_all(&configured).map_err(SlaveError::io(&configured))?;
+            let local = fs::canonicalize(&configured).map_err(SlaveError::io(&configured))?;
+            next_locals.insert(id.clone(), local.clone());
+            added.push((
+                id.clone(),
+                Checkout {
+                    id: loaded.id().clone(),
+                    central: loaded.central().clone(),
+                    local,
+                    inflight: Inflight::new(debounce),
+                },
+            ));
+        }
+        reject_resolved_locals(&next_locals)?;
+        for (_, checkout) in &added {
+            apply::wipe_tmp(&checkout.local)?;
+        }
+
         for id in &plan.removed {
             if let Some(checkout) = self.checkouts.remove(id) {
                 self.dirs.remove(&checkout.id);
@@ -565,33 +644,15 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 .retain(|(checkout, _), _| checkout != id);
             self.crawl.drop_checkout(id);
         }
-
-        for id in &plan.added {
-            let loaded = next
-                .checkout(id)
-                .ok_or_else(|| SlaveError::UnknownCheckout(id.clone()))?;
-            let configured = loaded.local().to_path_buf();
-            fs::create_dir_all(&configured).map_err(SlaveError::io(&configured))?;
-            let local = fs::canonicalize(&configured).map_err(SlaveError::io(&configured))?;
-            apply::wipe_tmp(&local)?;
-            self.checkouts.insert(
-                id.clone(),
-                Checkout {
-                    id: loaded.id().clone(),
-                    central: loaded.central().clone(),
-                    local,
-                    inflight: Inflight::new(debounce),
-                },
-            );
+        for (id, checkout) in added {
+            self.checkouts.insert(id, checkout);
         }
-
         if debounce_changed {
             for checkout in self.checkouts.values_mut() {
                 checkout.inflight.set_window(debounce);
             }
         }
 
-        reject_resolved_overlap(&self.checkouts)?;
         let pins_changed = self.cfg.pins_master() != next.pins_master();
         self.cfg = next;
         if plan.resubscribe || pins_changed {
@@ -677,9 +738,21 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     }
 
     pub fn apply_bulk(&mut self, header: BulkHeader, body: &[u8]) -> Result<Reply, SlaveError> {
-        self.status.bulk_in(None, body.len() as u64);
-        let reply = self.apply_bulk_message(header, body)?;
-        match &reply {
+        self.begin_apply_bulk(body.len() as u64);
+        let reply = match self.prepare_apply_bulk(header)? {
+            ApplyBulkPlan::Done(reply) => reply,
+            ApplyBulkPlan::Reconstruct(job) => self.finish_apply_bulk(job.reconstruct(body))?,
+        };
+        self.end_apply_bulk(&reply);
+        Ok(reply)
+    }
+
+    pub fn begin_apply_bulk(&mut self, bytes: u64) {
+        self.status.bulk_in(None, bytes);
+    }
+
+    pub fn end_apply_bulk(&mut self, reply: &Reply) {
+        match reply {
             Reply::Send(msgs) if msgs.is_empty() => self.status.apply_ok(None),
             Reply::Send(msgs) => {
                 if msgs
@@ -691,17 +764,16 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             }
             _ => {}
         }
-        self.record_reply(&reply);
-        Ok(reply)
+        self.record_reply(reply);
     }
 
-    fn apply_bulk_message(&mut self, header: BulkHeader, body: &[u8]) -> Result<Reply, SlaveError> {
+    pub fn prepare_apply_bulk(&mut self, header: BulkHeader) -> Result<ApplyBulkPlan, SlaveError> {
         let key = (header.checkout_id.clone(), header.path.clone());
         let Some(pending) = self.pending.get(&key) else {
-            return self.accept_if_live_matches(&header);
+            return Ok(ApplyBulkPlan::Done(self.accept_if_live_matches(&header)?));
         };
         if pending.new.content_hash != header.want_hash {
-            return self.accept_if_live_matches(&header);
+            return Ok(ApplyBulkPlan::Done(self.accept_if_live_matches(&header)?));
         }
         let host = self.host_for(&header.checkout_id, &header.path)?;
         let previous = self.meta(&header.checkout_id, &header.path)?;
@@ -713,18 +785,50 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         } else {
             apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))?
         };
-        match transfer::reconstruct(header.encoding, body, basis.as_deref()) {
-            Ok(bytes) if hash_bytes(&bytes) == header.want_hash => {
+        Ok(ApplyBulkPlan::Reconstruct(ApplyBulkJob {
+            key,
+            encoding: header.encoding,
+            basis,
+            want_hash: header.want_hash,
+        }))
+    }
+
+    pub fn finish_apply_bulk(&mut self, outcome: ApplyBulkOutcome) -> Result<Reply, SlaveError> {
+        match outcome {
+            ApplyBulkOutcome::Ready { key, bytes } => {
+                let Some(pending) = self.pending.get(&key) else {
+                    return self.accept_if_live_matches(&BulkHeader {
+                        checkout_id: key.0,
+                        path: key.1,
+                        want_hash: hash_bytes(&bytes),
+                        encoding: crate::protocol::BulkEncoding::Whole,
+                        size: bytes.len() as u64,
+                    });
+                };
+                if hash_bytes(&bytes) != pending.new.content_hash {
+                    return self.accept_if_live_matches(&BulkHeader {
+                        checkout_id: key.0.clone(),
+                        path: key.1.clone(),
+                        want_hash: pending.new.content_hash,
+                        encoding: crate::protocol::BulkEncoding::Whole,
+                        size: bytes.len() as u64,
+                    });
+                }
                 let pending = self.pending.remove(&key).expect("pending");
                 self.finish_apply(&pending.checkout_id, pending.path, pending.new, &bytes)
             }
-            _ => {
-                let pending = self.pending.get_mut(&key).expect("pending");
+            ApplyBulkOutcome::Failed { key, path } => {
+                let Some(pending) = self.pending.get_mut(&key) else {
+                    return Ok(Reply::Send(vec![ProtocolMessage::Error {
+                        code: "unknown_transfer".into(),
+                        message: path.as_str().into(),
+                    }]));
+                };
                 if pending.retried {
                     self.pending.remove(&key);
                     return Ok(Reply::Send(vec![ProtocolMessage::Error {
                         code: "keep_live".into(),
-                        message: header.path.as_str().into(),
+                        message: path.as_str().into(),
                     }]));
                 }
                 pending.retried = true;
@@ -1055,7 +1159,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.checkout_mut(checkout_id)?
             .inflight
             .arm(to.clone(), hash);
-        apply::rename_live(&local, &from_rel, &to_rel, &to_new)?;
+        if let Err(err) = apply::rename_live(&local, &from_rel, &to_rel, &to_new) {
+            self.checkout_mut(checkout_id)?.inflight.disarm(&to);
+            return Err(err.into());
+        }
         let ck = self.checkout(checkout_id)?.id.clone();
         self.write_index(&ck, &from, None, index::LastSynced::AdoptLeaf)?;
         self.index_ancestors(checkout_id, &to)?;
@@ -1193,8 +1300,14 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.checkout_mut(checkout_id)?
             .inflight
             .arm(path.clone(), hash);
-        self.index_ancestors(checkout_id, &path)?;
-        apply::replace_live(&local, &relative, &new, body, previous.as_ref())?;
+        if let Err(err) = self.index_ancestors(checkout_id, &path) {
+            self.checkout_mut(checkout_id)?.inflight.disarm(&path);
+            return Err(err);
+        }
+        if let Err(err) = apply::replace_live(&local, &relative, &new, body, previous.as_ref()) {
+            self.checkout_mut(checkout_id)?.inflight.disarm(&path);
+            return Err(err.into());
+        }
         let ck = self.checkout(checkout_id)?.id.clone();
         self.write_index(&ck, &path, Some(&new), index::LastSynced::AdoptLeaf)?;
         Ok(Reply::Send(Vec::new()))
@@ -1264,23 +1377,34 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             EntryKind::Dir => ContentHash::ZERO,
             EntryKind::File | EntryKind::Symlink => new.content_hash,
         };
+        let file_bytes = match new.kind {
+            EntryKind::File => Some(fs::read(&host).map_err(SlaveError::io(&host))?),
+            _ => None,
+        };
+        let link_target = match new.kind {
+            EntryKind::Symlink => {
+                Some(fs::read_link(&host).map_err(SlaveError::io(&host))?)
+            }
+            _ => None,
+        };
         self.checkout_mut(checkout_id)?
             .inflight
             .arm(path.clone(), hash);
-        match new.kind {
-            EntryKind::Dir => apply::mkdir_live(&local, &relative, new)?,
+        let applied = match new.kind {
+            EntryKind::Dir => apply::mkdir_live(&local, &relative, new),
             EntryKind::File => {
-                apply::atomic_put(
-                    &local,
-                    &relative,
-                    new,
-                    &fs::read(&host).map_err(SlaveError::io(&host))?,
-                )?;
+                apply::atomic_put(&local, &relative, new, file_bytes.as_ref().unwrap())
             }
-            EntryKind::Symlink => {
-                let target = fs::read_link(&host).map_err(SlaveError::io(&host))?;
-                apply::atomic_symlink(&local, &relative, new, target.as_os_str().as_bytes())?;
-            }
+            EntryKind::Symlink => apply::atomic_symlink(
+                &local,
+                &relative,
+                new,
+                link_target.as_ref().unwrap().as_os_str().as_bytes(),
+            ),
+        };
+        if let Err(err) = applied {
+            self.checkout_mut(checkout_id)?.inflight.disarm(path);
+            return Err(err.into());
         }
         let ck = self.checkout(checkout_id)?.id.clone();
         self.write_index(&ck, path, Some(new), index::LastSynced::AdoptLeaf)?;
@@ -1633,7 +1757,7 @@ fn stat_still_present(
 
 impl<S: Storage, C: ContentHook> Slave<S, C> {
     fn step_dir_list(&mut self, budget: usize) -> Result<HashPlan, SlaveError> {
-        let (checkout_id, parent, batch, next, deletes_stale) = {
+        let (checkout_id, parent, batch, next) = {
             let Some(page) = self.crawl.front_page_mut() else {
                 return Ok(HashPlan::default());
             };
@@ -1642,7 +1766,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             let after = page.after.clone();
             let more = page.more;
             let page_end = page.page_end.clone();
-            let deletes_stale = page.deletes_stale;
+            let _ = page.deletes_stale;
             let mut batch = Vec::new();
             let mut used = 0;
             while used < budget {
@@ -1671,7 +1795,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             } else {
                 None
             };
-            (checkout_id, parent, batch, next, deletes_stale)
+            (checkout_id, parent, batch, next)
         };
         self.crawl.pop_page_if_empty();
         let mut plan = HashPlan::default();
@@ -1682,7 +1806,6 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 &entry,
                 slave_child.as_ref(),
                 master_child.as_ref(),
-                deletes_stale,
             )?);
         }
         if let Some(ProtocolMessage::DirListRequest {
@@ -1704,7 +1827,6 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         entry: &str,
         slave_child: Option<&DirChild>,
         master_child: Option<&DirChild>,
-        deletes_stale: bool,
     ) -> Result<HashPlan, SlaveError> {
         let child_path = join_central(path, entry)?;
         let last_synced = self.last_synced(checkout_id, &child_path)?;
@@ -1748,6 +1870,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 }
             }
             WalkAction::AnnounceDelete => {
+                let deletes_stale = self
+                    .cas_since_dir_list
+                    .get(checkout_id)
+                    .is_some_and(|n| *n > 0);
                 if deletes_stale || self.crawl.rescanning(checkout_id) {
                     return Ok(plan);
                 }
@@ -2279,9 +2405,17 @@ fn into_slave_walk_err<E: std::error::Error + Send + Sync + 'static>(
 }
 
 fn reject_resolved_overlap(checkouts: &HashMap<String, Checkout>) -> Result<(), SlaveError> {
-    let locals: Vec<&PathBuf> = checkouts.values().map(|checkout| &checkout.local).collect();
-    for (i, a) in locals.iter().enumerate() {
-        for b in locals.iter().skip(i + 1) {
+    let locals: HashMap<String, PathBuf> = checkouts
+        .iter()
+        .map(|(id, checkout)| (id.clone(), checkout.local.clone()))
+        .collect();
+    reject_resolved_locals(&locals)
+}
+
+fn reject_resolved_locals(locals: &HashMap<String, PathBuf>) -> Result<(), SlaveError> {
+    let paths: Vec<&PathBuf> = locals.values().collect();
+    for (i, a) in paths.iter().enumerate() {
+        for b in paths.iter().skip(i + 1) {
             if local_paths_overlap(a, b) {
                 return Err(ConfigError::LocalOverlap {
                     a: a.display().to_string(),

@@ -476,6 +476,7 @@ fn slave_waiting_on_master_bytes_names_origin_bytes() {
     let sandbox = SyncSandbox::new();
     let body = b"bytes the slave does not hold";
     let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let _ = slave.take_status(online());
 
     match slave
         .handle(ProtocolMessage::FileAnnounce {

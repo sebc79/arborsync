@@ -33,12 +33,12 @@ UTF-8 only. Reject non-UTF-8 names (log, skip). `central_root` and each `local` 
 
 1. `symlink_metadata` (do not follow).
 2. Classify: file, dir, symlink, or other. Other (devices, sockets, FIFOs): log a warn with the host path and return `None`.
-3. Fill `size`, `mtime_ns` (`modified()` → duration since epoch; if unavailable, skip and log), `mode` (`PermissionsExt::mode()` on Unix).
+3. Fill `size`, `mtime_ns`, and `mode`. `mtime_ns` is `st_mtime * 1e9 + st_mtime_nsec` from `symlink_metadata` (negative stamps included). Do not use `Metadata::modified()` and do not skip the path when that clock is missing.
 4. **Hash decision:**
    - File (`collect_for_rescan`): hash if no index row, or stored size, mtime, or kind differ. Mode is not a miss. The returned row carries the fresh mode. Rescan, Create, Write, Metadata, and Rename use this.
    - `collect_from_path` hashes a file unconditionally. The miss path falls through to it.
-   - Symlink: always read the target and hash it (cheap) on a miss. Same-size same-mtime reuse applies.
-   - Dir: no content hash.
+   - Symlink: always read the target and hash it (`inspect_for_hash` does not reuse by size/mtime).
+   - Dir: no content hash. Always re-collect.
 5. Streaming BLAKE3 for files.
 
 Rescan is a **full `stat` walk** of the checkout or `central_root`. It is not limited to “changed subtrees.”

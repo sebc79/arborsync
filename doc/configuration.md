@@ -118,6 +118,8 @@ Both knobs apply on SIGHUP. Hash admission and leftover `kick` read `Loaded*` af
 
 SIGHUP reloads this file. It does not start reconcile.
 
+The process watches the config file's parent directory for changes and applies the same reload path as SIGHUP. If watch setup fails (for example the parent is missing), it logs and retries with backoff until the watch is running. A later successful setup delivers config-change events. SIGHUP still reloads while the watch is down.
+
 Removing an ACL row disconnects that `slave_id` if connected. Tightening `allowed_prefixes` drops those checkouts from interest and leaves the QUIC session up. The slave is not sent `SubscribeReject`. Later `RootReport`s for those ids return `not_subscribed`.
 
 ## Environment
