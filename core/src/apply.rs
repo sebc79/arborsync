@@ -319,3 +319,33 @@ fn unique_name() -> String {
         NEXT.fetch_add(1, Ordering::Relaxed)
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    #[test]
+    fn atomic_put_does_not_write_through_a_symlink_that_leaves_the_root() {
+        let unique = unique_name();
+        let base = std::env::temp_dir().join(format!("arborsync-escape-{unique}"));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        let bytes = b"pwned";
+        let meta = FileMetadata::file(bytes.len() as u64, 0, 0o100644, hash_bytes(bytes));
+        let path = CanonicalPath::parse("/escape/pwned").unwrap();
+
+        let result = atomic_put(&root, &path, &meta, bytes);
+
+        assert!(
+            !outside.join("pwned").exists(),
+            "wrote outside the checkout root"
+        );
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+}
