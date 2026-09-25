@@ -1021,10 +1021,12 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                     from_local.as_ref(),
                     to_new.content_hash,
                 )?;
+                self.sidecar_local(&checkout_id, &to, to_local.as_ref(), to_new.content_hash)?;
                 self.apply_rename(&checkout_id, from, to, to_new)?;
                 Ok(Reply::Send(Vec::new()))
             }
             RenameAction::Apply => {
+                self.sidecar_local(&checkout_id, &to, to_local.as_ref(), to_new.content_hash)?;
                 self.apply_rename(&checkout_id, from, to, to_new)?;
                 Ok(Reply::Send(Vec::new()))
             }
