@@ -103,10 +103,19 @@ pub fn hash_bytes(bytes: &[u8]) -> ContentHash {
     ContentHash::from_bytes(*blake3::hash(bytes).as_bytes())
 }
 
+/// Linux `asm-generic/fcntl.h` `O_NOFOLLOW`. Opening a symlink fails with `ELOOP`.
+const O_NOFOLLOW: i32 = 0x20000;
+
 /// Streaming so a large file never lands in memory whole.
+/// A symlink is not opened, so its target is not hashed as file bytes.
 pub fn hash_file(host: &Path) -> Result<ContentHash, io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(host)?;
     let mut hasher = blake3::Hasher::new();
-    io::copy(&mut fs::File::open(host)?, &mut hasher)?;
+    io::copy(&mut file, &mut hasher)?;
     Ok(ContentHash::from_bytes(*hasher.finalize().as_bytes()))
 }
 
@@ -157,6 +166,7 @@ pub fn collect_from_path(host: &Path) -> Result<Option<FileMetadata>, io::Error>
             log::warn!("skipping {}: permission denied", host.display());
             return Ok(None);
         }
+        Err(err) if err.raw_os_error() == Some(40) => return collect_from_path(host),
         Err(err) => return Err(err),
     };
     Ok(Some(FileMetadata::file(

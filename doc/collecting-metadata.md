@@ -56,7 +56,7 @@ Apply: `set_permissions` with `mode & 0o7777` on files and directories after the
 
 In-tree: first-class. `content_hash = BLAKE3(target)`, `size = target.len()`. Apply with `std::os::unix::fs::symlink` after removing the previous entry if needed. Broken targets are valid.
 
-Do not resolve in-tree links during scan, index, or apply. Resolving duplicates the target as a second leaf and can walk out of the checkout.
+Do not resolve in-tree links during scan, index, or apply. Resolving duplicates the target as a second leaf and can walk out of the checkout. `hash_file` opens with `O_NOFOLLOW`. A path that became a symlink after the file stat is collected again as a link.
 
 ## Errors
 
