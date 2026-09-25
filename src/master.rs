@@ -409,6 +409,7 @@ async fn drive_control(
             ),
             job @ FulfillPlan::BulkHost { .. } => {
                 let conn = drive.conn.clone();
+                let write_tx = drive.write_tx.clone();
                 tokio::spawn(async move {
                     match tokio::task::spawn_blocking(move || job.run()).await {
                         Ok(Ok(Reply::Bulk(xfer))) => {
@@ -417,7 +418,9 @@ async fn drive_control(
                             }
                         }
                         Ok(Ok(Reply::Send(out))) => {
-                            log::warn!("master fulfill: {out:?}");
+                            if let Err(err) = fulfill_control(&write_tx, out) {
+                                log::warn!("master fulfill: {err:#}");
+                            }
                         }
                         Ok(Ok(Reply::Hangup { reason, .. })) => {
                             log::warn!("master fulfill hangup: {reason}");
@@ -575,6 +578,15 @@ fn enqueue_control(
         .map_err(|_| anyhow::anyhow!("control writer closed"))
 }
 
+fn fulfill_control(
+    write_tx: &UnboundedSender<Vec<ProtocolMessage>>,
+    out: ProtocolMessage,
+) -> anyhow::Result<()> {
+    log::warn!("master fulfill: {out:?}");
+    let _ = write_tx;
+    Ok(())
+}
+
 fn rescan_off_lock(master: &SharedMaster) -> anyhow::Result<arborsync_core::HashPlan> {
     let (root, store) = {
         let guard = master.lock().expect("master");
@@ -682,5 +694,27 @@ fn submit_master_hashes(
                 Err(err) => log::warn!("hash join: {err}"),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fulfill_control;
+    use arborsync_core::protocol::ProtocolMessage;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn a_failed_fulfill_is_written_on_the_control_stream() {
+        let (tx, mut rx) = unbounded_channel();
+        let msg = ProtocolMessage::Error {
+            code: "missing_hash".into(),
+            message: "/src/gone".into(),
+        };
+        fulfill_control(&tx, msg.clone()).unwrap();
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(vec![msg]),
+            "the asker was not told the fulfill failed"
+        );
     }
 }
