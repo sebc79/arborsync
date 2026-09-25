@@ -518,6 +518,8 @@ A `/` checkout on `dev-alice` is `SubscribeReject`ed. Full-replica / overlap che
 
 Both sides enforce the same `max_checkouts_per_slave`. Config files are `0600` (they hold key *paths*, and slaves hold master pins). Private key files are `0600`.
 
+`rescan_interval_seconds` of `0` is a parse error. A zero timeout would walk on every watch pass.
+
 `[tune.hashing].workers` is `"nproc"` or 1 through 256 on both roles. `[tune.fulfill_parked].inflight` is 1 through 64 on the slave. Omit both tables for those defaults. `0` is a parse error. A `[tune]` hop other than `hashing` or `fulfill_parked` is a parse error. Master `[tune.fulfill_parked]` is `TuneNotOnRole`. Both knobs apply on SIGHUP. There is no NixOS option for either key.
 
 CLI overrides: `--config PATH`. Env: `ARBORSYNC_CONFIG`, `ARBORSYNC_LOG_LEVEL`. Do not put key material in the environment.
@@ -625,18 +627,18 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §8 `CasAccept` memory follows the durable commit | `on_cas_accept` calls `write_last_synced`, which `commit`s, before `clear_pending_rename` and the `cas_since_dir_list` increment. |
 | ❌ | §11 bulk body has a size cap | `read_bulk` allocates `vec![0u8; header.size as usize]` with no cap. Control frames stop at `MAX_CONTROL_FRAME`. `decode_bulk` adds `header.size as usize` with no checked add. |
 | ❌ | §11 a failed fulfill answers the ask | `FulfillPlan::run` returns `Reply::Send` when the file is missing, the hash does not match, or the transfer fails. The `BulkHost` task in `drive_control` logs that reply and drops it. `FulfillPlan::Send` from `plan_fulfill` is written. |
-| ❌ | §14 `rescan_interval_seconds` rejects 0 | `0` parses. `watch_central` and the slave watch loop pass it to `recv_timeout`. A zero timeout returns `Timeout` at once. The master walks `central_root` every pass. The slave sends `Work::Rescan` every pass. `max_connections = 0` refuses every new peer. `[tune.hashing]` already rejects `0`. |
-| ⚠️ | §7 `repair_dir_nodes` clears `last_synced` on leaves the hash left out | `stale_files` keeps only `EntryKind::File`. A symlink under a repaired directory keeps `last_synced`. |
+| ✅ | §14 `rescan_interval_seconds` rejects 0 | `LoadedMaster::parse` and `LoadedSlave::parse` return `ConfigError::RescanIntervalZero`. `max_connections = 0` still refuses every new peer. |
+| ✅ | §7 `repair_dir_nodes` clears `last_synced` on leaves the hash left out | A file or symlink under a repaired directory loses `last_synced`. Directories stay. |
 | ⚠️ | §7 inflight covers a failed apply | `publish`, `finish_apply`, and `apply_rename` call `inflight.arm` before `replace_live` or `rename_live`. A failed apply leaves the arm for one debounce window. |
 | ⚠️ | §14 slave checkout reload is one commit | `Slave::reload` deletes removed checkouts and inserts added ones before `reject_resolved_overlap`. `self.cfg` is assigned only after that check. `reload_slave_from_disk` treats `Err` as a failed reload and does not roll the index back. |
 | ⚠️ | §4 reload lists match `plan_reload` | The spec's not-reloadable list omits `slave_id`. `LoadedSlave::plan_reload` returns `RestartRequired` for it. The reloadable list omits debounce, rescan interval, status interval, and tune, which do reload. |
-| ⚠️ | §4 `keygen --out` | Clap takes `Option<PathBuf>`. `keygen::run` errors when it is missing. |
+| ✅ | §4 `keygen --out` | Clap requires `--out`. `keygen::run` writes that path. |
 | ⚠️ | §6 created directories use the announced mode | `doc/configuration.md` and `doc/applying-updates.md` say mode `0o755`. `create_dir_all` uses the process umask. |
 | ⚠️ | §6 symlink hash reuse | `doc/collecting-metadata.md` says same-size same-mtime reuse. `inspect_for_hash` always re-reads the link target. |
 | ⚠️ | §11 inbound `Error` | `doc/quic-transport.md` says both `handle` methods reply `unsupported`. The slave records the error and sends nothing. |
 | ⚠️ | §11 `decode_control` consumes the frame | Bytes after a valid message inside the length prefix are ignored. |
-| ⚠️ | §9 / §11 `signature_request` reports a `copia` failure | `unwrap_or_default` turns a signature error into an empty signature, so the ask is `Whole`, with no log. Omitting a signature that would exceed 1 MiB is separate and still built. |
-| ⚠️ | §12 `AttemptLimiter` drops idle addresses | `allow` keeps an empty `Vec` after the 60 s window. The map grows with source addresses seen before XX. |
+| ✅ | §9 / §11 `signature_request` reports a `copia` failure | A signature error is logged and the ask is `Whole`. Omitting a signature that would exceed 1 MiB is separate and still built. |
+| ✅ | §12 `AttemptLimiter` drops idle addresses | `allow` and `limited` drop an address once every hit is outside the 60 s window. A zero cap records nothing. |
 | ⚠️ | §14 config file watch stays up | `spawn_config_watch` logs and returns if setup fails. SIGHUP still reloads. |
 | ⚠️ | §9 apply work is off the session mutex | `apply_bulk` runs copia reconstruct and BLAKE3 while the session task holds the master or slave mutex. |
 | ⚠️ | §9 a whole file is not copied into a second buffer | `try_read_file_or_link` uses `fs::read`. `encode_bulk` allocates header plus body. Item 5 still reconstructs in memory before the tmp write. |

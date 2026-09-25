@@ -469,7 +469,7 @@ pub fn repair_dir_nodes<S: Storage>(
             if stored != Some(against_stored) {
                 if let Some(kids) = by_parent.get(dir) {
                     for (path, meta) in kids {
-                        if meta.kind == EntryKind::File {
+                        if matches!(meta.kind, EntryKind::File | EntryKind::Symlink) {
                             stale_files.push(path.clone());
                         }
                     }
@@ -733,6 +733,37 @@ mod tests {
         let synced = store.get_last_synced(&ck, &file_path).unwrap();
         assert!(!repair_dir_nodes(&store, &ck, &dir).unwrap());
         assert_eq!(store.get_last_synced(&ck, &file_path).unwrap(), synced);
+    }
+
+    #[test]
+    fn repair_dir_nodes_drops_last_synced_on_a_symlink() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::master();
+        let dir = p("/src");
+        let link_path = p("/src/link");
+        let link = FileMetadata::symlink(4, 0, 0o120777, ContentHash::from_bytes([9; 32]));
+        commit_cold(
+            &store,
+            &ck,
+            &dir,
+            Some(&FileMetadata::directory(0, 0o040755)),
+            LastSynced::AdoptLeaf,
+        )
+        .unwrap();
+        commit_cold(
+            &store,
+            &ck,
+            &link_path,
+            Some(&link),
+            LastSynced::AdoptLeaf,
+        )
+        .unwrap();
+        let mut batch = store.begin_write().unwrap();
+        batch.put_dir_node(&ck, &dir, empty_dir_node()).unwrap();
+        batch.commit().unwrap();
+
+        assert!(repair_dir_nodes(&store, &ck, &dir).unwrap());
+        assert!(store.get_last_synced(&ck, &link_path).unwrap().is_none());
     }
 
     #[test]

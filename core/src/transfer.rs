@@ -113,7 +113,13 @@ pub fn signature_request(
 ) -> ProtocolMessage {
     let checkout_id = checkout_id.into();
     let signature = match (ask_kind(kind, live.map(|b| b.len() as u64)), live) {
-        (AskKind::Delta, Some(bytes)) => signature_bytes(bytes).unwrap_or_default(),
+        (AskKind::Delta, Some(bytes)) => match signature_bytes(bytes) {
+            Ok(signature) => signature,
+            Err(err) => {
+                log::warn!("copia signature failed, asking for a whole file: {err}");
+                Vec::new()
+            }
+        },
         _ => Vec::new(),
     };
     let msg = ProtocolMessage::SignatureRequest {
