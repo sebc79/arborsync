@@ -71,7 +71,7 @@ Type change deletes the old kind, then creates the new kind, in one master accep
 
 Recipient-driven (`spec.md` §9). After the slave (or master) **decides it will apply** `want_hash`:
 
-1. If no local basis, basis size < 4 KiB, kind is symlink, or `encode_control` of the `SignatureRequest` would exceed 1 MiB: `SignatureRequest` with empty `signature` → sender opens a bulk stream `encoding = Whole`. A `SignatureRequest` for a directory replies `missing_hash`. Directories have no bulk body.
+1. If no local basis, basis size < 4 KiB, kind is symlink, or `encode_control` of the `SignatureRequest` would exceed 1 MiB: `SignatureRequest` with empty `signature` → sender opens a bulk stream `encoding = Whole`. A `SignatureRequest` for a directory replies `missing_hash`. Directories have no bulk body. A fulfill that cannot send bytes (missing file, hash mismatch, or transfer error) answers on the control stream with `Error`.
 2. Else: `copia` signature of the live file → bulk `encoding = Delta` → `reconstruct` in RAM → whole write through tmp.
 3. Sender that does not have `want_hash` replies `Error` and the recipient waits for the next reconcile.
 
