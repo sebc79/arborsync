@@ -1607,11 +1607,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             });
         }
         index::commit_leaves(&self.store, &walk.ck, changes).map_err(SlaveError::index)?;
-        if index::repair_dir_nodes(&self.store, &walk.ck, &walk.central)
-            .map_err(SlaveError::index)?
-        {
-            self.dirs.remove(&walk.ck);
-        }
+        index::repair_dir_nodes(&self.store, &walk.ck, &walk.central).map_err(SlaveError::index)?;
+        self.dirs.remove(&walk.ck);
         self.root_reports_for(&[walk.checkout_id])
     }
 }
