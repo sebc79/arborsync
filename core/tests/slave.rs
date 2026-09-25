@@ -1242,6 +1242,64 @@ fn hashed_siblings_announce_with_matching_index_rows() {
 }
 
 #[test]
+fn cas_reject_after_a_failed_rename_undo_clears_the_path_that_still_has_the_bytes() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("locked/old.txt", b"loser");
+    let created = slave
+        .note_local("src", LocalEvent::Changed(p("/src/locked/old.txt")))
+        .unwrap();
+    let ProtocolMessage::FileAnnounce { new, .. } = &created[0] else {
+        panic!("expected FileAnnounce, got {created:?}");
+    };
+    let node = file_node(new);
+    slave
+        .handle(ProtocolMessage::CasAccept {
+            checkout_id: "src".into(),
+            path: p("/src/locked/old.txt"),
+            file_node: Some(node),
+        })
+        .unwrap();
+
+    std::fs::rename(local.join("locked/old.txt"), local.join("new.txt")).unwrap();
+    slave
+        .note_local(
+            "src",
+            LocalEvent::Renamed {
+                from: p("/src/locked/old.txt"),
+                to: p("/src/new.txt"),
+            },
+        )
+        .unwrap();
+    std::fs::set_permissions(
+        local.join("locked"),
+        std::fs::Permissions::from_mode(0o555),
+    )
+    .unwrap();
+
+    slave
+        .handle(ProtocolMessage::CasReject {
+            checkout_id: "src".into(),
+            path: p("/src/new.txt"),
+            current: None,
+        })
+        .unwrap();
+
+    std::fs::set_permissions(
+        local.join("locked"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(
+        !local.join("new.txt").exists(),
+        "rejected rename left the bytes at the destination"
+    );
+    let sidecar = conflict_sidecar_path(&local, &p("/src/new.txt"), &hash_bytes(b"loser"));
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"loser");
+}
+
+#[test]
 fn reserved_tmp_rename_produces_no_message() {
     let sandbox = SyncSandbox::new();
     let mut slave = alice_slave(&sandbox, MemoryContent::new());
