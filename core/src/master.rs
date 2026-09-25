@@ -18,12 +18,12 @@ use crate::index;
 use crate::inflight::Inflight;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
-use crate::meta::{self, EntryKind, FileMetadata, Inspected, hash_bytes};
+use crate::meta::{self, hash_bytes, EntryKind, FileMetadata, Inspected};
 use crate::path::{
-    CanonicalPath, EntryName, PathError, canonical_to_host, confine_host, is_reserved_root_entry,
-    join_central,
+    canonical_to_host, confine_host, is_reserved_root_entry, join_central, CanonicalPath,
+    EntryName, PathError,
 };
-use crate::protocol::{BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage, page_dir_list};
+use crate::protocol::{page_dir_list, BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
 use crate::status::{MasterStatus, PeerLive, Queues, StatusLedger};
 use crate::storage::{CheckoutId, Storage};
 use crate::transfer::{self, BulkTransfer};
@@ -1892,6 +1892,11 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         }
         Ok(found)
     }
+}
+
+/// Rewrite master directory hashes that do not match indexed children.
+pub fn recompute_index<S: Storage>(store: &S) -> Result<bool, S::Error> {
+    index::repair_dir_nodes(store, &CheckoutId::master(), &CanonicalPath::root())
 }
 
 /// Stat `central_root` and read index rows. Does not write.

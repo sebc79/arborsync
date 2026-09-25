@@ -15,9 +15,11 @@ Normative source: `spec.md` §14. TOML only. No YAML, no templating, no include 
 arborsync master [--config PATH]
 arborsync slave  [--config PATH]
 arborsync keygen [--out PATH]
+arborsync recompute [--config PATH]
 ```
 
 `keygen` writes a 32-byte X25519 secret (0600) and prints the public key as `hex:` + 64 hex chars to stdout for pasting into the peer’s config.
+`recompute` loads a master config and rewrites directory hashes that do not match indexed children. It prints `recomputed directory hashes` when it writes, and `directory hashes already match` when it does not.
 `master` and `slave` log that same public pin at startup after they read the secret file.
 
 ## Master
