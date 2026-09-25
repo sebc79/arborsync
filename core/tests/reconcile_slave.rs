@@ -882,3 +882,34 @@ fn rescan_does_not_change_last_synced() {
         before
     );
 }
+
+#[test]
+fn rescan_keeps_a_file_when_the_checkout_cannot_be_listed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    let tree = sandbox.tree(&local);
+    tree.file("keep.txt", b"keep");
+    tree.file("gone.txt", b"gone");
+    slave.rescan("src").unwrap();
+    std::fs::remove_file(local.join("gone.txt")).unwrap();
+    slave.rescan("src").unwrap();
+    assert!(slave.meta("src", &p("/src/gone.txt")).unwrap().is_none());
+    assert!(slave.meta("src", &p("/src/keep.txt")).unwrap().is_some());
+
+    let mut perms = std::fs::metadata(&local).unwrap().permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(&local, perms).unwrap();
+    let rescanned = slave.rescan("src");
+    let mut perms = std::fs::metadata(&local).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&local, perms).unwrap();
+    rescanned.unwrap();
+
+    assert!(
+        slave.meta("src", &p("/src/keep.txt")).unwrap().is_some(),
+        "unreadable checkout cleared the index"
+    );
+}
