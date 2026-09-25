@@ -884,6 +884,59 @@ fn rescan_does_not_change_last_synced() {
 }
 
 #[test]
+fn a_write_after_rescan_keeps_last_synced_when_a_sibling_was_deleted() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+
+    let keep_node = accept_local_file(&mut slave, &local, "keep.txt", b"keep");
+    accept_local_file(&mut slave, &local, "gone.txt", b"gone");
+    std::fs::remove_file(local.join("gone.txt")).unwrap();
+    slave.rescan("src").unwrap();
+    assert!(slave.meta("src", &p("/src/gone.txt")).unwrap().is_none());
+
+    std::fs::write(local.join("keep.txt"), b"keep-2").unwrap();
+    slave
+        .note_local("src", LocalEvent::Changed(p("/src/keep.txt")))
+        .unwrap();
+    slave.rescan("src").unwrap();
+    assert_eq!(
+        slave.last_synced("src", &p("/src/keep.txt")).unwrap(),
+        Some(keep_node),
+        "a cached deleted sibling was hashed into the parent"
+    );
+}
+
+fn accept_local_file(
+    slave: &mut Slave<MemoryStorage, MemoryContent>,
+    local: &std::path::Path,
+    name: &str,
+    bytes: &[u8],
+) -> arborsync_core::hash::FileNode {
+    sandbox_file(local, name, bytes);
+    let path = p(&format!("/src/{name}"));
+    let created = slave
+        .note_local("src", LocalEvent::Changed(path.clone()))
+        .unwrap();
+    let ProtocolMessage::FileAnnounce { new, .. } = &created[0] else {
+        panic!("expected FileAnnounce, got {created:?}");
+    };
+    let node = file_node(new);
+    slave
+        .handle(ProtocolMessage::CasAccept {
+            checkout_id: "src".into(),
+            path,
+            file_node: Some(node),
+        })
+        .unwrap();
+    node
+}
+
+fn sandbox_file(local: &std::path::Path, name: &str, bytes: &[u8]) {
+    std::fs::write(local.join(name), bytes).unwrap();
+}
+
+#[test]
 fn rescan_keeps_a_file_when_the_checkout_cannot_be_listed() {
     use std::os::unix::fs::PermissionsExt;
 
