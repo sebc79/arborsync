@@ -3,7 +3,8 @@ use arborsync_core::meta::FileMetadata;
 use arborsync_core::path::{CanonicalPath, EntryName};
 use arborsync_core::protocol::{
     BulkEncoding, BulkHeader, DirEntry, Envelope, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE,
-    PROTOCOL_VERSION, ProtocolMessage, decode_bulk, decode_control, encode_bulk, encode_control,
+    PROTOCOL_VERSION, ProtocolMessage, decode_bulk, decode_control, encode_bulk, encode_bulk_chunks,
+    encode_control,
     page_dir_list,
 };
 use arborsync_core::test_support::{name, p};
@@ -339,17 +340,54 @@ fn decode_bulk_rejects_a_truncated_body() {
 }
 
 #[test]
-fn decode_bulk_rejects_a_body_larger_than_the_cap() {
+fn decode_bulk_rejects_a_chunk_larger_than_the_cap() {
     let header = BulkHeader {
         path: p("/src/hello.txt"),
         checkout_id: "src".into(),
         want_hash: ContentHash::from_bytes([7; 32]),
         encoding: BulkEncoding::Whole,
-        size: u64::MAX,
+        size: 4,
     };
     let payload =
         bincode::serde::encode_to_vec(&header, bincode::config::standard()).expect("header");
     let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
     frame.extend(payload);
+    frame.extend_from_slice(&((16 * 1024 * 1024 + 1) as u32).to_be_bytes());
     assert_eq!(decode_bulk(&frame).unwrap_err(), FrameError::BulkTooLarge);
+}
+
+#[test]
+fn decode_bulk_accepts_a_logical_body_past_1_gib_when_the_chunk_is_short() {
+    let header = BulkHeader {
+        path: p("/src/hello.txt"),
+        checkout_id: "src".into(),
+        want_hash: ContentHash::from_bytes([7; 32]),
+        encoding: BulkEncoding::Whole,
+        size: (1024 * 1024 * 1024) + 1,
+    };
+    let payload =
+        bincode::serde::encode_to_vec(&header, bincode::config::standard()).expect("header");
+    let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+    frame.extend(payload);
+    frame.extend_from_slice(&4u32.to_be_bytes());
+    frame.extend_from_slice(&[1, 2, 3, 4]);
+    assert_eq!(decode_bulk(&frame).unwrap_err(), FrameError::Truncated);
+}
+
+#[test]
+fn bulk_chunks_reassemble_to_the_original_bytes() {
+    let body = b"abcdefghij";
+    let header = BulkHeader {
+        path: p("/src/hello.txt"),
+        checkout_id: "src".into(),
+        want_hash: ContentHash::from_bytes([7; 32]),
+        encoding: BulkEncoding::Whole,
+        size: body.len() as u64,
+    };
+    let frame = encode_bulk_chunks(&header, body, 4).unwrap();
+    let (decoded, got, consumed) = decode_bulk(&frame).unwrap();
+    assert_eq!(decoded, header);
+    assert_eq!(got, body);
+    assert_eq!(consumed, frame.len());
+    assert!(frame.len() > 4 + body.len());
 }

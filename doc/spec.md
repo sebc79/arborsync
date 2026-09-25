@@ -299,7 +299,7 @@ There is no `latest-wins` / `local-wins` / `manual` policy knob and no `max_upda
 Recipient-driven. Never compute a forward delta against a cached snapshot of the other side.
 
 1. After a successful CAS decision (or a pull the slave already knows it wants), the **recipient** of bytes sends `SignatureRequest { checkout_id, path, want_hash, signature }` where `signature` is `copia`’s signature of the local basis, or empty if there is no basis / size < 4 KiB / first create / symlink / `encode_control` of that request would exceed 1 MiB. An empty signature means the sender must use `encoding = Whole`.
-2. Sender replies on a **bulk stream**: raw file bytes (`Whole`), symlink target bytes (`Whole`), or a `copia` delta (`Delta`). Directories have no bulk transfer. A body larger than 1 GiB is refused before the receiver allocates it.
+2. Sender replies on a **bulk stream**: raw file bytes (`Whole`), symlink target bytes (`Whole`), or a `copia` delta (`Delta`). Directories have no bulk transfer. The body is sent as chunks of at most 16 MiB. The receiver concatenates them. A chunk larger than 16 MiB is refused before that chunk is allocated. The logical body may be larger than 1 GiB.
 3. Recipient verifies BLAKE3 == `want_hash` before rename (`want_hash` is `content_hash`, not `FileNode`).
 
 `copia` is the delta engine only. Do not use its hub/bisync CLI protocol.
@@ -336,7 +336,7 @@ u32be length || bincode(Envelope)
 Envelope { version: u16 = 1, msg: ProtocolMessage }
 ```
 
-One long-lived **control stream** (opened by the slave after handshake). **Bulk streams** are one transfer each: a framed `BulkHeader`, then exactly `size` raw bytes. Do not put file bodies inside bincode.
+One long-lived **control stream** (opened by the slave after handshake). **Bulk streams** are one transfer each: a framed `BulkHeader`, then chunks of at most 16 MiB (`u32be len || bytes`) whose concatenation is `size` bytes. Do not put file bodies inside bincode.
 
 Handshake preamble / first Noise payload: ASCII `arborsync-v1`. Hyphae has no ALPN; this is the version pin. Mismatch → disconnect.
 
@@ -625,7 +625,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §8 rename keeps a destination whose content differs | `on_rename` calls `sidecar_local` on `to` before `rename_live` when that row's `content_hash` differs from `to_new`. Directories still do not sidecar. |
 | ❌ | §8 failed rename undo uses the path that still has the bytes | `on_cas_reject` sidecars `to` when `undo_rename_disk` fails, then `remove_path` and `apply_new` use `from`. |
 | ✅ | §8 `CasAccept` memory follows the durable commit | `on_cas_accept` calls `write_last_synced`, which `commit`s, before `clear_pending_rename` and the `cas_since_dir_list` increment. |
-| ✅ | §11 bulk body has a size cap | `bulk_body_len` refuses a body larger than 1 GiB before `read_bulk` allocates. `decode_bulk` adds the length with `checked_add`. |
+| ✅ | §11 bulk body has a size cap | Each chunk is at most 16 MiB. `chunk_len` refuses a longer chunk before `read_bulk` allocates it. The receiver concatenates chunks, so a file larger than 1 GiB still syncs. |
 | ❌ | §11 a failed fulfill answers the ask | `FulfillPlan::run` returns `Reply::Send` when the file is missing, the hash does not match, or the transfer fails. The `BulkHost` task in `drive_control` logs that reply and drops it. `FulfillPlan::Send` from `plan_fulfill` is written. |
 | ✅ | §14 `rescan_interval_seconds` rejects 0 | `LoadedMaster::parse` and `LoadedSlave::parse` return `ConfigError::RescanIntervalZero`. `max_connections = 0` still refuses every new peer. |
 | ✅ | §7 `repair_dir_nodes` clears `last_synced` on leaves the hash left out | A file or symlink under a repaired directory loses `last_synced`. Directories stay. |
