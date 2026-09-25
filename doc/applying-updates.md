@@ -51,7 +51,7 @@ No `conflict_resolution` knob, no `max_conflict_files_per_dir`, no `max_update_a
 
 ## Atomic write
 
-1. Ensure parent dirs exist (mode from announce or `0o755`).
+1. Ensure parent dirs exist. A directory announce sets `mode & 0o7777` on every directory that create creates. Parent dirs created only to hold a file or symlink use `0o755` after create.
 2. Write `{local}/.arborsync-tmp/{unique}` (same filesystem as `local`). Specified as built. Spec §8 says never patch in place. `reconstruct` patches in RAM, then `atomic_put` writes the full buffer. For whole-file: stream bytes into tmp. For a symlink: tmp is unused; `symlink` after removing the previous name.
 3. `fsync` the tmp file.
 4. Verify BLAKE3 of the tmp file (or symlink target) equals `new.content_hash`. Mismatch: drop tmp, send `SignatureRequest` with empty signature (whole-file retry) once; still wrong → log, keep the previous live file, leave `last_synced` unchanged.
@@ -61,7 +61,7 @@ No `conflict_resolution` knob, no `max_conflict_files_per_dir`, no `max_update_a
 
 Never patch in place. Crash between rename and index: rescan sees the new bytes; reconcile sets `last_synced`.
 
-Directory create: `create_dir_all` + mode + mtime, then index. `PermissionDenied` on mode or mtime is a warn. The directory stays and the apply continues. A missing parent or a create failure still fails the apply.  
+Directory create: `create_dir_all`, then `set_permissions` with the announced `mode & 0o7777` on each directory that call created, then mtime, then index. `PermissionDenied` on mode or mtime is a warn. The directory stays and the apply continues. A missing parent or a create failure still fails the apply.  
 Directory delete: children first (index prefix delete + FS remove), then `remove_dir`. Files and symlinks use `remove_file`.  
 File delete: `remove_file` after the CAS check.
 

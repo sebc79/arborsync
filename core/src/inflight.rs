@@ -31,6 +31,10 @@ impl Inflight {
         self.entries.insert(path, InflightEntry { hash, until });
     }
 
+    pub(crate) fn disarm(&mut self, path: &CanonicalPath) {
+        self.entries.remove(path);
+    }
+
     pub(crate) fn consume_if_echo(&mut self, path: &CanonicalPath, hash: &ContentHash) -> bool {
         let now = Instant::now();
         self.entries.retain(|_, entry| entry.until > now);

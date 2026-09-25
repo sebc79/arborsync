@@ -62,7 +62,7 @@ Master keeps an in-memory trie of `(slave_id, checkout_id, central)` for connect
 - Disconnect: drop that slave’s in-memory interest. No payload queue.
 - Reconnect: new XX, `Subscribe`, `RootReport` / walk (`spec.md` §10).
 - Same `slave_id` already connected: the new session replaces the old.
-- Config watch: add/remove checkouts as above. Changing `id` or `central` is remove + add.
+- Config watch: add/remove checkouts as above. Changing `id` or `central` is remove + add. Index delete and insert plus `cfg` assignment are one commit: overlap failure (or any `Err`) leaves the previous checkouts on disk and in memory.
 
 ## Path safety
 

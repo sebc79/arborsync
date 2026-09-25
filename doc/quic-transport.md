@@ -118,7 +118,7 @@ Rotation procedures: `spec.md` §4.
 - Handshake, pin, or unknown key: disconnect, log at `warn` without printing keys.
 - Protocol version other than 1 or prologue other than `arborsync-v1`: disconnect.
 - Frame length over the cap or bincode fail: disconnect (do not try to resync a corrupted control stream).
-- `Error` on a still-valid session: specified as log, then retry the path at the next reconcile. As built, both `handle` methods reply `Error { code: "unsupported" }` for an unmatched variant, including an incoming `Error`.
+- `Error` on a still-valid session: specified as log, then retry the path at the next reconcile. As built, inbound `Error` is recorded and not echoed; unmatched variants still reply `unsupported`.
 
 ## Tests / in-memory
 

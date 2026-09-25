@@ -15,7 +15,7 @@ use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::path::local_to_canonical;
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::slave::{
-    LinkState, Reply, RescanStat, RescanStated, Slave, SlaveError, WholeFileLater,
+    ApplyBulkPlan, LinkState, Reply, RescanStat, RescanStated, Slave, SlaveError, WholeFileLater,
     fulfill_from_host,
 };
 use arborsync_core::status::SlaveStatus;
@@ -271,8 +271,18 @@ fn spawn_checkout_watchers(
                     start_gen,
                 ) {
                     Ok(WatchStop::Removed) => return,
-                    Ok(WatchStop::Restart) => {}
-                    Err(err) => log::warn!("watch {id} stopped: {err}"),
+                    Ok(WatchStop::Restart) => {
+                        let _ = work_tx.send(Work::Rescan {
+                            checkout: id.clone(),
+                        });
+                    }
+                    Err(err) => {
+                        log::warn!("watch {id} stopped: {err}");
+                        let _ = work_tx.send(Work::Rescan {
+                            checkout: id.clone(),
+                        });
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
                 }
             }
         });
@@ -347,10 +357,22 @@ async fn session(
             incoming = conn.accept_uni() => {
                 let mut recv = incoming.map_err(stream_err)?;
                 let (header, body) = read_bulk(&mut recv).await?;
-                outbound.push_reply(
-                    &conn,
-                    slave.lock().expect("slave").apply_bulk(header, &body)?,
-                )?;
+                let plan = {
+                    let mut guard = slave.lock().expect("slave");
+                    guard.begin_apply_bulk(body.len() as u64);
+                    guard.prepare_apply_bulk(header)?
+                };
+                let reply = match plan {
+                    ApplyBulkPlan::Done(reply) => reply,
+                    ApplyBulkPlan::Reconstruct(job) => {
+                        let outcome = tokio::task::spawn_blocking(move || job.reconstruct(&body))
+                            .await
+                            .map_err(|err| anyhow::anyhow!("apply join: {err}"))?;
+                        slave.lock().expect("slave").finish_apply_bulk(outcome)?
+                    }
+                };
+                slave.lock().expect("slave").end_apply_bulk(&reply);
+                outbound.push_reply(&conn, reply)?;
             }
             Some(result) = bulk_rx.recv() => {
                 outbound.on_bulk_done(slave, &conn, result)?;

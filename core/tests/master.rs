@@ -4,6 +4,7 @@ use arborsync_core::config::{ReloadError, SlaveAcl};
 use arborsync_core::hash::{ContentHash, FileNode};
 use arborsync_core::keys::format_hex_key;
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 
 use arborsync_core::master::{
     CasDecision, CentralWalk, Master, MemoryContent, PreparedDelete, Reply, WholeFileLater,
@@ -1906,4 +1907,126 @@ fn directory_delete_reclaims_off_the_index_commit() {
     assert!(!sandbox.central_root().join("src/big").exists());
     assert!(!master.overlaps_wipe(&p("/src/big")));
     assert!(master.meta(&p("/src/other")).unwrap().is_some());
+}
+
+#[test]
+fn directory_rename_reindexes_only_that_subtree() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("src/dir/child.txt", b"inside");
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("src/blocked/secret.txt", b"nope");
+    master
+        .note_local(LocalEvent::Changed(p("/src/dir/child.txt")))
+        .unwrap();
+    master
+        .note_local(LocalEvent::Changed(p("/src/blocked/secret.txt")))
+        .unwrap();
+    let dir_meta = master.meta(&p("/src/dir")).unwrap().unwrap();
+
+    std::fs::set_permissions(
+        sandbox.central_root().join("src/blocked"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::Rename {
+                checkout_id: "src".into(),
+                from: p("/src/dir"),
+                to: p("/src/moved"),
+                from_basis: file_node(&dir_meta),
+                to_new: dir_meta.clone(),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Send(ProtocolMessage::CasAccept {
+            path,
+            file_node: node,
+            ..
+        }) => {
+            assert_eq!(path, p("/src/moved"));
+            assert_eq!(node, Some(file_node(&dir_meta)));
+        }
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+
+    assert!(master.meta(&p("/src/moved/child.txt")).unwrap().is_some());
+    let _ = std::fs::set_permissions(
+        sandbox.central_root().join("src/blocked"),
+        std::fs::Permissions::from_mode(0o755),
+    );
+}
+
+#[test]
+fn inbound_error_is_recorded_and_quiet() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    match master
+        .handle(
+            ALICE,
+            ProtocolMessage::Error {
+                code: "keep_live".into(),
+                message: "/src/hello.txt".into(),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Quiet => {}
+        other => panic!("expected Quiet, got {other:?}"),
+    }
+}
+
+#[test]
+fn failed_publish_disarms_inflight() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut master = two_slave_master(&sandbox, bodies);
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    let parent = sandbox.central_root().join("src");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    let err = master.handle(
+        ALICE,
+        ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            new,
+            basis: None,
+        },
+    );
+    assert!(err.is_err(), "publish into a read-only parent must fail");
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("src/hello.txt", hello);
+    let out = master
+        .plan_local(LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap();
+    assert!(
+        !out.send.is_empty() || !out.hash.is_empty(),
+        "failed publish must disarm inflight so a real write is planned; got {out:?}"
+    );
 }

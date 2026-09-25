@@ -5,7 +5,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::hash::{ContentHash, DirNode, FileNode};
 use crate::meta::FileMetadata;
-use crate::path::CanonicalPath;
+use crate::path::{join_central, CanonicalPath};
 
 /// Layout of a stored `meta` value. Bumped when the row encoding changes.
 const META_SCHEMA_VERSION: u16 = 1;
@@ -97,6 +97,20 @@ pub trait Storage: Send + Sync + 'static {
         ck: &CheckoutId,
         prefix: &CanonicalPath,
     ) -> Result<Vec<(CanonicalPath, DirNode)>, Self::Error>;
+
+    /// Direct children of `dir` only (one path component past `dir`).
+    /// Default filters [`Self::range_meta`]; redb seeks past each child subtree.
+    fn range_meta_children(
+        &self,
+        ck: &CheckoutId,
+        dir: &CanonicalPath,
+    ) -> Result<Vec<(CanonicalPath, FileMetadata)>, Self::Error> {
+        Ok(self
+            .range_meta(ck, dir)?
+            .into_iter()
+            .filter(|(path, _)| path.parent().as_ref() == Some(dir))
+            .collect())
+    }
 
     fn begin_write(&self) -> Result<Self::WriteBatch<'_>, Self::Error>;
     fn delete_checkout(&self, ck: &CheckoutId) -> Result<(), Self::Error>;
@@ -281,6 +295,22 @@ impl Storage for RedbStorage {
         let table = txn.open_table(META)?;
         let mut out = Vec::new();
         for_each_in_prefix(&table, ck, prefix, |path, value| {
+            let meta = decode_meta(value)?;
+            out.push((path, meta));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    fn range_meta_children(
+        &self,
+        ck: &CheckoutId,
+        dir: &CanonicalPath,
+    ) -> Result<Vec<(CanonicalPath, FileMetadata)>, Self::Error> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(META)?;
+        let mut out = Vec::new();
+        for_each_direct_child(&table, ck, dir, |path, value| {
             let meta = decode_meta(value)?;
             out.push((path, meta));
             Ok(())
@@ -607,6 +637,83 @@ where
     Ok(())
 }
 
+/// Walk only direct children of `dir`, seeking past each child's descendant keys.
+fn for_each_direct_child<T>(
+    table: &T,
+    ck: &CheckoutId,
+    dir: &CanonicalPath,
+    mut visit: impl FnMut(CanonicalPath, &[u8]) -> Result<(), RedbStoreError>,
+) -> Result<(), RedbStoreError>
+where
+    T: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    let (range_start, range_end) = descendant_range(ck, dir);
+    let mut cursor = if dir.as_str() == "/" {
+        let mut after_root = storage_key(ck, dir);
+        after_root.push(0);
+        after_root
+    } else {
+        range_start
+    };
+
+    while cursor.as_slice() < range_end.as_slice() {
+        #[cfg(test)]
+        DIRECT_CHILD_RANGE_STEPS.with(|steps| steps.set(steps.get() + 1));
+
+        let mut iter = table.range(cursor.as_slice()..range_end.as_slice())?;
+        let Some(item) = iter.next() else {
+            break;
+        };
+        let (key, value) = item?;
+        let Some(path) = path_from_key(ck, key.value()) else {
+            cursor = key.value().to_vec();
+            increment_key(&mut cursor);
+            continue;
+        };
+        if !dir.covers(&path) || path.as_str() == dir.as_str() {
+            break;
+        }
+        let Some(child) = first_direct_child(dir, &path) else {
+            break;
+        };
+
+        if path == child {
+            visit(child.clone(), value.value())?;
+        } else if let Some(guard) = table.get(storage_key(ck, &child).as_slice())? {
+            visit(child.clone(), guard.value())?;
+        }
+
+        let (_, after_child) = descendant_range(ck, &child);
+        cursor = after_child;
+    }
+    Ok(())
+}
+
+fn first_direct_child(dir: &CanonicalPath, path: &CanonicalPath) -> Option<CanonicalPath> {
+    if !dir.covers(path) || path == dir {
+        return None;
+    }
+    let relative = if dir.as_str() == "/" {
+        path.as_str().trim_start_matches('/')
+    } else {
+        path.as_str()
+            .strip_prefix(dir.as_str())?
+            .strip_prefix('/')?
+    };
+    let name = relative.split('/').next()?;
+    join_central(dir, name).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    static DIRECT_CHILD_RANGE_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_direct_child_range_steps() -> usize {
+    DIRECT_CHILD_RANGE_STEPS.with(|steps| steps.replace(0))
+}
+
 fn delete_interest_prefix(
     txn: &redb::WriteTransaction,
     table_def: TableDefinition<&[u8], &[u8]>,
@@ -666,6 +773,16 @@ mod prefix_keys {
         start.as_slice() <= key.as_slice() && key.as_slice() < end.as_slice()
     }
 
+    fn meta(content_byte: u8) -> FileMetadata {
+        FileMetadata::file(1, 0, 0o100644, ContentHash::from_bytes([content_byte; 32]))
+    }
+
+    fn open_tmp() -> (tempfile::TempDir, RedbStorage) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = RedbStorage::open(&dir.path().join("index.redb")).expect("open");
+        (dir, store)
+    }
+
     #[test]
     fn descendant_key_range_stops_before_a_sorting_sibling() {
         let ck = CheckoutId::master();
@@ -681,5 +798,68 @@ mod prefix_keys {
         let ck = CheckoutId::master();
         assert!(in_range(&ck, &p("/"), &p("/")));
         assert!(in_range(&ck, &p("/"), &p("/zzz/f00000")));
+    }
+
+    #[test]
+    fn range_meta_children_returns_only_direct_children() {
+        let (_dir, store) = open_tmp();
+        let ck = CheckoutId::master();
+        let mut batch = store.begin_write().unwrap();
+        batch
+            .put_meta(&ck, &p("/src"), &FileMetadata::directory(0, 0o040755))
+            .unwrap();
+        batch
+            .put_meta(&ck, &p("/src/a"), &FileMetadata::directory(0, 0o040755))
+            .unwrap();
+        batch
+            .put_meta(&ck, &p("/src/a/nested.txt"), &meta(1))
+            .unwrap();
+        batch
+            .put_meta(&ck, &p("/src/a/deeper/file.txt"), &meta(2))
+            .unwrap();
+        batch.put_meta(&ck, &p("/src/b.txt"), &meta(3)).unwrap();
+        batch
+            .put_meta(&ck, &p("/other"), &FileMetadata::directory(0, 0o040755))
+            .unwrap();
+        batch.commit().unwrap();
+
+        let kids = store.range_meta_children(&ck, &p("/src")).unwrap();
+        assert_eq!(
+            kids.iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["/src/a", "/src/b.txt"]
+        );
+    }
+
+    #[test]
+    fn range_meta_children_seeks_past_grandchild_keys() {
+        let (_dir, store) = open_tmp();
+        let ck = CheckoutId::master();
+        let mut batch = store.begin_write().unwrap();
+        batch
+            .put_meta(&ck, &p("/wide"), &FileMetadata::directory(0, 0o040755))
+            .unwrap();
+        for i in 0..8 {
+            let child = p(&format!("/wide/c{i:02}"));
+            batch
+                .put_meta(&ck, &child, &FileMetadata::directory(0, 0o040755))
+                .unwrap();
+            for j in 0..200 {
+                batch
+                    .put_meta(&ck, &p(&format!("/wide/c{i:02}/f{j:03}")), &meta(1))
+                    .unwrap();
+            }
+        }
+        batch.commit().unwrap();
+
+        let _ = take_direct_child_range_steps();
+        let kids = store.range_meta_children(&ck, &p("/wide")).unwrap();
+        let steps = take_direct_child_range_steps();
+        assert_eq!(kids.len(), 8);
+        assert!(
+            steps <= 16,
+            "direct-child load touched {steps} range steps; expected one seek per child, not all grandchildren"
+        );
     }
 }

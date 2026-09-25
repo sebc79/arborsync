@@ -86,6 +86,8 @@ impl Origin {
 #[derive(Debug)]
 pub enum Reply {
     Send(ProtocolMessage),
+    /// Inbound control that needs no response (for example a peer `Error`).
+    Quiet,
     Hangup { reason: String, rate_limit: bool },
     Bulk(BulkTransfer),
 }
@@ -116,6 +118,46 @@ pub enum FulfillPlan {
         signature: Vec<u8>,
     },
     Send(ProtocolMessage),
+}
+
+/// Work that can run without the master mutex: copia reconstruct + BLAKE3.
+pub enum ApplyBulkPlan {
+    Done(Reply),
+    Reconstruct(ApplyBulkJob),
+}
+
+pub struct ApplyBulkJob {
+    key: (String, CanonicalPath),
+    encoding: crate::protocol::BulkEncoding,
+    basis: Option<Vec<u8>>,
+    want_hash: ContentHash,
+}
+
+pub enum ApplyBulkOutcome {
+    Ready {
+        key: (String, CanonicalPath),
+        bytes: Vec<u8>,
+    },
+    Failed {
+        key: (String, CanonicalPath),
+        path: CanonicalPath,
+    },
+}
+
+impl ApplyBulkJob {
+    pub fn reconstruct(self, body: &[u8]) -> ApplyBulkOutcome {
+        let path = self.key.1.clone();
+        match transfer::reconstruct(self.encoding, body, self.basis.as_deref()) {
+            Ok(bytes) if hash_bytes(&bytes) == self.want_hash => ApplyBulkOutcome::Ready {
+                key: self.key,
+                bytes,
+            },
+            _ => ApplyBulkOutcome::Failed {
+                key: self.key,
+                path,
+            },
+        }
+    }
 }
 
 impl FulfillPlan {
@@ -617,6 +659,12 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                     rate_limit: false,
                 })
             }
+            ProtocolMessage::Error { code, message } => {
+                let slave = self.status_slave(&peer);
+                self.status
+                    .error(slave.as_deref(), format!("error:{code}:{message}"));
+                Ok(Reply::Quiet)
+            }
             ProtocolMessage::SignatureRequest {
                 checkout_id,
                 path,
@@ -658,10 +706,25 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         header: BulkHeader,
         body: &[u8],
     ) -> Result<Reply, MasterError> {
+        self.begin_apply_bulk(peer, body.len() as u64);
+        let reply = match self.prepare_apply_bulk(peer, header)? {
+            ApplyBulkPlan::Done(reply) => reply,
+            ApplyBulkPlan::Reconstruct(job) => {
+                self.finish_apply_bulk(peer, job.reconstruct(body))?
+            }
+        };
+        self.end_apply_bulk(peer, &reply);
+        Ok(reply)
+    }
+
+    pub fn begin_apply_bulk(&mut self, peer: [u8; 32], bytes: u64) {
         let slave = self.status_slave(&peer);
-        self.status.bulk_in(slave.as_deref(), body.len() as u64);
-        let reply = self.apply_bulk_message(peer, header, body)?;
-        match &reply {
+        self.status.bulk_in(slave.as_deref(), bytes);
+    }
+
+    pub fn end_apply_bulk(&mut self, peer: [u8; 32], reply: &Reply) {
+        let slave = self.status_slave(&peer);
+        match reply {
             Reply::Send(ProtocolMessage::CasAccept { .. }) => {
                 self.status.apply_ok(slave.as_deref());
             }
@@ -670,26 +733,26 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             }
             _ => {}
         }
-        self.record_reply(slave.as_deref(), &reply);
-        Ok(reply)
+        self.record_reply(slave.as_deref(), reply);
     }
 
-    fn apply_bulk_message(
+    /// Validate the pending apply and read the local basis under the mutex.
+    /// Copia reconstruct and BLAKE3 run on [`ApplyBulkJob::reconstruct`] off the mutex.
+    pub fn prepare_apply_bulk(
         &mut self,
         peer: [u8; 32],
         header: BulkHeader,
-        body: &[u8],
-    ) -> Result<Reply, MasterError> {
+    ) -> Result<ApplyBulkPlan, MasterError> {
         let key = (header.checkout_id.clone(), header.path.clone());
         if self.inside_wipe(&header.path) {
             self.pending.remove(&key);
-            return Ok(Reply::Send(wiping(&header.path)));
+            return Ok(ApplyBulkPlan::Done(Reply::Send(wiping(&header.path))));
         }
         let Some(pending) = self.pending.get(&key) else {
-            return self.accept_if_live_matches(&header);
+            return Ok(ApplyBulkPlan::Done(self.accept_if_live_matches(&header)?));
         };
         if pending.peer != peer || pending.new.content_hash != header.want_hash {
-            return self.accept_if_live_matches(&header);
+            return Ok(ApplyBulkPlan::Done(self.accept_if_live_matches(&header)?));
         }
         let host = canonical_to_host(&self.central_root, &header.path);
         let basis = if pending
@@ -701,8 +764,39 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         } else {
             apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))?
         };
-        match transfer::reconstruct(header.encoding, body, basis.as_deref()) {
-            Ok(bytes) if hash_bytes(&bytes) == header.want_hash => {
+        Ok(ApplyBulkPlan::Reconstruct(ApplyBulkJob {
+            key,
+            encoding: header.encoding,
+            basis,
+            want_hash: header.want_hash,
+        }))
+    }
+
+    pub fn finish_apply_bulk(
+        &mut self,
+        peer: [u8; 32],
+        outcome: ApplyBulkOutcome,
+    ) -> Result<Reply, MasterError> {
+        match outcome {
+            ApplyBulkOutcome::Ready { key, bytes } => {
+                let Some(pending) = self.pending.get(&key) else {
+                    return self.accept_if_live_matches(&BulkHeader {
+                        checkout_id: key.0,
+                        path: key.1,
+                        want_hash: hash_bytes(&bytes),
+                        encoding: crate::protocol::BulkEncoding::Whole,
+                        size: bytes.len() as u64,
+                    });
+                };
+                if pending.peer != peer || hash_bytes(&bytes) != pending.new.content_hash {
+                    return self.accept_if_live_matches(&BulkHeader {
+                        checkout_id: key.0.clone(),
+                        path: key.1.clone(),
+                        want_hash: pending.new.content_hash,
+                        encoding: crate::protocol::BulkEncoding::Whole,
+                        size: bytes.len() as u64,
+                    });
+                }
                 let pending = self.pending.remove(&key).expect("pending");
                 self.publish(
                     &pending.path,
@@ -722,13 +816,18 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                     file_node: Some(file_node(&pending.new)),
                 }))
             }
-            _ => {
-                let pending = self.pending.get_mut(&key).expect("pending");
+            ApplyBulkOutcome::Failed { key, path } => {
+                let Some(pending) = self.pending.get_mut(&key) else {
+                    return Ok(Reply::Send(ProtocolMessage::Error {
+                        code: "unknown_transfer".into(),
+                        message: path.as_str().into(),
+                    }));
+                };
                 if pending.retried {
                     self.pending.remove(&key);
                     return Ok(Reply::Send(ProtocolMessage::Error {
                         code: "keep_live".into(),
-                        message: header.path.as_str().into(),
+                        message: path.as_str().into(),
                     }));
                 }
                 pending.retried = true;
@@ -1060,6 +1159,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     fn record_reply(&mut self, slave: Option<&str>, reply: &Reply) {
         match reply {
             Reply::Send(msg) => self.status.outbound(slave, msg),
+            Reply::Quiet => {}
             Reply::Hangup { reason, .. } => {
                 self.status.error(slave, format!("hangup:{reason}"));
             }
@@ -1227,8 +1327,16 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         match new.kind {
             EntryKind::Dir => {
                 self.inflight.arm(path.clone(), ContentHash::ZERO);
-                self.index_ancestors(&path)?;
-                apply::replace_live(&self.central_root, &path, &new, &[], current.as_ref())?;
+                if let Err(err) = self.index_ancestors(&path) {
+                    self.inflight.disarm(&path);
+                    return Err(err);
+                }
+                if let Err(err) =
+                    apply::replace_live(&self.central_root, &path, &new, &[], current.as_ref())
+                {
+                    self.inflight.disarm(&path);
+                    return Err(err.into());
+                }
             }
             EntryKind::File | EntryKind::Symlink => match self.bodies.fetch(new.content_hash) {
                 ContentBytes::AskSender => {
@@ -1765,9 +1873,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         dir: &CanonicalPath,
         last_synced: index::LastSynced,
     ) -> Result<(), MasterError> {
-        let disk = self.walk_central()?;
+        let disk = self.walk_prefix(dir)?;
         for (path, found) in disk {
-            if &path == dir || !dir.covers(&path) {
+            if &path == dir {
                 continue;
             }
             let current = self.meta(&path)?;
@@ -1787,8 +1895,14 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         body: &[u8],
     ) -> Result<(), MasterError> {
         self.inflight.arm(path.clone(), new.content_hash);
-        self.index_ancestors(path)?;
-        apply::replace_live(&self.central_root, path, new, body, previous)?;
+        if let Err(err) = self.index_ancestors(path) {
+            self.inflight.disarm(path);
+            return Err(err);
+        }
+        if let Err(err) = apply::replace_live(&self.central_root, path, new, body, previous) {
+            self.inflight.disarm(path);
+            return Err(err.into());
+        }
         Ok(())
     }
 
@@ -1847,15 +1961,24 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         survey_central(&self.central_root, &self.store)
     }
 
+    #[allow(dead_code)]
     fn walk_central(&self) -> Result<BTreeMap<CanonicalPath, FileMetadata>, MasterError> {
+        self.walk_prefix(&CanonicalPath::root())
+    }
+
+    fn walk_prefix(
+        &self,
+        start: &CanonicalPath,
+    ) -> Result<BTreeMap<CanonicalPath, FileMetadata>, MasterError> {
         let mut found = BTreeMap::new();
-        let root_prev = self.meta(&CanonicalPath::root())?;
-        if let Some(root) = meta::collect_for_rescan(&self.central_root, root_prev.as_ref())
-            .map_err(MasterError::io(&self.central_root))?
+        let start_prev = self.meta(start)?;
+        let start_host = canonical_to_host(&self.central_root, start);
+        if let Some(root) = meta::collect_for_rescan(&start_host, start_prev.as_ref())
+            .map_err(MasterError::io(&start_host))?
         {
-            found.insert(CanonicalPath::root(), root);
+            found.insert(start.clone(), root);
         }
-        let mut pending = vec![CanonicalPath::root()];
+        let mut pending = vec![start.clone()];
         while let Some(dir) = pending.pop() {
             let host = canonical_to_host(&self.central_root, &dir);
             let entries = match fs::read_dir(&host) {

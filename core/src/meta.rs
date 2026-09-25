@@ -183,8 +183,10 @@ pub enum Inspected {
     Absent,
 }
 
-/// Stat, symlink, and directory only. A file whose mtime, size, and kind match
-/// `previous` is `Ready` and reuses that content hash. A file miss is `NeedHash`.
+/// Stat, directory, and symlink. A regular file whose mtime, size, and kind
+/// match `previous` is `Ready` and reuses that content hash. Symlinks and
+/// directories always re-collect (symlink target read is cheap). A file miss
+/// is `NeedHash`.
 pub fn inspect_for_hash(
     host: &Path,
     previous: Option<&FileMetadata>,
@@ -224,6 +226,34 @@ pub fn inspect_for_hash(
         }
     }
     Ok(Inspected::NeedHash(host.to_path_buf()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inspect_re_reads_symlink_when_size_and_mtime_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("alias");
+        std::os::unix::fs::symlink("first-target", &link).unwrap();
+        let first = collect_from_path(&link).unwrap().unwrap();
+        std::fs::remove_file(&link).unwrap();
+        // Same length as "first-target" (12 bytes); content differs.
+        std::os::unix::fs::symlink("second-targ!", &link).unwrap();
+        let ft = filetime::FileTime::from_unix_time(
+            first.mtime_ns.div_euclid(1_000_000_000),
+            first.mtime_ns.rem_euclid(1_000_000_000) as u32,
+        );
+        filetime::set_symlink_file_times(&link, ft, ft).unwrap();
+        let Inspected::Ready(second) = inspect_for_hash(&link, Some(&first)).unwrap() else {
+            panic!("expected Ready after re-read");
+        };
+        assert_eq!(second.size, first.size);
+        assert_eq!(second.mtime_ns, first.mtime_ns);
+        assert_ne!(second.content_hash, first.content_hash);
+        assert_eq!(second.content_hash, hash_bytes(b"second-targ!"));
+    }
 }
 
 /// Re-stat `host` and reuse `previous.content_hash` when kind, size, and
