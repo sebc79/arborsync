@@ -626,7 +626,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §8 failed rename undo uses the path that still has the bytes | `on_cas_reject` sidecars `to` when `undo_rename_disk` fails, then `remove_path` and `apply_new` use `to`. |
 | ✅ | §8 `CasAccept` memory follows the durable commit | `on_cas_accept` calls `write_last_synced`, which `commit`s, before `clear_pending_rename` and the `cas_since_dir_list` increment. |
 | ✅ | §11 bulk body has a size cap | Each chunk is at most 16 MiB. `chunk_len` refuses a longer chunk before `read_bulk` allocates it. The receiver concatenates chunks, so a file larger than 1 GiB still syncs. |
-| ❌ | §11 a failed fulfill answers the ask | `FulfillPlan::run` returns `Reply::Send` when the file is missing, the hash does not match, or the transfer fails. The `BulkHost` task in `drive_control` logs that reply and drops it. `FulfillPlan::Send` from `plan_fulfill` is written. |
+| ✅ | §11 a failed fulfill answers the ask | `FulfillPlan::run` returns `Reply::Send` when the file is missing, the hash does not match, or the transfer fails. The `BulkHost` task writes that message on the control stream. |
 | ✅ | §14 `rescan_interval_seconds` rejects 0 | `LoadedMaster::parse` and `LoadedSlave::parse` return `ConfigError::RescanIntervalZero`. `max_connections = 0` still refuses every new peer. |
 | ✅ | §7 `repair_dir_nodes` clears `last_synced` on leaves the hash left out | A file or symlink under a repaired directory loses `last_synced`. Directories stay. |
 | ⚠️ | §7 inflight covers a failed apply | `publish`, `finish_apply`, and `apply_rename` call `inflight.arm` before `replace_live` or `rename_live`. A failed apply leaves the arm for one debounce window. |

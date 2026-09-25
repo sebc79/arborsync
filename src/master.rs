@@ -582,9 +582,7 @@ fn fulfill_control(
     write_tx: &UnboundedSender<Vec<ProtocolMessage>>,
     out: ProtocolMessage,
 ) -> anyhow::Result<()> {
-    log::warn!("master fulfill: {out:?}");
-    let _ = write_tx;
-    Ok(())
+    enqueue_control(write_tx, vec![out])
 }
 
 fn rescan_off_lock(master: &SharedMaster) -> anyhow::Result<arborsync_core::HashPlan> {
