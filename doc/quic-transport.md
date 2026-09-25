@@ -30,7 +30,7 @@ Preamble `arborsync-v1` is the hyphae Noise prologue (`with_prologue`), not an a
 | Stream | Use |
 |---|---|
 | Control (one, slave-opened) | Framed `Envelope` messages |
-| Bulk (on demand, one transfer) | Framed `BulkHeader` + exactly `size` raw bytes |
+| Bulk (on demand, one transfer) | Framed `BulkHeader` + chunks of at most 16 MiB that concatenate to `size` |
 | Datagram (unreliable, slave to master) | One 25-byte `Gauge`: the slave's own `bottleneck=` verdict. Never a `ProtocolMessage`. A peer without datagram support drops to `hint=absent` and the session is unaffected. |
 
 Quinn gives **byte streams**. Control frame:
@@ -39,7 +39,7 @@ Quinn gives **byte streams**. Control frame:
 u32be length || bincode(u16 version) || bincode(ProtocolMessage)
 ```
 
-That is the field order of `Envelope`. Maximum control frame: 1 MiB. Larger means disconnect (file bodies do not belong here). If `encode_control` of a `SignatureRequest` would overflow that cap, the signature is omitted and the transfer falls back to `Whole` (`spec.md` §9). A `DirListResponse` that would overflow is split. The master sends the longest prefix that still encodes under `MAX_DIR_LIST_PAYLOAD` (`MAX_CONTROL_FRAME / 4`) and sets `more`. One child that exceeds that still goes if `encode_control` succeeds. The slave continues with `DirListRequest.after`. Bulk header uses the same length prefix. The body is raw and not length-prefixed again (`size` in the header is authoritative). A body larger than 1 GiB is refused before allocation.
+That is the field order of `Envelope`. Maximum control frame: 1 MiB. Larger means disconnect (file bodies do not belong here). If `encode_control` of a `SignatureRequest` would overflow that cap, the signature is omitted and the transfer falls back to `Whole` (`spec.md` §9). A `DirListResponse` that would overflow is split. The master sends the longest prefix that still encodes under `MAX_DIR_LIST_PAYLOAD` (`MAX_CONTROL_FRAME / 4`) and sets `more`. One child that exceeds that still goes if `encode_control` succeeds. The slave continues with `DirListRequest.after`. Bulk header uses the same length prefix. The body follows as chunks (`u32be len || bytes`), each at most 16 MiB. `size` in the header is the concatenated length. A longer chunk is refused before allocation. The logical body may exceed 1 GiB.
 
 One message per bulk stream. Close the stream after the body. Control stream stays open for the session.
 

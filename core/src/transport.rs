@@ -423,10 +423,26 @@ pub async fn read_bulk(recv: &mut RecvStream) -> Result<(BulkHeader, Vec<u8>), T
     let (header, _): (BulkHeader, usize) =
         bincode::serde::decode_from_slice(&payload, bincode::config::standard())
             .map_err(|err| TransportError::Frame(FrameError::Bincode(err.to_string())))?;
-    let body_len = crate::protocol::bulk_body_len(header.size).map_err(TransportError::Frame)?;
-    let mut body = vec![0u8; body_len];
-    if !body.is_empty() {
-        recv.read_exact(&mut body).await.map_err(stream_err)?;
+    let mut body = Vec::new();
+    while (body.len() as u64) < header.size {
+        let mut chunk_len_bytes = [0u8; 4];
+        recv.read_exact(&mut chunk_len_bytes)
+            .await
+            .map_err(stream_err)?;
+        let n = crate::protocol::chunk_len(u32::from_be_bytes(chunk_len_bytes))
+            .map_err(TransportError::Frame)?;
+        let end = (body.len() as u64)
+            .checked_add(n as u64)
+            .ok_or(TransportError::Frame(FrameError::BulkTooLarge))?;
+        if end > header.size {
+            return Err(TransportError::Frame(FrameError::BodySize {
+                got: end,
+                want: header.size,
+            }));
+        }
+        let mut chunk = vec![0u8; n];
+        recv.read_exact(&mut chunk).await.map_err(stream_err)?;
+        body.extend_from_slice(&chunk);
     }
     Ok((header, body))
 }
@@ -547,9 +563,20 @@ impl Transport for Connection {
     }
 
     async fn write_bulk(&self, xfer: &BulkTransfer) -> Result<(), Self::Error> {
-        let frame = protocol::encode_bulk(&xfer.header, &xfer.body)?;
+        if xfer.body.len() as u64 != xfer.header.size {
+            return Err(TransportError::Frame(FrameError::BodySize {
+                got: xfer.body.len() as u64,
+                want: xfer.header.size,
+            }));
+        }
+        let header = protocol::bulk_header_frame(&xfer.header)?;
         let mut send = self.open_uni().await.map_err(stream_err)?;
-        send.write_all(&frame).await.map_err(stream_err)?;
+        send.write_all(&header).await.map_err(stream_err)?;
+        for chunk in xfer.body.chunks(protocol::MAX_BULK_CHUNK) {
+            let prefix = (chunk.len() as u32).to_be_bytes();
+            send.write_all(&prefix).await.map_err(stream_err)?;
+            send.write_all(chunk).await.map_err(stream_err)?;
+        }
         send.finish().map_err(stream_err)?;
         Ok(())
     }

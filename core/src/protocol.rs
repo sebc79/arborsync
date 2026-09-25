@@ -11,14 +11,15 @@ pub const PROTOCOL_PREAMBLE: &[u8] = b"arborsync-v1";
 /// Maximum control frame (header + bincode body). Larger → disconnect.
 pub const MAX_CONTROL_FRAME: usize = 1024 * 1024;
 pub const MAX_DIR_LIST_PAYLOAD: usize = MAX_CONTROL_FRAME / 4;
-/// Maximum bulk body. Larger is refused before the receiver allocates.
-pub const MAX_BULK_BODY: u64 = 1024 * 1024 * 1024;
+/// One bulk chunk. A larger chunk is refused before the receiver allocates it.
+/// The logical body is the concatenation and may exceed this.
+pub const MAX_BULK_CHUNK: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FrameError {
     #[error("control frame exceeds 1 MiB")]
     TooLarge,
-    #[error("bulk body exceeds 1 GiB")]
+    #[error("bulk chunk exceeds 16 MiB")]
     BulkTooLarge,
     #[error("truncated frame")]
     Truncated,
@@ -275,27 +276,53 @@ pub fn decode_control(buf: &[u8]) -> Result<(ProtocolMessage, usize), FrameError
     Ok((msg, total))
 }
 
-/// `u32be header_len || bincode(BulkHeader) || exactly header.size raw bytes`.
+/// `u32be header_len || bincode(BulkHeader) || chunks`.
+/// Each chunk is `u32be len || bytes`, `len` at most [`MAX_BULK_CHUNK`].
+/// The concatenation of the chunks is `header.size` bytes.
 pub fn encode_bulk(header: &BulkHeader, body: &[u8]) -> Result<Vec<u8>, FrameError> {
-    bulk_body_len(header.size)?;
+    encode_bulk_chunks(header, body, MAX_BULK_CHUNK)
+}
+
+pub fn encode_bulk_chunks(
+    header: &BulkHeader,
+    body: &[u8],
+    chunk_max: usize,
+) -> Result<Vec<u8>, FrameError> {
+    if chunk_max == 0 || chunk_max > MAX_BULK_CHUNK {
+        return Err(FrameError::BulkTooLarge);
+    }
     if body.len() as u64 != header.size {
         return Err(FrameError::BodySize {
             got: body.len() as u64,
             want: header.size,
         });
     }
+    let mut frame = bulk_header_frame(header)?;
+    for chunk in body.chunks(chunk_max) {
+        frame.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
+        frame.extend_from_slice(chunk);
+    }
+    Ok(frame)
+}
+
+pub(crate) fn bulk_header_frame(header: &BulkHeader) -> Result<Vec<u8>, FrameError> {
     let payload = encode_wire(header).map_err(FrameError::Bincode)?;
     if payload.len() > MAX_CONTROL_FRAME {
         return Err(FrameError::TooLarge);
     }
-    let mut frame = Vec::with_capacity(4 + payload.len() + body.len());
+    let mut frame = Vec::with_capacity(4 + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     frame.extend_from_slice(&payload);
-    frame.extend_from_slice(body);
     Ok(frame)
 }
 
-pub fn decode_bulk(buf: &[u8]) -> Result<(BulkHeader, &[u8], usize), FrameError> {
+pub fn decode_bulk(buf: &[u8]) -> Result<(BulkHeader, Vec<u8>, usize), FrameError> {
+    let (header, header_end) = decode_bulk_header(buf)?;
+    let (body, consumed) = take_chunks(&buf[header_end..], header.size)?;
+    Ok((header, body, header_end + consumed))
+}
+
+pub(crate) fn decode_bulk_header(buf: &[u8]) -> Result<(BulkHeader, usize), FrameError> {
     if buf.len() < 4 {
         return Err(FrameError::Truncated);
     }
@@ -309,19 +336,41 @@ pub fn decode_bulk(buf: &[u8]) -> Result<(BulkHeader, &[u8], usize), FrameError>
     }
     let (header, _): (BulkHeader, usize) =
         decode_wire(&buf[4..header_end]).map_err(FrameError::Bincode)?;
-    let body_len = bulk_body_len(header.size)?;
-    let total = header_end
-        .checked_add(body_len)
-        .ok_or(FrameError::BulkTooLarge)?;
-    if buf.len() < total {
-        return Err(FrameError::Truncated);
-    }
-    Ok((header, &buf[header_end..total], total))
+    Ok((header, header_end))
 }
 
-pub(crate) fn bulk_body_len(size: u64) -> Result<usize, FrameError> {
-    if size > MAX_BULK_BODY {
+pub(crate) fn chunk_len(raw: u32) -> Result<usize, FrameError> {
+    let len = raw as usize;
+    if len == 0 || len > MAX_BULK_CHUNK {
         return Err(FrameError::BulkTooLarge);
     }
-    usize::try_from(size).map_err(|_| FrameError::BulkTooLarge)
+    Ok(len)
+}
+
+fn take_chunks(buf: &[u8], size: u64) -> Result<(Vec<u8>, usize), FrameError> {
+    let mut body = Vec::new();
+    let mut pos = 0;
+    while (body.len() as u64) < size {
+        if buf.len().saturating_sub(pos) < 4 {
+            return Err(FrameError::Truncated);
+        }
+        let raw = u32::from_be_bytes(buf[pos..pos + 4].try_into().expect("4 bytes"));
+        let n = chunk_len(raw)?;
+        let next = pos + 4 + n;
+        if buf.len() < next {
+            return Err(FrameError::Truncated);
+        }
+        let end = (body.len() as u64)
+            .checked_add(n as u64)
+            .ok_or(FrameError::BulkTooLarge)?;
+        if end > size {
+            return Err(FrameError::BodySize {
+                got: end,
+                want: size,
+            });
+        }
+        body.extend_from_slice(&buf[pos + 4..next]);
+        pos = next;
+    }
+    Ok((body, pos))
 }
