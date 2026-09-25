@@ -57,6 +57,39 @@ fn help_lists_master_slave_and_keygen() {
 }
 
 #[test]
+fn recompute_rewrites_an_empty_master_index_then_matches() {
+    let (_sandbox, config) = master_sandbox();
+    let first = bin()
+        .args(["recompute", "--config"])
+        .arg(&config)
+        .output()
+        .expect("run");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(first.stdout).expect("stdout").trim(),
+        "recomputed directory hashes"
+    );
+    let second = bin()
+        .args(["recompute", "--config"])
+        .arg(&config)
+        .output()
+        .expect("run");
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(second.stdout).expect("stdout").trim(),
+        "directory hashes already match"
+    );
+}
+
+#[test]
 fn keygen_help_mentions_out() {
     let output = bin().args(["keygen", "--help"]).output().expect("run");
     assert!(output.status.success());

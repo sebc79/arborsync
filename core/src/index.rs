@@ -621,6 +621,31 @@ mod tests {
         )
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "committed DirNode does not match a recompute from children")]
+    fn a_cached_child_missing_from_meta_fails_the_post_commit_check() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::master();
+        let mut cache = DirChildren::default();
+        let mut kids = DirKids::default();
+        kids.upsert(p("/ghost.txt"), EntryKind::File, &[9; 32], false);
+        cache.by_parent.insert(CanonicalPath::root(), kids);
+        let path = p("/real.txt");
+        let meta = file(1);
+        commit_leaves_with(
+            &store,
+            &ck,
+            [LeafChange {
+                path: &path,
+                meta: Some(&meta),
+                last_synced: LastSynced::AdoptLeaf,
+            }],
+            &mut cache,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn keep_leaves_last_synced_untouched_when_local_meta_changes() {
         let store = MemoryStorage::new();
