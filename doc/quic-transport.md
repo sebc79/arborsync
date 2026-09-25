@@ -100,7 +100,7 @@ max_connection_attempts_per_minute = 60
 
 `quic_max_concurrent_streams`, `quic_idle_timeout_ms`, `quic_initial_mtu`, `reconnect_initial_ms`, and `reconnect_max_ms` appear in older drafts. They are not parsed. Idle timeout and stream limits stay at Quinn defaults. Keep-alive is the 10 s ping above. Reconnect backoff is hardcoded (1 s, doubling, cap 60 s).
 
-Idle timeout closes the QUIC connection. The slave reconnects. Unknown-key disconnects increment `AttemptLimiter` after XX and still `close`. A limited IP is ignored before XX. Broken frames do not increment the limiter. Prefix deny stays `SubscribeReject`. `slave_id` mismatch is hangup.
+Idle timeout closes the QUIC connection. The slave reconnects. A session that ends on a read or write error still drops its roster entry and calls `Master::disconnect`, so the slot does not count toward `max_connections` and fan-out stops. Unknown-key disconnects increment `AttemptLimiter` after XX and still `close`. A limited IP is ignored before XX. Broken frames do not increment the limiter. Prefix deny stays `SubscribeReject`. `slave_id` mismatch is hangup.
 
 ## Security
 
