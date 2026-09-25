@@ -8,19 +8,19 @@ use std::time::{Duration, Instant};
 use crate::apply;
 use crate::bottleneck::{Stage, Wait, Waiting};
 use crate::config::{ConfigError, LoadedSlave, ReloadError, SlaveReload};
-use crate::crawl::{Crawl, DirListPage, RescanWalk, STEP_BUDGET, WalkError, Walked};
+use crate::crawl::{Crawl, DirListPage, RescanWalk, WalkError, Walked, STEP_BUDGET};
 use crate::hash::{ContentHash, FileNode};
 use crate::hashing::{HashDone, HashKey, HashNeed, HashOutcome, HashPlan};
 use crate::index;
 use crate::inflight::Inflight;
-use crate::merkle::{DirChild, file_node};
-use crate::meta::{self, EntryKind, FileMetadata, Inspected, hash_bytes};
+use crate::merkle::{file_node, DirChild};
+use crate::meta::{self, hash_bytes, EntryKind, FileMetadata, Inspected};
 use crate::path::{
-    CanonicalPath, EntryName, PathError, canonical_to_host, confine_host, conflict_sidecar_path,
-    join_central, local_paths_overlap, strip_central,
+    canonical_to_host, confine_host, conflict_sidecar_path, join_central, local_paths_overlap,
+    strip_central, CanonicalPath, EntryName, PathError,
 };
 use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
-use crate::reconcile::{WalkAction, decide_child};
+use crate::reconcile::{decide_child, WalkAction};
 use crate::status::{Queues, SlaveStatus, StatusLedger};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
 use crate::transfer::{self, BulkTransfer};
@@ -1585,6 +1585,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             if walk.found.contains_key(path) {
                 continue;
             }
+            if stat_still_present(&walk.local, &walk.central, path)? {
+                continue;
+            }
             changes.push(index::LeafChange {
                 path,
                 meta: None,
@@ -1609,7 +1612,27 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         }
         self.root_reports_for(&[walk.checkout_id])
     }
+}
 
+fn stat_still_present(
+    local: &Path,
+    central: &CanonicalPath,
+    path: &CanonicalPath,
+) -> Result<bool, SlaveError> {
+    let relative = strip_central(central, path)?;
+    let host = canonical_to_host(local, &relative);
+    match fs::symlink_metadata(&host) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            log::warn!("keeping {}: permission denied", host.display());
+            Ok(true)
+        }
+        Err(err) => Err(SlaveError::io(&host)(err)),
+    }
+}
+
+impl<S: Storage, C: ContentHook> Slave<S, C> {
     fn step_dir_list(&mut self, budget: usize) -> Result<HashPlan, SlaveError> {
         let (checkout_id, parent, batch, next, deletes_stale) = {
             let Some(page) = self.crawl.front_page_mut() else {
