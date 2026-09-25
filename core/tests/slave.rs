@@ -986,6 +986,56 @@ fn incoming_rename_moves_the_file_and_sets_last_synced_on_both_paths() {
 }
 
 #[test]
+fn incoming_rename_sidecars_a_destination_whose_content_differs() {
+    let sandbox = SyncSandbox::new();
+    let from_body = b"from-bytes";
+    let to_body = b"dest-bytes";
+    let from_hash = hash_bytes(from_body);
+    let to_hash = hash_bytes(to_body);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(from_hash, from_body.to_vec());
+    bodies.offer(to_hash, to_body.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let from_meta = FileMetadata::file(from_body.len() as u64, MTIME, 0o100644, from_hash);
+    let to_meta = FileMetadata::file(to_body.len() as u64, MTIME, 0o100644, to_hash);
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/old.txt"),
+            new: from_meta.clone(),
+            basis: None,
+        })
+        .unwrap();
+    slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: p("/src/new.txt"),
+            new: to_meta,
+            basis: None,
+        })
+        .unwrap();
+
+    slave
+        .handle(ProtocolMessage::Rename {
+            checkout_id: "src".into(),
+            from: p("/src/old.txt"),
+            to: p("/src/new.txt"),
+            from_basis: file_node(&from_meta),
+            to_new: from_meta,
+        })
+        .unwrap();
+
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    assert_eq!(std::fs::read(local.join("new.txt")).unwrap(), from_body);
+    let sidecar = conflict_sidecar_path(&local, &p("/src/new.txt"), &to_hash);
+    assert!(
+        sidecar.exists(),
+        "destination bytes were replaced without a sidecar"
+    );
+    assert_eq!(std::fs::read(&sidecar).unwrap(), to_body);
+}
+
+#[test]
 fn unpaired_remove_and_change_still_delete_plus_announce() {
     let sandbox = SyncSandbox::new();
     let mut slave = alice_slave(&sandbox, MemoryContent::new());
