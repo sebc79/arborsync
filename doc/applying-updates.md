@@ -87,7 +87,7 @@ Master `prepare_delete` commits the index and replies `CasAccept` before `remove
 
 Master CAS accepts the delete of `from` (`FileNode == from_basis`) and the create of `to` (`to` absent). A miss on `from` is `CasReject { path: from }`. A live `to` is `CasReject { path: to }`. Success replies `CasAccept` on `to` and enqueues `CasAccept` on `from` with `file_node: None`. Fan-out is one `Rename` when a checkout covers both paths, `Delete` when it covers only `from`, and `FileAnnounce` create when it covers only `to`.
 
-Slave apply uses `RenameAction`. `from` absent and `to` already matching `to_new` is `NoopRefresh`. Both absent is `CreateAtTo`. Matching `from_basis` or `last_synced` is `Apply`. Divergent file content sidecars `from`, then `rename_live`. After apply, `last_synced` on `from` is cleared and `last_synced` on `to` becomes `FileNode(to_new)`. Inflight arms on `to`.
+Slave apply uses `RenameAction`. `from` absent and `to` already matching `to_new` is `NoopRefresh`. Both absent is `CreateAtTo`. Matching `from_basis` or `last_synced` is `Apply`. Divergent file content sidecars `from`, then `rename_live`. A destination whose `content_hash` differs from `to_new` is sidecared before that rename. After apply, `last_synced` on `from` is cleared and `last_synced` on `to` becomes `FileNode(to_new)`. Inflight arms on `to`.
 
 Unpaired or cross-checkout rename stays Delete plus Create (`filesystem-scanning-watching.md`).
 
