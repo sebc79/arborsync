@@ -1,6 +1,7 @@
 mod cli;
 mod keygen;
 mod master;
+mod recompute;
 mod reload;
 mod slave;
 mod status;

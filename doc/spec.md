@@ -22,6 +22,7 @@
 arborsync master [--config /etc/arborsync/master.toml]
 arborsync slave  [--config ~/.config/arborsync/slave.toml]
 arborsync keygen [--out PATH]
+arborsync recompute [--config /etc/arborsync/master.toml]
 ```
 
 Config is TOML only.
@@ -535,7 +536,7 @@ arborsync/
 ├── flake.lock
 ├── nix/                # module.nix, eval fixture
 ├── core/               # arborsync-core
-└── src/                # master / slave / keygen subcommands
+└── src/                # master / slave / keygen / recompute subcommands
 ```
 
 ```toml
@@ -649,7 +650,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ⚠️ | §13 dirty root before network CAS | `Master::open` calls `root_is_dirty` and `rescan`s when it is true. `Slave::open` does not. `repair_dir_nodes` runs after a slave rescan commit. `doc/indexing.md` says both roles recompute before accepting network CAS. A slave can `RootReport` and apply before that walk. |
 | ⚠️ | §7 slave watcher death rescans | Notify overflow inside `watch_checkout` sends `Work::Rescan`. If `watch_checkout` returns `Err`, `spawn_checkout_watchers` logs and loops with no rescan and no sleep. `WatchStop::Restart` also skips the rescan. The master loop rescans, then re-arms. `doc/filesystem-scanning-watching.md` says log, rescan immediately, and re-arm. |
 | ✅ | §3 path safety re-checks the joined path | `confine_host` canonicalizes each existing ancestor and returns `PathError::EscapesRoot` when that ancestor leaves the root. Apply, ancestor mkdir, and rename undo use it. `canonical_to_host` stays the lexical join for reads. |
-| ❌ | §5 post-commit Merkle check | `commit_leaves_with` has no `debug_assert` against a recompute. No CLI command recomputes the tree. `doc/building-updating-merkle-trees.md` asks for both. |
+| ✅ | §5 post-commit Merkle check | Debug builds panic when a directory `commit_leaves_with` just wrote does not match a recompute from its children. `arborsync recompute` rewrites the master index from `/`. |
 
 Topic documents:
 

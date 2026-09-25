@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::{keygen, master, slave};
+use crate::{keygen, master, recompute, slave};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -32,6 +32,11 @@ pub enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Recompute master directory hashes from indexed children
+    Recompute {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 impl Cli {
@@ -40,6 +45,7 @@ impl Cli {
             Command::Master { config } => master::run(resolve_config(config)),
             Command::Slave { config } => slave::run(resolve_config(config)),
             Command::Keygen { out } => keygen::run(&out),
+            Command::Recompute { config } => recompute::run(resolve_config(config)),
         }
     }
 }

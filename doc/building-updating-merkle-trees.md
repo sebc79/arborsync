@@ -89,7 +89,7 @@ A flat global binary tree cannot make that equality hold. This encoding can.
 
 ## Integrity
 
-- After every committed batch, `DirNode(P)` must equal a recomputation from children in `meta` / `dir_nodes`. A debug assertion on small trees; a periodic full recompute on master if an operator requests it.
+- After every committed batch, `DirNode(P)` must equal a recomputation from children in `meta` / `dir_nodes`. Debug builds check the directories that batch wrote. `arborsync recompute` walks the master index from `/` when an operator asks.
 - A mismatched root is not “corrupt”; it is a reconcile trigger. Rebuild from the filesystem only when the index is unreadable (redb recovery failure). Then reconcile.
 
 ## Non-goals (struck from earlier drafts)

@@ -324,6 +324,8 @@ pub fn commit_leaves_with<'a, S: Storage>(
 
     let mut dirty: Vec<CanonicalPath> = dirty.into_iter().collect();
     dirty.sort_by_key(|path| std::cmp::Reverse(depth(path)));
+    #[cfg(debug_assertions)]
+    let written = dirty.clone();
 
     for dir in dirty {
         let node = cache.hash_dir(&dir);
@@ -332,7 +334,38 @@ pub fn commit_leaves_with<'a, S: Storage>(
         }
         batch.put_dir_node(ck, &dir, node)?;
     }
-    batch.commit()
+    batch.commit()?;
+    #[cfg(debug_assertions)]
+    debug_check_committed_dirs(store, ck, &written);
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn debug_check_committed_dirs<S: Storage>(store: &S, ck: &CheckoutId, dirs: &[CanonicalPath]) {
+    match committed_dirs_match(store, ck, dirs) {
+        Ok(true) => {}
+        Ok(false) => panic!("committed DirNode does not match a recompute from children"),
+        Err(err) => panic!("committed DirNode recompute failed: {err}"),
+    }
+}
+
+#[cfg(any(debug_assertions, test))]
+fn committed_dirs_match<S: Storage>(
+    store: &S,
+    ck: &CheckoutId,
+    dirs: &[CanonicalPath],
+) -> Result<bool, S::Error> {
+    let mut ordered = dirs.to_vec();
+    ordered.sort_by_key(|path| std::cmp::Reverse(depth(path)));
+    let mut computed = HashMap::new();
+    for dir in ordered {
+        let fresh = recompute(store, ck, &dir, &HashMap::new(), &computed)?;
+        if store.get_dir_node(ck, &dir)? != Some(fresh) {
+            return Ok(false);
+        }
+        computed.insert(dir, fresh);
+    }
+    Ok(true)
 }
 
 /// `DirNode(central)`, or the `FileNode` when a checkout maps a single file,
@@ -621,6 +654,41 @@ mod tests {
         )
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "committed DirNode does not match a recompute from children")]
+    fn a_cached_child_missing_from_meta_fails_the_post_commit_check() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::master();
+        let mut cache = DirChildren::default();
+        let mut kids = DirKids::default();
+        kids.upsert(p("/ghost.txt"), EntryKind::File, &[9; 32], false);
+        cache.by_parent.insert(CanonicalPath::root(), kids);
+        let path = p("/real.txt");
+        let meta = file(1);
+        commit_leaves_with(
+            &store,
+            &ck,
+            [LeafChange {
+                path: &path,
+                meta: Some(&meta),
+                last_synced: LastSynced::AdoptLeaf,
+            }],
+            &mut cache,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_committed_file_matches_a_recompute_from_children() {
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::new("src");
+        let path = p("/src/foo.rs");
+        let meta = file(1);
+        commit_cold(&store, &ck, &path, Some(&meta), LastSynced::AdoptLeaf).unwrap();
+        assert!(committed_dirs_match(&store, &ck, &[CanonicalPath::root(), p("/src")]).unwrap());
+    }
+
     #[test]
     fn keep_leaves_last_synced_untouched_when_local_meta_changes() {
         let store = MemoryStorage::new();
@@ -750,14 +818,7 @@ mod tests {
             LastSynced::AdoptLeaf,
         )
         .unwrap();
-        commit_cold(
-            &store,
-            &ck,
-            &link_path,
-            Some(&link),
-            LastSynced::AdoptLeaf,
-        )
-        .unwrap();
+        commit_cold(&store, &ck, &link_path, Some(&link), LastSynced::AdoptLeaf).unwrap();
         let mut batch = store.begin_write().unwrap();
         batch.put_dir_node(&ck, &dir, empty_dir_node()).unwrap();
         batch.commit().unwrap();
