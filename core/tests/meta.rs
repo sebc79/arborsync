@@ -1,9 +1,36 @@
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use arborsync_core::hash::ContentHash;
-use arborsync_core::meta::{EntryKind, collect_for_rescan, collect_from_path};
+use arborsync_core::meta::{EntryKind, collect_for_rescan, collect_from_path, hash_bytes, hash_file};
 use arborsync_core::test_support::TempTree;
+
+#[test]
+fn hash_file_does_not_follow_a_symlink() {
+    let tree = TempTree::new();
+    let target = tree.builder().file("target.bin", b"secret-bytes");
+    let link = tree.path().join("alias");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    match hash_file(&link) {
+        Ok(hash) => panic!(
+            "followed the symlink and hashed the target ({hash:?} == {:?})",
+            hash_bytes(b"secret-bytes")
+        ),
+        Err(err) => assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "the symlink path exists"
+        ),
+    }
+    let row = collect_from_path(&link).unwrap().unwrap();
+    let target_bytes = std::fs::read_link(&link).unwrap();
+    assert_eq!(row.kind, EntryKind::Symlink);
+    assert_eq!(
+        row.content_hash,
+        hash_bytes(target_bytes.as_os_str().as_bytes())
+    );
+}
 
 #[test]
 fn collect_skips_fifo_and_unreadable_file() {
