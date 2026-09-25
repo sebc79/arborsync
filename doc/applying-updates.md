@@ -33,7 +33,7 @@ Accept iff:
 
 Then atomic-write `central_root`, update the global index, reply `CasAccept`, and fan out (`pushing-updates.md`) to every interested checkout except the announcing `(slave_id, checkout_id)`.
 
-Otherwise `CasReject { path, current }`. The announcing slave sidecars its local bytes if `content_hash` differs, then pulls `current` (or deletes if `current` is `None`).
+Otherwise `CasReject { path, current }`. The announcing slave sidecars its local bytes if `content_hash` differs, then pulls `current` (or deletes if `current` is `None`). A rejected rename moves the file back first. If that move fails, the sidecar, delete, and pull use the path that still has the bytes.
 
 Meta-only mismatch (same `content_hash`, different `FileNode`): no sidecar; the loser adopts winner metadata.
 

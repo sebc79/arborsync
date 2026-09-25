@@ -1105,12 +1105,12 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                     None => {
                         self.remove_path(
                             &checkout_id,
-                            &from,
-                            self.meta(&checkout_id, &from)?.as_ref(),
+                            &to,
+                            self.meta(&checkout_id, &to)?.as_ref(),
                         )?;
                         Ok(Reply::Send(Vec::new()))
                     }
-                    Some(winner) => self.apply_new(&checkout_id, from, winner),
+                    Some(winner) => self.apply_new(&checkout_id, to, winner),
                 };
             }
         }
