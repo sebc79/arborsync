@@ -11,11 +11,15 @@ pub const PROTOCOL_PREAMBLE: &[u8] = b"arborsync-v1";
 /// Maximum control frame (header + bincode body). Larger → disconnect.
 pub const MAX_CONTROL_FRAME: usize = 1024 * 1024;
 pub const MAX_DIR_LIST_PAYLOAD: usize = MAX_CONTROL_FRAME / 4;
+/// Maximum bulk body. Larger is refused before the receiver allocates.
+pub const MAX_BULK_BODY: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FrameError {
     #[error("control frame exceeds 1 MiB")]
     TooLarge,
+    #[error("bulk body exceeds 1 GiB")]
+    BulkTooLarge,
     #[error("truncated frame")]
     Truncated,
     #[error("unsupported envelope version {0}")]
@@ -273,6 +277,7 @@ pub fn decode_control(buf: &[u8]) -> Result<(ProtocolMessage, usize), FrameError
 
 /// `u32be header_len || bincode(BulkHeader) || exactly header.size raw bytes`.
 pub fn encode_bulk(header: &BulkHeader, body: &[u8]) -> Result<Vec<u8>, FrameError> {
+    bulk_body_len(header.size)?;
     if body.len() as u64 != header.size {
         return Err(FrameError::BodySize {
             got: body.len() as u64,
@@ -304,9 +309,19 @@ pub fn decode_bulk(buf: &[u8]) -> Result<(BulkHeader, &[u8], usize), FrameError>
     }
     let (header, _): (BulkHeader, usize) =
         decode_wire(&buf[4..header_end]).map_err(FrameError::Bincode)?;
-    let total = header_end + header.size as usize;
+    let body_len = bulk_body_len(header.size)?;
+    let total = header_end
+        .checked_add(body_len)
+        .ok_or(FrameError::BulkTooLarge)?;
     if buf.len() < total {
         return Err(FrameError::Truncated);
     }
     Ok((header, &buf[header_end..total], total))
+}
+
+pub(crate) fn bulk_body_len(size: u64) -> Result<usize, FrameError> {
+    if size > MAX_BULK_BODY {
+        return Err(FrameError::BulkTooLarge);
+    }
+    usize::try_from(size).map_err(|_| FrameError::BulkTooLarge)
 }
