@@ -423,7 +423,8 @@ pub async fn read_bulk(recv: &mut RecvStream) -> Result<(BulkHeader, Vec<u8>), T
     let (header, _): (BulkHeader, usize) =
         bincode::serde::decode_from_slice(&payload, bincode::config::standard())
             .map_err(|err| TransportError::Frame(FrameError::Bincode(err.to_string())))?;
-    let mut body = vec![0u8; header.size as usize];
+    let body_len = crate::protocol::bulk_body_len(header.size).map_err(TransportError::Frame)?;
+    let mut body = vec![0u8; body_len];
     if !body.is_empty() {
         recv.read_exact(&mut body).await.map_err(stream_err)?;
     }

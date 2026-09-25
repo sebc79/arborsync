@@ -351,5 +351,5 @@ fn decode_bulk_rejects_a_body_larger_than_the_cap() {
         bincode::serde::encode_to_vec(&header, bincode::config::standard()).expect("header");
     let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
     frame.extend(payload);
-    assert_eq!(decode_bulk(&frame).unwrap_err(), FrameError::TooLarge);
+    assert_eq!(decode_bulk(&frame).unwrap_err(), FrameError::BulkTooLarge);
 }
