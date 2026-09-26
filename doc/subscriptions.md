@@ -52,7 +52,7 @@ Master keeps an in-memory trie of `(slave_id, checkout_id, central)` for connect
 2. Slave opens the control stream, sends framed `Subscribe { slave_id, checkouts }`.
 3. `slave_id` must match the ACL row for that key. Each `central` must sit under at least one `allowed_prefixes` entry (same prefix rule). Count must be ≤ `max_checkouts_per_slave` (same name and default on both sides: 100).
 4. Central paths need not exist yet. Pre-subscribe is allowed; creates under the ACL succeed later.
-5. Success: `SubscribeAck` with master’s current `DirNode` (or `FileNode`) for each `central`. Failure: `SubscribeReject` with `denied_centrals` and a reason. Specified: the slave logs and does not retry those prefixes until config or ACL changes. As built: `Slave::handle` hangs up and the binary reconnects with the same `Subscribe`.
+5. Success: `SubscribeAck` with master’s current `DirNode` (or `FileNode`) for each `central`. Failure: `SubscribeReject` with `denied_centrals` and a reason. The slave stores those centrals in `denied_centrals` and re-subscribes without them. When none remain it hangs up. The set is cleared on a checkout or pin reload.
 6. A second `Subscribe` on the same connection **replaces** the set. Removed ids are forgotten on the master; the slave drops those index prefixes. Added ids start reconcile.
 
 `Subscribe` is not authenticated by a shared PSK. The key *is* the identity. There is no separate “path authorization” mechanism beyond `allowed_prefixes`.

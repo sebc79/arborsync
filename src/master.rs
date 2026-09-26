@@ -368,6 +368,7 @@ fn release_session<S: Storage, C: ContentHook>(
     replaced: bool,
 ) {
     if replaced {
+        master.lock().expect("master").drop_pending(peer);
         return;
     }
     sessions.lock().expect("sessions").remove(slave_id);
@@ -751,8 +752,9 @@ mod tests {
     use arborsync_core::LoadedMaster;
     use arborsync_core::config::SlaveAcl;
     use arborsync_core::keys::format_hex_key;
-    use arborsync_core::master::{Master, MemoryContent};
-    use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
+    use arborsync_core::master::{Master, MemoryContent, Reply};
+    use arborsync_core::meta::{hash_bytes, FileMetadata};
+    use arborsync_core::protocol::{BulkEncoding, BulkHeader, CheckoutRef, ProtocolMessage};
     use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -819,5 +821,76 @@ mod tests {
             1,
             "the replacement was dropped with the old task"
         );
+    }
+
+    #[test]
+    fn a_replaced_session_drops_that_peers_pending() {
+        let sandbox = SyncSandbox::new();
+        let cfg_path = sandbox.write_master_config(vec![SlaveAcl {
+            id: "dev-alice".into(),
+            public_keys: vec![format_hex_key(&ALICE)],
+            allowed_prefixes: vec!["/src".into()],
+        }]);
+        let mut master = Master::open(
+            LoadedMaster::load(&cfg_path).unwrap(),
+            MemoryStorage::new(),
+            MemoryContent::new(),
+        )
+        .unwrap();
+        master
+            .handle(
+                ALICE,
+                ProtocolMessage::Subscribe {
+                    slave_id: "dev-alice".into(),
+                    checkouts: vec![CheckoutRef {
+                        id: "src".into(),
+                        central: p("/src"),
+                    }],
+                },
+            )
+            .unwrap();
+        let body = b"pending-bytes";
+        let new = FileMetadata::file(body.len() as u64, 1_700_000_000_000, 0o100644, hash_bytes(body));
+        match master
+            .handle(
+                ALICE,
+                ProtocolMessage::FileAnnounce {
+                    checkout_id: "src".into(),
+                    path: p("/src/hello.txt"),
+                    new,
+                    basis: None,
+                },
+            )
+            .unwrap()
+        {
+            Reply::Send(ProtocolMessage::SignatureRequest { .. }) => {}
+            other => panic!("expected SignatureRequest, got {other:?}"),
+        }
+        let master = Mutex::new(master);
+        let sessions = Mutex::new(std::collections::HashMap::new());
+        release_session(&sessions, &master, "dev-alice", ALICE, true);
+        assert_eq!(master.lock().expect("master").take_status().connected, 1);
+        match master
+            .lock()
+            .expect("master")
+            .apply_bulk(
+                ALICE,
+                BulkHeader {
+                    path: p("/src/hello.txt"),
+                    checkout_id: "src".into(),
+                    want_hash: hash_bytes(body),
+                    encoding: BulkEncoding::Whole,
+                    size: body.len() as u64,
+                },
+                body,
+            )
+            .unwrap()
+        {
+            Reply::Send(ProtocolMessage::Error { code, .. }) => {
+                assert_eq!(code, "unknown_transfer")
+            }
+            other => panic!("expected unknown_transfer, got {other:?}"),
+        }
+        assert!(!sandbox.central_root().join("src/hello.txt").exists());
     }
 }
