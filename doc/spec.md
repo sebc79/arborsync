@@ -21,7 +21,7 @@
 ```
 arborsync master [--config /etc/arborsync/master.toml]
 arborsync slave  [--config ~/.config/arborsync/slave.toml]
-arborsync keygen [--out PATH]
+arborsync keygen --out PATH
 arborsync recompute [--config /etc/arborsync/master.toml]
 ```
 
@@ -151,7 +151,7 @@ Handshake: Noise `XX_25519_ChaChaPoly_BLAKE2s` via `quinn-hyphae`. After XX, eac
 - Slave key: add the new public key to `public_keys`, reload master, switch the slave key, then drop the old key.
 - Master key: add the new public key to every slave’s `master_public_keys` first, rotate the master key, then remove the old pin.
 
-**Reloadable** without restart: log level, rate limits, ACL rows (add/remove slaves, prefixes, extra public keys), watcher debounce, rescan interval, status interval, and `[tune]` knobs (`hashing.workers` on both roles; slave `fulfill_parked.inflight`).  
+**Reloadable** without restart: log level, rate limits, `max_connections` (new accepts only), `max_checkouts_per_slave` (enforced on the next `Subscribe`; live interest is not pruned), ACL rows (add/remove slaves, prefixes, extra public keys), slave `master_public_keys`, slave `checkouts` (add/remove per §3), watcher debounce, rescan interval, status interval, and `[tune]` knobs (`hashing.workers` on both roles; slave `fulfill_parked.inflight`).  
 **Not reloadable:** `listen_addr`, `db_path`, `central_root`, key *paths*, `master_addr`, slave `slave_id`.
 
 ---
@@ -287,7 +287,7 @@ Same `FileAnnounce` / `Delete` with `origin` = master (no checkout) and `basis` 
 
 **Sidecar path:** `{checkout_local}/.arborsync-conflicts/{canonical-relative}--{content_hash_hex[0..16]}`. Create parent dirs as needed. Never place conflict files beside the original under a syncable name.
 
-**Type change** (file ↔ dir ↔ symlink): Delete + Create in one master transaction, each CAS-guarded.
+**Type change** (file ↔ dir ↔ symlink): one `FileAnnounce`. CAS on the old `FileNode`. Accept deletes then creates, one `commit_leaf_with`, one `CasAccept`. Fan-out uses the previous `FileNode` as basis.
 
 **Same-slave central overlap:** apply per checkout independently. Origin checkout is skipped on fan-out; the other local copy is updated via announce, not by copying locally out-of-band.
 
@@ -408,7 +408,7 @@ Paths in every message are canonical. `checkout_id` is required on slave-scoped 
 - Pattern: `Noise_XX_25519_ChaChaPoly_BLAKE2s`.
 - Listen: UDP, default `0.0.0.0:8443`.
 - Slave verifies master static key; master maps slave static key → ACL.
-- Unknown keys and ACL misses are disconnects, rate-limited per source IP.
+- Unknown keys and `slave_id` mismatches are disconnects, rate-limited per source IP. A checkout `central` outside `allowed_prefixes` is `SubscribeReject` (not a disconnect and not a rate-limit hit).
 - Reconnect: exponential backoff, then `Subscribe` + reconcile. No 0-RTT, no replay of announces.
 - `Transport` is a live session after handshake. It exposes the peer static key, one control stream pair, on-demand bulk transfers, best-effort datagrams, and `close`.
 - `impl Transport for quinn::Connection` is the QUIC path.
@@ -572,14 +572,14 @@ Status icons: ✅ built · ⚠️ partial · ❌ open · ➖ struck.
 
 Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen` binaries.
 
-1. ✅ `core`: `FileMetadata`, path-Merkle encode/hash, `Storage` + redb, frame codec, canonical-path helpers, reserved-name filter, local-overlap check.
+1. ✅ `core`: `FileMetadata`, path-Merkle encode/hash, `Storage` + redb, frame codec, canonical-path helpers, local-overlap check. Reserved-name filter on local watch and rescan only (wire path: see table).
 2. ✅ `keygen` + config parse/validate (ACL, pins, checkouts).
 3. ✅ Master: watch `central_root`, index, QUIC XX accept, ACL, Subscribe, CAS apply to disk, fan-out, log public pin at startup.
 4. ✅ Slave: connect, pin check, Subscribe, per-checkout watch, announce, apply, sidecar, log public pin at startup.
-5. ✅ Bulk `copia` streams; whole-file fallback. Apply reconstructs in memory, then writes the full buffer through `.arborsync-tmp`.
+5. ⚠️ Bulk `copia` streams; whole-file fallback. Apply reconstructs in memory, then writes the full buffer through `.arborsync-tmp`. Bodies larger than 1 GiB are allowed and peak RAM follows (see table).
 6. ✅ Reconcile walk + rescan + reconnect.
 7. ✅ Config watch for checkout add/remove; SIGHUP ACL/log/status-interval/tune reload.
-8. ✅ Tests: `core/tests/scenarios.rs` covers reserved dirs, two checkouts on one slave (`/src` and `/`), CAS conflict, echo suppression, ACL deny, and rescan-as-missed-watcher. Those tests call `handle`, `note_local`, and `rescan` on `MemoryStorage`. `src/watch.rs` starts a real `notify-debouncer-full` thread and asserts a FileAnnounce after a post-arm write. `tests/sync.rs` starts master and slave over QUIC and asserts a post-connect write crosses.
+8. ✅ Tests: `core/tests/scenarios.rs` covers reserved dirs (local skip), two checkouts on one slave (`/src` and `/`), CAS conflict, echo suppression, ACL deny, and rescan-as-missed-watcher. Those tests call `handle`, `note_local`, and `rescan` on `MemoryStorage`. `src/watch.rs` starts a real `notify-debouncer-full` thread and asserts a FileAnnounce after a post-arm write. `tests/sync.rs` starts master and slave over QUIC and asserts a post-connect write crosses. No wire reserved-name reject test. No end-to-end SIGHUP reload test in `tests/cli.rs`.
 
 **✅ Framing and storage.** `decode_control` reads `Envelope.version`, then `ProtocolMessage`. An unknown version is `FrameError::UnsupportedVersion`, including a v2 variant index under version 2. On-disk `FileMetadata` is `u16le META_SCHEMA_VERSION || bincode` with its own `meta_bincode_config`. Wire frames use `wire_bincode_config`. Both configs are `bincode::config::standard()` today. The schema prefix is what stops a wire change from silently reinterpreting stored rows.
 
@@ -590,13 +590,13 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §3 overlap after symlink-resolved canonicalize | Parse checks tilde-expanded paths and `canonicalize`s a local that already exists. `Slave::open` and checkout-add reload `canonicalize` again and reject `LocalOverlap` on the resolved paths. |
 | ✅ | §4 startup public pin | After `read_static_key`, `master` and `slave` log `hex:` plus 64 hex digits. Same form as `keygen` stdout. |
 | ✅ | §4 / §14 config files `0600` | `LoadedMaster::load` / `LoadedSlave::load` reject a file whose mode is not `0600` (`ConfigError::InsecureMode`). `parse` does not check mode. The NixOS unit copies `services.arborsync.master.configFile` to `/run/arborsync/master.toml` with mode `0600` and passes that path to `--config`. |
-| ✅ | §4 / §12 unknown-key rate limit | `AttemptLimiter::limited` drops the accept before XX. After XX, unknown key records `allow` and closes. `slave_id` mismatch is `Reply::Hangup` (the binary also `allow`s). Prefix deny stays `SubscribeReject` and does not call `allow`. §12 still says ACL misses are disconnects. |
+| ✅ | §4 / §12 unknown-key rate limit | `AttemptLimiter::limited` drops the accept before XX. After XX, unknown key records `allow` and closes. `slave_id` mismatch is `Reply::Hangup` (the binary also `allow`s). Prefix deny stays `SubscribeReject` and does not call `allow`. |
 | ✅ | §6 skip device, socket, FIFO | `collect_from_path` / `collect_for_rescan` return `Ok(None)` and log a warn for device, socket, and FIFO. The walk continues. `PermissionDenied` also returns `Ok(None)`. The §7 rescan row is the delete that follows. |
 | ✅ | §6 / §7 hash only on size/mtime miss | `inspect_for_hash` reuses `content_hash` for a regular file when kind, size, and mtime match. Mode is not a miss. The returned row carries the fresh mode. Symlinks and directories always `collect_from_path`. Rescan walks, Create, Write, Metadata, and same-window Rename use it. A miss falls through to `collect_from_path`. |
 | ✅ | §7 event kinds and same-window `Rename` | `notify-debouncer-full` 0.5 keeps Create, Write, Remove, Rename, and `Modify(Metadata)`. Same-window same-checkout rename is one `ProtocolMessage::Rename`. Unpaired or cross-checkout rename stays Delete plus Create. Apply is `fs::rename` plus index update, not a bulk copy. |
 | ✅ | §7 inflight before apply | Armed before the live `rename` / `mkdir` / meta apply. Files, symlinks, dirs (`ContentHash::ZERO`), and meta-only apply all arm. |
 | ✅ | §8 directory CAS | Live directories CAS on `FileNode` like files (create, meta update, delete). `last_synced` stores that `FileNode`. Master-local dir edits still `commit` as replica of record, same as files. Mode or mtime `PermissionDenied` on an existing directory is a warn, not a session error. |
-| ✅ | §8 type change in one master transaction | One `FileAnnounce`. CAS on the old `FileNode`. Delete then create in the accept. One `commit_leaf_with`. One `CasAccept`. Fan-out `FileAnnounce` with previous `FileNode` as basis. §8 still says Delete plus Create, each CAS-guarded. |
+| ✅ | §8 type change in one master transaction | One `FileAnnounce`. CAS on the old `FileNode`. Delete then create in the accept. One `commit_leaf_with`. One `CasAccept`. Fan-out `FileAnnounce` with previous `FileNode` as basis. |
 | ✅ | §8 sidecar only for the content-hash loser | Slave announce apply, `CasReject`, and incoming `Delete` use `sidecar_if_content_differs`. Delete compares live `content_hash` with the last-synced content hash. Master `publish` does not sidecar a successful replace. |
 | ✅ | §8 children-first directory delete | `remove_live` removes each child, then `remove_dir`. Files and symlinks use `remove_file`. |
 | ✅ | Unrelated paths proceed during a directory delete | `prepare_delete` commits the index and returns `CasAccept` before `remove_live`. The binary runs `remove_live` on `spawn_blocking`. While that walk runs, the prefix stays in `wipes`. The watcher and rescan skip a path that prefix covers. Overlapping `FileAnnounce`, `Delete`, and `Rename` stay queued on the connection until `finish_wipe`. Other paths and other connections proceed. A failed `remove_live` logs, drops the prefix, and the next rescan indexes files still on disk. |
@@ -610,12 +610,12 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §11 slave control write is not on the session `select!` | The slave binary owns a writer task for the control `SendStream` and a spawned `write_bulk`. The session task keeps `read_control` live. A leftover walk that wrote a whole `Reply::Send` before reading filled the 1.25 MiB stream window with unread `SignatureRequest`s and never opened bulk. Leftover file reads run on `spawn_blocking`. Up to four small bulks can be in flight. One file larger than 16 MiB uses the large lane. Extra inbound `SignatureRequest`s stay parked with the announced size from that ingest. `kick` admits from that size, not a redb walk. Leftover dir-list pages wait while asks are parked or in flight. Rescan hashing still steps so a leftover send does not stall the rest of the tree. A second `SignatureRequest` for the same `(checkout_id, path, want_hash)` is dropped. Watcher plus leftover walk used to fulfill the same ask twice. The second bulk hit `unknown_transfer` and held later leftover asks behind a full-file send. `apply_bulk` treats a missing pending row as success when the live bytes already hash to `want_hash`. Inbound `Error` is recorded and not echoed as `unsupported`. Outbound pull `SignatureRequest`s after `CasReject` take a second writer lane that the control task prefers over leftover `FileAnnounce`s. |
 | ✅ | §7 / §10 slave crawl yields | `SubscribeAck` rescan and leftover `DirListResponse` pages walk at most 64 names per session turn. A new or changed index row is announced in that turn. The slave holds hashed announces until 64 are ready or hashing workers are idle, then one `commit_leaves` writes them. `SubscribeAck` sends the current `RootReport` before a long walk finishes. Leftover pages are stepped before a queued rescan. The watch thread queues `request_rescan` and does not drain the walk. `status` and `read_control` stay live. `Slave::rescan` drains the walk for tests. A 300k-file walk that ran inside one `handle` used to mute `status 5s` and stop reading control. A `commit_leaves` of more than one path marks new children stale and rebuilds each directory concat once. Splicing every new name walked every sibling, so one wide directory held the session task inside `crawl_step` and the 5s line stopped. Waiting for the whole walk before `RootReport` left leftover files on the slave. Rescan `lstat` runs off the session task, 64 names at a time, so `read_control` and the hash pump stay live while those stats are in flight. A partial directory is not a delete. A dir-list `Delete` waits until that rescan finishes. `apply_dir_child` reads the live `cas_since_dir_list` counter so a `CasAccept` mid-page does not emit `AnnounceDelete` for a path that accept just committed. Known index rows still reconcile via the `SubscribeAck` `RootReport`. |
 | ✅ | §11 master control write is not on the session `select!` | `dispatch_master` and `flush_outbox` enqueue onto a writer task. Master `write_bulk` is spawned. The session keeps `read_control` and `accept_uni` live while the control window is full. |
-| ✅ | §12 one live connection per `slave_id` | Replacing a session `close`s the previous `Connection` and signals the old task. `accept_session` runs the read loop in a block, then `release_session` removes the roster entry and calls `Master::disconnect` on every exit, including `read_control`, `read_bulk`, `apply_bulk`, `flush_outbox`, and the writer-error arm. A replaced session does not remove the new entry. `Reply::Hangup` breaks the loop, so `disconnect` runs. `dispatch_master` does not call `conn.close`. Unknown-key, max-connection, replacement, and ACL reload do close. |
+| ✅ | §12 one live connection per `slave_id` | Replacing a session `close`s the previous `Connection` and signals the old task. `accept_session` runs the read loop in a block, then `release_session` removes the roster entry and calls `Master::disconnect` on a normal exit. A replaced session returns early from `release_session` without `disconnect` (see review row). `Reply::Hangup` breaks the loop, so `disconnect` runs. `dispatch_master` does not call `conn.close`. Unknown-key, max-connection, replacement, and ACL reload do close. |
 | ✅ | §12 `Transport` trait | `Transport` is a live session. It exposes the peer static key, one control stream pair, on-demand bulk, best-effort datagrams, and `close`. `impl Transport for quinn::Connection` is the QUIC path. The master and slave binaries and `core/tests/transport.rs` call the trait. `MemoryTransport::pair` is the in-memory test impl and has no datagrams. `pair_with_datagrams` is the opt-in. Most unit tests still call `handle`. |
 | ➖ | §14 `quic_*` / `reconnect_*` | Struck in `doc/configuration.md`. Not struct fields. Reconnect is 1 s, doubling, cap 60 s. |
 | ✅ | §11 / §12 keep-alive | Idle timeout stays at the Quinn 30 s default. `listen` and `client_endpoint` set `keep_alive_interval` to 10 s. No application `Heartbeat`. |
 | ✅ | Backpressure (`set_writable`) | `flush_outbox` polls the batch and `set_writable(peer, false)` when the batch is longer than 32. The writer task sets `writable` true after that batch is written. `set_writable(false)` clears the leftover outbox and increments `fanout_dropped` on that interval. |
-| ✅ | In-flight bulk after disconnect | `Master::disconnect` drops pending rows whose `peer` is the disconnected peer. `release_session` calls it when the session loop ends, including an error return. |
+| ✅ | In-flight bulk after disconnect | `Master::disconnect` drops pending rows whose `peer` is the disconnected peer. `release_session` calls it on a normal session exit, including an error return. A replaced session skips that call (see review row). |
 | ✅ | Interval status reports | Master and slave log a `status ` summary each `status_interval_seconds` (default 5, `0` disables, max 3600). Health is `idle`, `busy`, `stuck`, or `failed`. Each line also names `bottleneck=` (the hop that is limiting progress), with `age=` and `depth=` when a wait is open. The master adds one line per slave and prints `fanout_dropped=` on the master queue fields. Reload applies the interval live. No metrics port. |
 | ✅ | §14 `[tune.hashing]` / `[tune.fulfill_parked]` | `workers` is `"nproc"` or 1 through 256 on both roles. Slave `inflight` is 1 through 64. Defaults are `"nproc"` and 4. `0` and `[tune.origin_bytes]` fail parse. Master `[tune.fulfill_parked]` is `TuneNotOnRole`. Both knobs apply on SIGHUP. Hash work and master fulfill run on `spawn_blocking`. Slave leftover inflight is `FulfillAdmission`. No NixOS option. |
 | ✅ | Bottleneck side-channel | The slave sends its own `bottleneck=` verdict to the master as a 25-byte QUIC datagram each status period. Not a `ProtocolMessage`. A missing or stale gauge prints `hint=absent` or `hint=stale` on that slave line only. An old peer keeps syncing. |
@@ -632,7 +632,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §7 `repair_dir_nodes` clears `last_synced` on leaves the hash left out | A file or symlink under a repaired directory loses `last_synced`. Directories stay. |
 | ✅ | §7 inflight covers a failed apply | `publish`, `finish_apply`, and `apply_rename` arm `inflight` before the live write and disarm if that apply fails. |
 | ✅ | §14 slave checkout reload is one commit | `Slave::reload` validates resolved local overlap on a provisional checkout set, then deletes/inserts index rows and assigns `cfg` only after that check succeeds. |
-| ✅ | §4 reload lists match `plan_reload` | Reloadable and not-reloadable lists match `plan_reload` for both roles. `slave_id` is not reloadable. Debounce, rescan interval, status interval, and tune reload. |
+| ✅ | §4 reload lists match `plan_reload` | §4 Reloadable / Not reloadable match `plan_reload` for both roles, including slave checkouts, `master_public_keys`, `max_connections`, and `max_checkouts_per_slave`. `slave_id` is not reloadable. Debounce, rescan interval, status interval, and tune reload. Shrinking `max_checkouts_per_slave` does not prune live interest (next `Subscribe` enforces). `configuration.md` Applied live still omits `max_checkouts_per_slave`. |
 | ✅ | §4 `keygen --out` | Clap requires `--out`. `keygen::run` writes that path. |
 | ✅ | §6 created directories use the announced mode | `mkdir_live` creates missing parents, then sets `mode & 0o7777` on each directory that call created, then mtime. Umask does not leave the announced mode. |
 | ✅ | §6 symlink hash reuse | Symlinks always re-read the target. Same-size same-mtime reuse is files only. |
@@ -647,10 +647,25 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §13 a directory cache loads direct children | `DirChildren::ensure_loaded` and reconcile child lists use `range_meta_children` (direct children only). On redb the scan seeks past each child's subtree so nested keys are not walked. `range_meta` still ends at the exclusive descendant bound. |
 | ✅ | §6 collection uses `symlink_metadata` | Collection uses `symlink_metadata`. `mtime_ns` is `st_mtime * 1e9 + st_mtime_nsec`, including negative stamps. Paths are not skipped when `Metadata::modified()` would fail. |
 | ✅ | §13 `last_synced` value is 32 or 64 bytes | `last_synced` values are 32 bytes (`FileNode`) or 64 bytes (`FileNode` || `content_hash`). Both widths decode. |
-| ✅ | §13 dirty root before network CAS | `Slave::open` and `Master::open` both rescan when `root_is_dirty` before accepting network CAS. |
+| ✅ | §13 dirty root before network CAS | `Slave::open` and `Master::open` both rescan when `root_is_dirty` before accepting network CAS. Slave `commit_rescan` also runs `repair_dir_nodes`. Master rescan does not (see review row below). |
 | ✅ | §7 slave watcher death rescans | If `watch_checkout` returns `Err` or `WatchStop::Restart`, the slave logs (on `Err`), queues `Work::Rescan`, re-arms, and on `Err` sleeps 1s so a broken watch cannot spin. |
 | ✅ | §3 path safety re-checks the joined path | `confine_host` canonicalizes each existing ancestor and returns `PathError::EscapesRoot` when that ancestor leaves the root. Apply, ancestor mkdir, and rename undo use it. `canonical_to_host` stays the lexical join for reads. |
 | ✅ | §5 post-commit Merkle check | Debug builds panic when a directory `commit_leaves_with` just wrote does not match a recompute from its children. `arborsync recompute` rewrites the master index from `/`. |
+
+Review findings (tree at `37f8671`, working tree clean). High-confidence gaps against this map. Icons stay ⚠️ until fixed in code or tests.
+
+| | Gap | Evidence |
+|---|---|---|
+| ⚠️ | §6 reserved names on the wire | Local `note_changed` / walk skip `.arborsync-tmp` and `.arborsync-conflicts`. Master `on_announce`, `on_delete` / `classify_delete`, `on_rename`, `plan_fulfill`, and `on_dir_list` do not. Slave inbound `on_announce` does not. A `/` ACL peer can announce under those names; the master can index and fan them out. Scenarios cover local skip only. |
+| ⚠️ | §8 bulk finish does not re-CAS | `on_announce` decides CAS once and stores `PendingApply`. `finish_apply_bulk` publishes and commits without a second `decide_cas` against the live `FileNode`. Pending keys are `(checkout_id, path)`, so two accepted pendings can target the same canonical path. A later loser can overwrite a newer winner. |
+| ⚠️ | §13 master dirty open skips `repair_dir_nodes` | `indexing.md` crash safety wants a full metadata walk plus recompute before network CAS. `Master::open` rescans when `root_is_dirty` but never calls `repair_dir_nodes` (`recompute_index` / CLI only). Slave `commit_rescan` does repair. Pure `dir_nodes` corruption with matching `meta` can survive. `root_is_dirty` hashes `/` from stored child DirNodes only, not a bottom-up leaf recompute. |
+| ⚠️ | §12 session replace leaves pending | `release_session` returns early when `replaced` and skips `Master::disconnect`, so that peer’s `pending` rows are not dropped. Same-key replace keeps old pending under the new session. Key rotation leaves orphans with no TTL. §16’s “in-flight bulk after disconnect” row covers only the non-replaced exit. |
+| ⚠️ | §7 type-change / symlink echo | `Remove` while armed is dropped and does not consume (`applying-updates.md` Echo). Create/Changed matching the armed hash does consume. If Create runs first, a late Remove can `reconcile_delete` the CAS winner. Tests cover Remove while still armed. |
+| ⚠️ | applying-updates parent dirs `0o755` | File and symlink parents use bare `fs::create_dir_all` (`VerifiedContent::publish`, `atomic_symlink`, `rename_live`). Only directory announces use `create_dir_all_with_mode`. Under a restrictive umask, auto-created parents are not `0755`. |
+| ⚠️ | §14 / quic-transport key file `0600` on read | `write_static_key` sets `0600`. `read_static_key` loads any readable file. Config TOML mode is checked; key files are not. |
+| ⚠️ | §9 / item 5 whole-file RAM | Spec allows a logical body larger than 1 GiB. `read_bulk` concatenates into one `Vec`, reconstruct holds the result, and `StagedContent::verify` re-reads the tmp into another buffer before rename. |
+| ⚠️ | Reload path untested at the binary | Core `plan_reload` / `Master::reload` / `Slave::reload` and `src/reload.rs` watch-setup backoff are covered. `tests/cli.rs` does not drive SIGHUP or config-watch through ACL drop / `close` / resubscribe. |
+| ⚠️ | `doc/subscriptions.md` SubscribeReject “As built” | Still says the slave hangs up and reconnects with the same `Subscribe`. Code stores `denied_centrals` and re-subscribes filtered checkouts (`Slave::on_subscribe_reject`). Overview and quic-transport match the code. |
 
 Topic documents:
 
