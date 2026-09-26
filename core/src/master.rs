@@ -20,8 +20,8 @@ use crate::keys::format_hex_key;
 use crate::merkle::file_node;
 use crate::meta::{self, hash_bytes, EntryKind, FileMetadata, Inspected};
 use crate::path::{
-    canonical_to_host, confine_host, is_reserved_root_entry, join_central, CanonicalPath,
-    EntryName, PathError,
+    canonical_to_host, confine_host, is_reserved_root_entry, join_central, strip_central,
+    CanonicalPath, EntryName, PathError,
 };
 use crate::protocol::{page_dir_list, BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
 use crate::status::{MasterStatus, PeerLive, Queues, StatusLedger};
@@ -1310,6 +1310,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         if !session.central.covers(&path) {
             return Ok(outside_central(&path));
         }
+        if path_is_reserved(&session.central, &path) {
+            return Ok(reserved_name(&path));
+        }
         if self.overlaps_wipe(&path) {
             return Ok(wiping(&path));
         }
@@ -1505,6 +1508,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         if !session.central.covers(&path) {
             return Ok(DeleteClass::Reply(outside_central(&path)));
         }
+        if path_is_reserved(&session.central, &path) {
+            return Ok(DeleteClass::Reply(reserved_name(&path)));
+        }
         let current = self.meta(&path)?;
         if let CasDecision::Reject { current } = decide_cas(current.as_ref(), Some(basis), None) {
             return Ok(DeleteClass::Reply(ProtocolMessage::CasReject {
@@ -1552,6 +1558,12 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         }
         if self.overlaps_wipe(&from) || self.overlaps_wipe(&to) {
             return Ok(wiping(&from));
+        }
+        if path_is_reserved(&session.central, &from) {
+            return Ok(reserved_name(&from));
+        }
+        if path_is_reserved(&session.central, &to) {
+            return Ok(reserved_name(&to));
         }
 
         let current_from = self.meta(&from)?;
@@ -1642,6 +1654,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         };
         if !session.central.covers(&path) {
             return Ok(outside_central(&path));
+        }
+        if path_is_reserved(&session.central, &path) {
+            return Ok(reserved_name(&path));
         }
         match self.meta(&path)? {
             Some(meta) if meta.kind != EntryKind::Dir => Ok(ProtocolMessage::FileAnnounce {
@@ -1932,6 +1947,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         if !session.central.covers(&path) {
             return Ok(FulfillPlan::Send(outside_central(&path)));
         }
+        if path_is_reserved(&session.central, &path) {
+            return Ok(FulfillPlan::Send(reserved_name(&path)));
+        }
         if self.inside_wipe(&path) {
             return Ok(FulfillPlan::Send(missing_hash(&path)));
         }
@@ -2127,6 +2145,18 @@ fn wiping(path: &CanonicalPath) -> ProtocolMessage {
 fn missing_hash(path: &CanonicalPath) -> ProtocolMessage {
     ProtocolMessage::Error {
         code: "missing_hash".into(),
+        message: path.as_str().into(),
+    }
+}
+
+fn path_is_reserved(central: &CanonicalPath, path: &CanonicalPath) -> bool {
+    path.has_reserved_root_name()
+        || strip_central(central, path).is_ok_and(|relative| relative.has_reserved_root_name())
+}
+
+fn reserved_name(path: &CanonicalPath) -> ProtocolMessage {
+    ProtocolMessage::Error {
+        code: "reserved_name".into(),
         message: path.as_str().into(),
     }
 }
