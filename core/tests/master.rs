@@ -1253,6 +1253,80 @@ fn an_announce_outside_the_subscribed_central_is_an_error_not_a_cas_reject() {
 }
 
 #[test]
+fn a_reserved_name_on_the_wire_is_rejected_and_not_indexed() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    master
+        .handle(BACKUP, subscribe("backup-1", &[("bak", "/")]))
+        .unwrap();
+
+    let announced = [
+        (BACKUP, "bak", "/.arborsync-tmp/scratch", ".arborsync-tmp/scratch"),
+        (
+            ALICE,
+            "src",
+            "/src/.arborsync-conflicts/noise",
+            "src/.arborsync-conflicts/noise",
+        ),
+    ];
+    for (peer, checkout_id, canonical, host) in announced {
+        match master
+            .handle(
+                peer,
+                ProtocolMessage::FileAnnounce {
+                    checkout_id: checkout_id.into(),
+                    path: p(canonical),
+                    new: dir(),
+                    basis: None,
+                },
+            )
+            .unwrap()
+        {
+            Reply::Send(ProtocolMessage::Error { code, .. }) => assert_eq!(code, "reserved_name"),
+            other => panic!("expected reserved_name, got {other:?}"),
+        }
+        assert_eq!(master.meta(&p(canonical)).unwrap(), None);
+        assert!(!sandbox.central_root().join(host).exists());
+    }
+
+    let root_tmp = p("/.arborsync-tmp");
+    let verbs = [
+        ProtocolMessage::Delete {
+            checkout_id: "bak".into(),
+            path: root_tmp.clone(),
+            basis: file_node(&dir()),
+        },
+        ProtocolMessage::Rename {
+            checkout_id: "bak".into(),
+            from: p("/keep.txt"),
+            to: p("/.arborsync-conflicts/keep.txt"),
+            from_basis: file_node(&file(1)),
+            to_new: file(1),
+        },
+        ProtocolMessage::DirListRequest {
+            checkout_id: "bak".into(),
+            path: root_tmp.clone(),
+            after: None,
+        },
+        ProtocolMessage::SignatureRequest {
+            checkout_id: "bak".into(),
+            path: p("/.arborsync-conflicts/noise"),
+            want_hash: ContentHash::ZERO,
+            signature: Vec::new(),
+        },
+    ];
+    for msg in verbs {
+        match master.handle(BACKUP, msg).unwrap() {
+            Reply::Send(ProtocolMessage::Error { code, .. }) => assert_eq!(code, "reserved_name"),
+            other => panic!("expected reserved_name, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn resubscribing_from_a_rotated_key_makes_the_old_key_inert() {
     const ALICE_NEW: [u8; 32] = [0xA2; 32];
     let sandbox = SyncSandbox::new();

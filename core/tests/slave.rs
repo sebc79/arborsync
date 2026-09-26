@@ -1320,6 +1320,43 @@ fn reserved_tmp_rename_produces_no_message() {
 }
 
 #[test]
+fn an_inbound_reserved_name_is_not_applied() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    let path = p("/src/.arborsync-tmp/scratch");
+    let reply = slave
+        .handle(ProtocolMessage::FileAnnounce {
+            checkout_id: "src".into(),
+            path: path.clone(),
+            new: FileMetadata::directory(MTIME, 0o040755),
+            basis: None,
+        })
+        .unwrap();
+    assert!(matches!(reply, Reply::Send(msgs) if msgs.is_empty()));
+    assert_eq!(slave.meta("src", &path).unwrap(), None);
+    assert!(!local.join(".arborsync-tmp/scratch").exists());
+
+    slave
+        .handle(ProtocolMessage::Delete {
+            checkout_id: "src".into(),
+            path: path.clone(),
+            basis: file_node(&FileMetadata::directory(MTIME, 0o040755)),
+        })
+        .unwrap();
+    slave
+        .handle(ProtocolMessage::Rename {
+            checkout_id: "src".into(),
+            from: p("/src/keep.txt"),
+            to: path,
+            from_basis: file_node(&file(1)),
+            to_new: file(1),
+        })
+        .unwrap();
+    assert!(!local.join(".arborsync-tmp").exists());
+}
+
+#[test]
 fn cas_reject_adopts_a_winner_of_a_different_kind() {
     let sandbox = SyncSandbox::new();
     let mut slave = alice_slave(&sandbox, MemoryContent::new());

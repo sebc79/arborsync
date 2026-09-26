@@ -1030,6 +1030,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         new: FileMetadata,
         basis: Option<FileNode>,
     ) -> Result<Reply, SlaveError> {
+        if self.reserved_inbound(&checkout_id, &path)? {
+            return Ok(Reply::Send(Vec::new()));
+        }
         if self
             .pending_pulls
             .remove(&(checkout_id.clone(), path.clone()))
@@ -1066,6 +1069,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         path: CanonicalPath,
         basis: FileNode,
     ) -> Result<Reply, SlaveError> {
+        if self.reserved_inbound(&checkout_id, &path)? {
+            return Ok(Reply::Send(Vec::new()));
+        }
         let current = self.meta(&checkout_id, &path)?;
         let last_synced = self.last_synced(&checkout_id, &path)?;
         let last_content = self.last_synced_content(&checkout_id, &path)?;
@@ -1094,6 +1100,11 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         from_basis: FileNode,
         to_new: FileMetadata,
     ) -> Result<Reply, SlaveError> {
+        if self.reserved_inbound(&checkout_id, &from)?
+            || self.reserved_inbound(&checkout_id, &to)?
+        {
+            return Ok(Reply::Send(Vec::new()));
+        }
         let from_local = self.meta(&checkout_id, &from)?;
         let to_local = self.meta(&checkout_id, &to)?;
         let last_synced_from = self.last_synced(&checkout_id, &from)?;
@@ -2363,6 +2374,15 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.checkouts
             .get_mut(id)
             .ok_or_else(|| SlaveError::UnknownCheckout(id.into()))
+    }
+
+    fn reserved_inbound(
+        &self,
+        checkout_id: &str,
+        path: &CanonicalPath,
+    ) -> Result<bool, SlaveError> {
+        let central = self.checkout(checkout_id)?.central.clone();
+        Ok(is_reserved(&central, path))
     }
 }
 
