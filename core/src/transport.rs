@@ -411,7 +411,7 @@ impl Transport for MemoryTransport {
     }
 }
 
-pub async fn read_bulk(recv: &mut RecvStream) -> Result<(BulkHeader, Vec<u8>), TransportError> {
+pub async fn read_bulk_header(recv: &mut RecvStream) -> Result<BulkHeader, TransportError> {
     let mut len_bytes = [0u8; 4];
     recv.read_exact(&mut len_bytes).await.map_err(stream_err)?;
     let len = u32::from_be_bytes(len_bytes) as usize;
@@ -423,27 +423,49 @@ pub async fn read_bulk(recv: &mut RecvStream) -> Result<(BulkHeader, Vec<u8>), T
     let (header, _): (BulkHeader, usize) =
         bincode::serde::decode_from_slice(&payload, bincode::config::standard())
             .map_err(|err| TransportError::Frame(FrameError::Bincode(err.to_string())))?;
-    let mut body = Vec::new();
-    while (body.len() as u64) < header.size {
+    Ok(header)
+}
+
+/// Copy chunk frames into `dest`, reusing one buffer capped at the chunk size.
+/// The in-memory transport still concatenates via [`read_bulk`].
+pub async fn copy_bulk_body(
+    recv: &mut RecvStream,
+    size: u64,
+    dest: &mut impl std::io::Write,
+) -> Result<(), TransportError> {
+    let mut got = 0u64;
+    let mut chunk = Vec::new();
+    while got < size {
         let mut chunk_len_bytes = [0u8; 4];
         recv.read_exact(&mut chunk_len_bytes)
             .await
             .map_err(stream_err)?;
         let n = crate::protocol::chunk_len(u32::from_be_bytes(chunk_len_bytes))
             .map_err(TransportError::Frame)?;
-        let end = (body.len() as u64)
+        let end = got
             .checked_add(n as u64)
             .ok_or(TransportError::Frame(FrameError::BulkTooLarge))?;
-        if end > header.size {
+        if end > size {
             return Err(TransportError::Frame(FrameError::BodySize {
                 got: end,
-                want: header.size,
+                want: size,
             }));
         }
-        let mut chunk = vec![0u8; n];
-        recv.read_exact(&mut chunk).await.map_err(stream_err)?;
-        body.extend_from_slice(&chunk);
+        chunk.resize(n, 0);
+        recv.read_exact(&mut chunk[..n])
+            .await
+            .map_err(stream_err)?;
+        dest.write_all(&chunk[..n])
+            .map_err(|err| TransportError::Stream(err.to_string()))?;
+        got = end;
     }
+    Ok(())
+}
+
+pub async fn read_bulk(recv: &mut RecvStream) -> Result<(BulkHeader, Vec<u8>), TransportError> {
+    let header = read_bulk_header(recv).await?;
+    let mut body = Vec::new();
+    copy_bulk_body(recv, header.size, &mut body).await?;
     Ok((header, body))
 }
 

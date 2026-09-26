@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use filetime::FileTime;
 
 use crate::hash::ContentHash;
-use crate::meta::{EntryKind, FileMetadata, hash_bytes};
-use crate::path::{CanonicalPath, RESERVED_TMP, confine_host};
+use crate::meta::{hash_bytes, hash_file, EntryKind, FileMetadata};
+use crate::path::{confine_host, CanonicalPath, RESERVED_TMP};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -106,11 +106,11 @@ impl StagedContent {
         Ok(Self { tmp })
     }
 
-    /// Re-reads the staged file rather than the caller's buffer, so a short
-    /// write fails here instead of publishing truncated bytes.
+    /// Hashes the staged file in chunks, so a short write fails here instead
+    /// of publishing truncated bytes and the file is not loaded whole.
     pub fn verify(self, want: ContentHash) -> Result<VerifiedContent, ApplyError> {
-        let written = fs::read(&self.tmp).map_err(at(&self.tmp))?;
-        if hash_bytes(&written) != want {
+        let got = hash_file(&self.tmp).map_err(at(&self.tmp))?;
+        if got != want {
             let _ = fs::remove_file(&self.tmp);
             return Err(ApplyError::ContentMismatch);
         }
@@ -118,18 +118,176 @@ impl StagedContent {
     }
 }
 
+/// Chunk writer for `{root}/.arborsync-tmp`. Drop removes the file unless
+/// [`BulkStage::finish`] has already handed it to [`VerifiedContent`].
+pub struct BulkStage {
+    tmp: PathBuf,
+    file: Option<File>,
+    finished: bool,
+}
+
+impl Write for BulkStage {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("staged file is closed"))?
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("staged file is closed"))?
+            .flush()
+    }
+}
+
+impl Drop for BulkStage {
+    fn drop(&mut self) {
+        self.file.take();
+        if !self.finished {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+impl BulkStage {
+    pub fn create(root: &Path) -> Result<Self, ApplyError> {
+        let dir = root.join(RESERVED_TMP);
+        fs::create_dir_all(&dir).map_err(at(&dir))?;
+        let tmp = dir.join(unique_name());
+        let file = File::create(&tmp).map_err(at(&tmp))?;
+        Ok(Self {
+            tmp,
+            file: Some(file),
+            finished: false,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.tmp
+    }
+
+    pub fn finish(mut self, want: ContentHash) -> Result<VerifiedContent, ApplyError> {
+        if let Some(file) = self.file.take() {
+            file.sync_all().map_err(at(&self.tmp))?;
+        }
+        let got = hash_file(&self.tmp).map_err(at(&self.tmp))?;
+        if got != want {
+            return Err(ApplyError::ContentMismatch);
+        }
+        self.finished = true;
+        Ok(VerifiedContent {
+            tmp: self.tmp.clone(),
+        })
+    }
+}
+
+impl Drop for VerifiedContent {
+    fn drop(&mut self) {
+        if !self.tmp.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
+}
+
 impl VerifiedContent {
+    pub fn read_bytes(&self) -> Result<Vec<u8>, ApplyError> {
+        fs::read(&self.tmp).map_err(at(&self.tmp))
+    }
+
     /// The rename is the publish point. A crash before it leaves the live
     /// path untouched and a stray tmp file that `Master::open` wipes; a
     /// crash after it leaves an index the next rescan repairs.
-    pub fn publish(self, target: &Path, meta: &FileMetadata) -> Result<(), ApplyError> {
+    pub fn publish(mut self, target: &Path, meta: &FileMetadata) -> Result<(), ApplyError> {
         if let Some(parent) = target.parent() {
             create_dir_all_with_mode(parent, 0o755)?;
         }
         fs::set_permissions(&self.tmp, Permissions::from_mode(meta.mode & 0o7777))
             .map_err(at(&self.tmp))?;
         filetime::set_file_mtime(&self.tmp, file_time(meta.mtime_ns)).map_err(at(&self.tmp))?;
-        fs::rename(&self.tmp, target).map_err(at(target))
+        fs::rename(&self.tmp, target).map_err(at(target))?;
+        self.tmp.clear();
+        Ok(())
+    }
+}
+
+/// Copy a regular file into `.arborsync-tmp` with a small buffer, so a delta
+/// basis is not held in RAM. `None` when the path is missing or not a file.
+pub fn snapshot_basis(host: &Path, stage_root: &Path) -> Result<Option<PathBuf>, ApplyError> {
+    match fs::symlink_metadata(host) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(at(host)(err)),
+        Ok(md) if !md.file_type().is_file() => return Ok(None),
+        Ok(_) => {}
+    }
+    let mut src = File::open(host).map_err(at(host))?;
+    let mut stage = BulkStage::create(stage_root)?;
+    io::copy(&mut src, &mut stage).map_err(at(stage.path()))?;
+    if let Some(file) = stage.file.take() {
+        file.sync_all().map_err(at(stage.path()))?;
+    }
+    stage.finished = true;
+    Ok(Some(stage.tmp.clone()))
+}
+
+pub fn stage_delta(
+    stage_root: &Path,
+    basis: Option<&Path>,
+    delta: &[u8],
+    want: ContentHash,
+) -> Result<VerifiedContent, ApplyError> {
+    let mut stage = BulkStage::create(stage_root)?;
+    let basis_file = match basis {
+        Some(path) => Some(File::open(path).map_err(at(path))?),
+        None => None,
+    };
+    crate::transfer::patch_into(basis_file, delta, &mut stage).map_err(|err| ApplyError::Io {
+        path: stage.path().to_path_buf(),
+        source: io::Error::other(err.to_string()),
+    })?;
+    stage.finish(want)
+}
+
+pub fn install_verified(
+    root: &Path,
+    path: &CanonicalPath,
+    new: &FileMetadata,
+    previous: Option<&FileMetadata>,
+    verified: VerifiedContent,
+) -> Result<(), ApplyError> {
+    if previous.is_some_and(|prev| prev.kind != new.kind) {
+        remove_live(root, path)?;
+    }
+    match new.kind {
+        EntryKind::Dir => {
+            drop(verified);
+            mkdir_live(root, path, new)
+        }
+        EntryKind::File => {
+            let target = host_in_root(root, path)?;
+            verified.publish(&target, new)
+        }
+        EntryKind::Symlink => {
+            let bytes = verified.read_bytes()?;
+            drop(verified);
+            atomic_symlink(root, path, new, &bytes)
+        }
+    }
+}
+
+/// True when the live file or symlink target hashes to `want`, without
+/// reading a regular file into one buffer.
+pub fn content_matches(host: &Path, want: ContentHash) -> io::Result<bool> {
+    match fs::symlink_metadata(host) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+        Ok(md) if md.file_type().is_symlink() => {
+            let target = fs::read_link(host)?;
+            Ok(hash_bytes(target.as_os_str().as_bytes()) == want)
+        }
+        Ok(md) if md.file_type().is_file() => Ok(hash_file(host)? == want),
+        Ok(_) => Ok(false),
     }
 }
 
@@ -433,6 +591,29 @@ mod tests {
 
         let parent_mode = fs::symlink_metadata(root.join("nested")).unwrap().mode() & 0o777;
         assert_eq!(parent_mode, 0o755);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn chunked_stage_publishes_without_a_second_buffer() {
+        let unique = unique_name();
+        let base = std::env::temp_dir().join(format!("arborsync-chunk-stage-{unique}"));
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"hello-from-chunks";
+        let meta = FileMetadata::file(bytes.len() as u64, 0, 0o100644, hash_bytes(bytes));
+        let path = CanonicalPath::parse("/hello.txt").unwrap();
+
+        let mut stage = BulkStage::create(&root).unwrap();
+        stage.write_all(&bytes[..5]).unwrap();
+        stage.write_all(&bytes[5..]).unwrap();
+        let verified = stage.finish(meta.content_hash).unwrap();
+        install_verified(&root, &path, &meta, None, verified).unwrap();
+
+        assert_eq!(fs::read(root.join("hello.txt")).unwrap(), bytes);
+        let tmp = root.join(RESERVED_TMP);
+        let leftovers = fs::read_dir(&tmp).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(leftovers, 0);
         let _ = fs::remove_dir_all(&base);
     }
 }

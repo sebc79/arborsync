@@ -300,7 +300,7 @@ There is no `latest-wins` / `local-wins` / `manual` policy knob and no `max_upda
 Recipient-driven. Never compute a forward delta against a cached snapshot of the other side.
 
 1. After a successful CAS decision (or a pull the slave already knows it wants), the **recipient** of bytes sends `SignatureRequest { checkout_id, path, want_hash, signature }` where `signature` is `copia`’s signature of the local basis, or empty if there is no basis / size < 4 KiB / first create / symlink / `encode_control` of that request would exceed 1 MiB. An empty signature means the sender must use `encoding = Whole`.
-2. Sender replies on a **bulk stream**: raw file bytes (`Whole`), symlink target bytes (`Whole`), or a `copia` delta (`Delta`). Directories have no bulk transfer. The body is sent as chunks of at most 16 MiB. The receiver concatenates them. A chunk larger than 16 MiB is refused before that chunk is allocated. The logical body may be larger than 1 GiB.
+2. Sender replies on a **bulk stream**: raw file bytes (`Whole`), symlink target bytes (`Whole`), or a `copia` delta (`Delta`). Directories have no bulk transfer. The body is sent as chunks of at most 16 MiB. A whole-file apply writes each chunk to `.arborsync-tmp` and hashes that file. A chunk larger than 16 MiB is refused before that chunk is allocated. The logical body may be larger than 1 GiB.
 3. Recipient verifies BLAKE3 == `want_hash` before rename (`want_hash` is `content_hash`, not `FileNode`).
 
 `copia` is the delta engine only. Do not use its hub/bisync CLI protocol.
@@ -576,7 +576,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 2. ✅ `keygen` + config parse/validate (ACL, pins, checkouts).
 3. ✅ Master: watch `central_root`, index, QUIC XX accept, ACL, Subscribe, CAS apply to disk, fan-out, log public pin at startup.
 4. ✅ Slave: connect, pin check, Subscribe, per-checkout watch, announce, apply, sidecar, log public pin at startup.
-5. ⚠️ Bulk `copia` streams; whole-file fallback. Apply reconstructs in memory, then writes the full buffer through `.arborsync-tmp`. Bodies larger than 1 GiB are allowed and peak RAM follows (see table).
+5. ✅ Bulk `copia` streams; whole-file fallback. A whole-file body is written to `.arborsync-tmp` one chunk at a time and hashed from that file. A delta is patched from a streamed basis snapshot. Peak RAM for a whole file is one 16 MiB chunk. Bodies larger than 1 GiB still sync.
 6. ✅ Reconcile walk + rescan + reconnect.
 7. ✅ Config watch for checkout add/remove; SIGHUP ACL/log/status-interval/tune reload.
 8. ✅ Tests: `core/tests/scenarios.rs` covers reserved dirs (local skip), two checkouts on one slave (`/src` and `/`), CAS conflict, echo suppression, ACL deny, and rescan-as-missed-watcher. Those tests call `handle`, `note_local`, and `rescan` on `MemoryStorage`. `src/watch.rs` starts a real `notify-debouncer-full` thread and asserts a FileAnnounce after a post-arm write. `tests/sync.rs` starts master and slave over QUIC and asserts a post-connect write crosses. Wire reserved-name reject is covered in `core/tests/master.rs` and `core/tests/slave.rs`. No end-to-end SIGHUP reload test in `tests/cli.rs`.
@@ -603,7 +603,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §8 sidecar only for the content-hash loser | Slave announce apply, `CasReject`, and incoming `Delete` use `sidecar_if_content_differs`. Delete compares live `content_hash` with the last-synced content hash. Master `publish` does not sidecar a successful replace. |
 | ✅ | §8 children-first directory delete | `remove_live` removes each child, then `remove_dir`. Files and symlinks use `remove_file`. |
 | ✅ | Unrelated paths proceed during a directory delete | `prepare_delete` commits the index and returns `CasAccept` before `remove_live`. The binary runs `remove_live` on `spawn_blocking`. While that walk runs, the prefix stays in `wipes`. The watcher and rescan skip a path that prefix covers. Overlapping `FileAnnounce`, `Delete`, and `Rename` stay queued on the connection until `finish_wipe`. Other paths and other connections proceed. A failed `remove_live` logs, drops the prefix, and the next rescan indexes files still on disk. |
-| ✅ | §9 patch from the live file into tmp | Specified as built. Spec §8 says never patch in place. `reconstruct` patches in RAM, then `atomic_put` writes the whole buffer. |
+| ✅ | §9 patch from the live file into tmp | Specified as built. Spec §8 says never patch in place. A delta snapshots the live file into `.arborsync-tmp` and patches onto that file. A whole body is streamed into tmp one chunk at a time. |
 | ✅ | §9 / §11 signature fits the control frame | `signature_request` omits the `copia` signature when `encode_control` would exceed 1 MiB. The recipient then asks for `Whole`. An oversized `SignatureRequest` used to fail `encode_control` and drop the session. |
 | ✅ | §10 / §11 DirList fits the control frame | `page_dir_list` splits a directory listing so each `DirListResponse` prefers `MAX_DIR_LIST_PAYLOAD` (`MAX_CONTROL_FRAME / 4`). One child that exceeds that still goes if `encode_control` succeeds. `more` keeps the slave from treating unsent names as master-absent. An unpaged 50k-file listing used to fail `encode_control` and drop the session. |
 | ✅ | §11 bulk read is not cancelled by `select!` | Master and slave `accept_uni` inside `select!`, then `read_bulk` after that arm wins. Cancelling `accept_bulk` mid-body dropped the `RecvStream` and Quinn sent `STOP_SENDING` 0. |
@@ -629,7 +629,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §8 rename keeps a destination whose content differs | `on_rename` calls `sidecar_local` on `to` before `rename_live` when that row's `content_hash` differs from `to_new`. Directories still do not sidecar. |
 | ✅ | §8 failed rename undo uses the path that still has the bytes | `on_cas_reject` sidecars `to` when `undo_rename_disk` fails, then `remove_path` and `apply_new` use `to`. |
 | ✅ | §8 `CasAccept` memory follows the durable commit | `on_cas_accept` calls `write_last_synced`, which `commit`s, before `clear_pending_rename` and the `cas_since_dir_list` increment. |
-| ✅ | §11 bulk body has a size cap | Each chunk is at most 16 MiB. `chunk_len` refuses a longer chunk before `read_bulk` allocates it. The receiver concatenates chunks, so a file larger than 1 GiB still syncs. |
+| ✅ | §11 bulk body has a size cap | Each chunk is at most 16 MiB. `chunk_len` refuses a longer chunk before it is allocated. The QUIC apply path writes chunks to `.arborsync-tmp`. A file larger than 1 GiB still syncs. `read_bulk` still concatenates for the in-memory transport. |
 | ✅ | §11 a failed fulfill answers the ask | `FulfillPlan::run` returns `Reply::Send` when the file is missing, the hash does not match, or the transfer fails. The `BulkHost` task writes that message on the control stream. |
 | ✅ | §14 `rescan_interval_seconds` rejects 0 | `LoadedMaster::parse` and `LoadedSlave::parse` return `ConfigError::RescanIntervalZero`. `max_connections = 0` still refuses every new peer. |
 | ✅ | §7 `repair_dir_nodes` clears `last_synced` on leaves the hash left out | A file or symlink under a repaired directory loses `last_synced`. Directories stay. |
@@ -645,8 +645,8 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §9 / §11 `signature_request` reports a `copia` failure | A signature error is logged and the ask is `Whole`. Omitting a signature that would exceed 1 MiB is separate and still built. |
 | ✅ | §12 `AttemptLimiter` drops idle addresses | `allow` and `limited` drop an address once every hit is outside the 60 s window. A zero cap records nothing. |
 | ✅ | §14 config file watch stays up | `spawn_config_watch` retries setup with backoff until the watch is up. A later successful setup delivers config-change events. SIGHUP still reloads while the watch is down. |
-| ✅ | §9 apply work is off the session mutex | Session `apply_bulk` prepares under the mutex, runs copia reconstruct and BLAKE3 off the mutex, then finishes durable index update and inflight arming under the mutex again. |
-| ✅ | §9 a whole file is not copied into a second buffer | `encode_bulk_owned` moves the body into the frame. `encode_bulk` remains a slice wrapper. `try_read_file_or_link` still returns `Vec<u8>`. Item 5 reconstruct path unchanged. |
+| ✅ | §9 apply work is off the session mutex | Session `apply_bulk` prepares under the mutex, streams or patches and hashes off the mutex, then finishes durable index update and inflight arming under the mutex again. |
+| ✅ | §9 a whole file is not copied into a second buffer | `encode_bulk_owned` moves the body into the frame. `encode_bulk` remains a slice wrapper. A whole-file apply writes each 16 MiB chunk to `.arborsync-tmp` and `hash_file`s that file. `try_read_file_or_link` still returns `Vec<u8>` for callers that ask for bytes. |
 | ✅ | §5 a directory rename reindexes that subtree | `Master::reindex_descendants` walks only the renamed prefix via `walk_prefix`. `Slave::reindex_descendants` walks from the destination. |
 | ✅ | §13 a directory cache loads direct children | `DirChildren::ensure_loaded` and reconcile child lists use `range_meta_children` (direct children only). On redb the scan seeks past each child's subtree so nested keys are not walked. `range_meta` still ends at the exclusive descendant bound. |
 | ✅ | §6 collection uses `symlink_metadata` | Collection uses `symlink_metadata`. `mtime_ns` is `st_mtime * 1e9 + st_mtime_nsec`, including negative stamps. Paths are not skipped when `Metadata::modified()` would fail. |
@@ -655,12 +655,12 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §7 slave watcher death rescans | If `watch_checkout` returns `Err` or `WatchStop::Restart`, the slave logs (on `Err`), queues `Work::Rescan`, re-arms, and on `Err` sleeps 1s so a broken watch cannot spin. |
 | ✅ | §3 path safety re-checks the joined path | `confine_host` canonicalizes each existing ancestor and returns `PathError::EscapesRoot` when that ancestor leaves the root. Apply, ancestor mkdir, and rename undo use it. `canonical_to_host` stays the lexical join for reads. |
 | ✅ | §5 post-commit Merkle check | Debug builds panic when a directory `commit_leaves_with` just wrote does not match a recompute from its children. `arborsync recompute` rewrites the master index from `/`. |
+| ✅ | §9 / item 5 whole-file RAM | A whole-file body is written to `.arborsync-tmp` one chunk at a time. `StagedContent::verify` and `BulkStage::finish` hash that file with `hash_file`. A delta snapshots the basis to tmp and patches onto another tmp file. `read_bulk` still concatenates for the in-memory transport. |
 
 Review findings (tree at `37f8671`, working tree clean). High-confidence gaps against this map. Icons stay ⚠️ until fixed in code or tests.
 
 | | Gap | Evidence |
 |---|---|---|
-| ⚠️ | §9 / item 5 whole-file RAM | Spec allows a logical body larger than 1 GiB. `read_bulk` concatenates into one `Vec`, reconstruct holds the result, and `StagedContent::verify` re-reads the tmp into another buffer before rename. |
 | ⚠️ | Reload path untested at the binary | Core `plan_reload` / `Master::reload` / `Slave::reload` and `src/reload.rs` watch-setup backoff are covered. `tests/cli.rs` does not drive SIGHUP or config-watch through ACL drop / `close` / resubscribe. |
 
 Topic documents:
