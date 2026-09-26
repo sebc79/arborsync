@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -14,12 +14,12 @@ use crate::hashing::{HashDone, HashKey, HashNeed, HashOutcome, HashPlan};
 use crate::index;
 use crate::inflight::Inflight;
 use crate::merkle::{file_node, DirChild};
-use crate::meta::{self, hash_bytes, EntryKind, FileMetadata, Inspected};
+use crate::meta::{self, EntryKind, FileMetadata, Inspected};
 use crate::path::{
     canonical_to_host, confine_host, conflict_sidecar_path, join_central, local_paths_overlap,
     strip_central, CanonicalPath, EntryName, PathError,
 };
-use crate::protocol::{BulkHeader, CheckoutRef, ProtocolMessage};
+use crate::protocol::{BulkEncoding, BulkHeader, CheckoutRef, ProtocolMessage};
 use crate::reconcile::{decide_child, WalkAction};
 use crate::status::{Queues, SlaveStatus, StatusLedger};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
@@ -46,7 +46,7 @@ pub enum Reply {
     Bulk(BulkTransfer),
 }
 
-/// Work that can run without the slave mutex: copia reconstruct + BLAKE3.
+/// Work that can run without the slave mutex: stream or patch into tmp, then BLAKE3.
 pub enum ApplyBulkPlan {
     Done(Reply),
     Reconstruct(ApplyBulkJob),
@@ -54,15 +54,18 @@ pub enum ApplyBulkPlan {
 
 pub struct ApplyBulkJob {
     key: (String, CanonicalPath),
-    encoding: crate::protocol::BulkEncoding,
-    basis: Option<Vec<u8>>,
+    encoding: BulkEncoding,
+    stage_root: PathBuf,
+    /// Streamed copy of the live basis for a delta. Not the file bytes.
+    basis_tmp: Option<PathBuf>,
     want_hash: ContentHash,
 }
 
 pub enum ApplyBulkOutcome {
     Ready {
         key: (String, CanonicalPath),
-        bytes: Vec<u8>,
+        verified: apply::VerifiedContent,
+        want_hash: ContentHash,
     },
     Failed {
         key: (String, CanonicalPath),
@@ -70,18 +73,52 @@ pub enum ApplyBulkOutcome {
     },
 }
 
+impl Drop for ApplyBulkJob {
+    fn drop(&mut self) {
+        if let Some(path) = self.basis_tmp.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 impl ApplyBulkJob {
-    pub fn reconstruct(self, body: &[u8]) -> ApplyBulkOutcome {
+    pub fn is_delta(&self) -> bool {
+        self.encoding == BulkEncoding::Delta
+    }
+
+    pub fn open_stage(&self) -> Result<apply::BulkStage, SlaveError> {
+        Ok(apply::BulkStage::create(&self.stage_root)?)
+    }
+
+    pub fn complete_whole(self, stage: apply::BulkStage) -> ApplyBulkOutcome {
+        let want = self.want_hash;
+        self.outcome_from(stage.finish(want))
+    }
+
+    pub fn complete_delta(self, body: Vec<u8>) -> ApplyBulkOutcome {
+        let staged = apply::stage_delta(
+            &self.stage_root,
+            self.basis_tmp.as_deref(),
+            &body,
+            self.want_hash,
+        );
+        self.outcome_from(staged)
+    }
+
+    fn outcome_from(
+        self,
+        staged: Result<apply::VerifiedContent, apply::ApplyError>,
+    ) -> ApplyBulkOutcome {
         let path = self.key.1.clone();
-        match transfer::reconstruct(self.encoding, body, self.basis.as_deref()) {
-            Ok(bytes) if hash_bytes(&bytes) == self.want_hash => ApplyBulkOutcome::Ready {
-                key: self.key,
-                bytes,
+        let key = self.key.clone();
+        let want_hash = self.want_hash;
+        match staged {
+            Ok(verified) => ApplyBulkOutcome::Ready {
+                key,
+                verified,
+                want_hash,
             },
-            _ => ApplyBulkOutcome::Failed {
-                key: self.key,
-                path,
-            },
+            Err(_) => ApplyBulkOutcome::Failed { key, path },
         }
     }
 }
@@ -741,7 +778,18 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         self.begin_apply_bulk(body.len() as u64);
         let reply = match self.prepare_apply_bulk(header)? {
             ApplyBulkPlan::Done(reply) => reply,
-            ApplyBulkPlan::Reconstruct(job) => self.finish_apply_bulk(job.reconstruct(body))?,
+            ApplyBulkPlan::Reconstruct(job) => {
+                let outcome = if job.is_delta() {
+                    job.complete_delta(body.to_vec())
+                } else {
+                    let mut stage = job.open_stage()?;
+                    stage
+                        .write_all(body)
+                        .map_err(SlaveError::io(stage.path()))?;
+                    job.complete_whole(stage)
+                };
+                self.finish_apply_bulk(outcome)?
+            }
         };
         self.end_apply_bulk(&reply);
         Ok(reply)
@@ -777,45 +825,57 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         }
         let host = self.host_for(&header.checkout_id, &header.path)?;
         let previous = self.meta(&header.checkout_id, &header.path)?;
-        let basis = if previous
-            .as_ref()
-            .is_some_and(|prev| prev.kind != pending.new.kind)
+        let stage_root = self.checkout(&header.checkout_id)?.local.clone();
+        let basis_tmp = if header.encoding == BulkEncoding::Whole
+            || previous
+                .as_ref()
+                .is_some_and(|prev| prev.kind != pending.new.kind)
         {
             None
         } else {
-            apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))?
+            apply::snapshot_basis(&host, &stage_root)?
         };
         Ok(ApplyBulkPlan::Reconstruct(ApplyBulkJob {
             key,
             encoding: header.encoding,
-            basis,
+            stage_root,
+            basis_tmp,
             want_hash: header.want_hash,
         }))
     }
 
     pub fn finish_apply_bulk(&mut self, outcome: ApplyBulkOutcome) -> Result<Reply, SlaveError> {
         match outcome {
-            ApplyBulkOutcome::Ready { key, bytes } => {
+            ApplyBulkOutcome::Ready {
+                key,
+                verified,
+                want_hash,
+            } => {
                 let Some(pending) = self.pending.get(&key) else {
                     return self.accept_if_live_matches(&BulkHeader {
                         checkout_id: key.0,
                         path: key.1,
-                        want_hash: hash_bytes(&bytes),
-                        encoding: crate::protocol::BulkEncoding::Whole,
-                        size: bytes.len() as u64,
+                        want_hash,
+                        encoding: BulkEncoding::Whole,
+                        size: 0,
                     });
                 };
-                if hash_bytes(&bytes) != pending.new.content_hash {
+                if want_hash != pending.new.content_hash {
                     return self.accept_if_live_matches(&BulkHeader {
                         checkout_id: key.0.clone(),
                         path: key.1.clone(),
                         want_hash: pending.new.content_hash,
-                        encoding: crate::protocol::BulkEncoding::Whole,
-                        size: bytes.len() as u64,
+                        encoding: BulkEncoding::Whole,
+                        size: 0,
                     });
                 }
                 let pending = self.pending.remove(&key).expect("pending");
-                self.finish_apply(&pending.checkout_id, pending.path, pending.new, &bytes)
+                self.finish_verified(
+                    &pending.checkout_id,
+                    pending.path,
+                    pending.new,
+                    verified,
+                )
             }
             ApplyBulkOutcome::Failed { key, path } => {
                 let Some(pending) = self.pending.get_mut(&key) else {
@@ -844,11 +904,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
 
     fn accept_if_live_matches(&self, header: &BulkHeader) -> Result<Reply, SlaveError> {
         let host = self.host_for(&header.checkout_id, &header.path)?;
-        let live = apply::try_read_file_or_link(&host).map_err(SlaveError::io(&host))?;
-        if live
-            .as_deref()
-            .is_some_and(|bytes| hash_bytes(bytes) == header.want_hash)
-        {
+        if apply::content_matches(&host, header.want_hash).map_err(SlaveError::io(&host))? {
             return Ok(Reply::Send(Vec::new()));
         }
         Ok(Reply::Send(vec![ProtocolMessage::Error {
@@ -1287,6 +1343,43 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 ContentBytes::Whole(body) => self.finish_apply(checkout_id, path, new, &body),
             },
         }
+    }
+
+    fn finish_verified(
+        &mut self,
+        checkout_id: &str,
+        path: CanonicalPath,
+        new: FileMetadata,
+        verified: apply::VerifiedContent,
+    ) -> Result<Reply, SlaveError> {
+        let previous = self.meta(checkout_id, &path)?;
+        let (local, relative) = {
+            let checkout = self.checkout(checkout_id)?;
+            (
+                checkout.local.clone(),
+                strip_central(&checkout.central, &path)?,
+            )
+        };
+        let hash = match new.kind {
+            EntryKind::Dir => ContentHash::ZERO,
+            EntryKind::File | EntryKind::Symlink => new.content_hash,
+        };
+        self.checkout_mut(checkout_id)?
+            .inflight
+            .arm(path.clone(), hash);
+        if let Err(err) = self.index_ancestors(checkout_id, &path) {
+            self.checkout_mut(checkout_id)?.inflight.disarm(&path);
+            return Err(err);
+        }
+        if let Err(err) =
+            apply::install_verified(&local, &relative, &new, previous.as_ref(), verified)
+        {
+            self.checkout_mut(checkout_id)?.inflight.disarm(&path);
+            return Err(err.into());
+        }
+        let ck = self.checkout(checkout_id)?.id.clone();
+        self.write_index(&ck, &path, Some(&new), index::LastSynced::AdoptLeaf)?;
+        Ok(Reply::Send(Vec::new()))
     }
 
     fn finish_apply(

@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -18,19 +18,23 @@ use crate::index;
 use crate::inflight::Inflight;
 use crate::keys::format_hex_key;
 use crate::merkle::file_node;
-use crate::meta::{self, hash_bytes, EntryKind, FileMetadata, Inspected};
+use crate::meta::{self, EntryKind, FileMetadata, Inspected};
 use crate::path::{
     canonical_to_host, confine_host, is_reserved_root_entry, join_central, strip_central,
     CanonicalPath, EntryName, PathError,
 };
-use crate::protocol::{page_dir_list, BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage};
+use crate::protocol::{
+    page_dir_list, BulkEncoding, BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage,
+};
 use crate::status::{MasterStatus, PeerLive, Queues, StatusLedger};
 use crate::storage::{CheckoutId, Storage};
 use crate::transfer::{self, BulkTransfer};
 use crate::tune::Tune;
 use crate::watch::LocalEvent;
 
-pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
+pub use crate::apply::{
+    ApplyError, BulkStage, ContentBytes, ContentHook, MemoryContent, VerifiedContent, WholeFileLater,
+};
 
 /// Checkout id on the wire. Distinct from [`CheckoutId`], the index namespace.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -120,7 +124,7 @@ pub enum FulfillPlan {
     Send(ProtocolMessage),
 }
 
-/// Work that can run without the master mutex: copia reconstruct + BLAKE3.
+/// Work that can run without the master mutex: stream or patch into tmp, then BLAKE3.
 pub enum ApplyBulkPlan {
     Done(Reply),
     Reconstruct(ApplyBulkJob),
@@ -128,15 +132,18 @@ pub enum ApplyBulkPlan {
 
 pub struct ApplyBulkJob {
     key: (String, CanonicalPath),
-    encoding: crate::protocol::BulkEncoding,
-    basis: Option<Vec<u8>>,
+    encoding: BulkEncoding,
+    stage_root: PathBuf,
+    /// Streamed copy of the live basis for a delta. Not the file bytes.
+    basis_tmp: Option<PathBuf>,
     want_hash: ContentHash,
 }
 
 pub enum ApplyBulkOutcome {
     Ready {
         key: (String, CanonicalPath),
-        bytes: Vec<u8>,
+        verified: apply::VerifiedContent,
+        want_hash: ContentHash,
     },
     Failed {
         key: (String, CanonicalPath),
@@ -144,18 +151,52 @@ pub enum ApplyBulkOutcome {
     },
 }
 
+impl Drop for ApplyBulkJob {
+    fn drop(&mut self) {
+        if let Some(path) = self.basis_tmp.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 impl ApplyBulkJob {
-    pub fn reconstruct(self, body: &[u8]) -> ApplyBulkOutcome {
+    pub fn is_delta(&self) -> bool {
+        self.encoding == BulkEncoding::Delta
+    }
+
+    pub fn open_stage(&self) -> Result<apply::BulkStage, MasterError> {
+        Ok(apply::BulkStage::create(&self.stage_root)?)
+    }
+
+    pub fn complete_whole(self, stage: apply::BulkStage) -> ApplyBulkOutcome {
+        let want = self.want_hash;
+        self.outcome_from(stage.finish(want))
+    }
+
+    pub fn complete_delta(self, body: Vec<u8>) -> ApplyBulkOutcome {
+        let staged = apply::stage_delta(
+            &self.stage_root,
+            self.basis_tmp.as_deref(),
+            &body,
+            self.want_hash,
+        );
+        self.outcome_from(staged)
+    }
+
+    fn outcome_from(
+        self,
+        staged: Result<apply::VerifiedContent, apply::ApplyError>,
+    ) -> ApplyBulkOutcome {
         let path = self.key.1.clone();
-        match transfer::reconstruct(self.encoding, body, self.basis.as_deref()) {
-            Ok(bytes) if hash_bytes(&bytes) == self.want_hash => ApplyBulkOutcome::Ready {
-                key: self.key,
-                bytes,
+        let key = self.key.clone();
+        let want_hash = self.want_hash;
+        match staged {
+            Ok(verified) => ApplyBulkOutcome::Ready {
+                key,
+                verified,
+                want_hash,
             },
-            _ => ApplyBulkOutcome::Failed {
-                key: self.key,
-                path,
-            },
+            Err(_) => ApplyBulkOutcome::Failed { key, path },
         }
     }
 }
@@ -715,7 +756,16 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         let reply = match self.prepare_apply_bulk(peer, header)? {
             ApplyBulkPlan::Done(reply) => reply,
             ApplyBulkPlan::Reconstruct(job) => {
-                self.finish_apply_bulk(peer, job.reconstruct(body))?
+                let outcome = if job.is_delta() {
+                    job.complete_delta(body.to_vec())
+                } else {
+                    let mut stage = job.open_stage()?;
+                    stage
+                        .write_all(body)
+                        .map_err(MasterError::io(stage.path()))?;
+                    job.complete_whole(stage)
+                };
+                self.finish_apply_bulk(peer, outcome)?
             }
         };
         self.end_apply_bulk(peer, &reply);
@@ -741,8 +791,8 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         self.record_reply(slave.as_deref(), reply);
     }
 
-    /// Validate the pending apply and read the local basis under the mutex.
-    /// Copia reconstruct and BLAKE3 run on [`ApplyBulkJob::reconstruct`] off the mutex.
+    /// Validate the pending apply under the mutex. A delta snapshots the live
+    /// file into `.arborsync-tmp`; a whole body is streamed later, off this lock.
     pub fn prepare_apply_bulk(
         &mut self,
         peer: [u8; 32],
@@ -760,19 +810,21 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             return Ok(ApplyBulkPlan::Done(self.accept_if_live_matches(&header)?));
         }
         let host = canonical_to_host(&self.central_root, &header.path);
-        let basis = if pending
-            .previous
-            .as_ref()
-            .is_some_and(|prev| prev.kind != pending.new.kind)
+        let basis_tmp = if header.encoding == BulkEncoding::Whole
+            || pending
+                .previous
+                .as_ref()
+                .is_some_and(|prev| prev.kind != pending.new.kind)
         {
             None
         } else {
-            apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))?
+            apply::snapshot_basis(&host, &self.central_root)?
         };
         Ok(ApplyBulkPlan::Reconstruct(ApplyBulkJob {
             key,
             encoding: header.encoding,
-            basis,
+            stage_root: self.central_root.clone(),
+            basis_tmp,
             want_hash: header.want_hash,
         }))
     }
@@ -783,23 +835,27 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         outcome: ApplyBulkOutcome,
     ) -> Result<Reply, MasterError> {
         match outcome {
-            ApplyBulkOutcome::Ready { key, bytes } => {
+            ApplyBulkOutcome::Ready {
+                key,
+                verified,
+                want_hash,
+            } => {
                 let Some(pending) = self.pending.get(&key) else {
                     return self.accept_if_live_matches(&BulkHeader {
                         checkout_id: key.0,
                         path: key.1,
-                        want_hash: hash_bytes(&bytes),
-                        encoding: crate::protocol::BulkEncoding::Whole,
-                        size: bytes.len() as u64,
+                        want_hash,
+                        encoding: BulkEncoding::Whole,
+                        size: 0,
                     });
                 };
-                if pending.peer != peer || hash_bytes(&bytes) != pending.new.content_hash {
+                if pending.peer != peer || want_hash != pending.new.content_hash {
                     return self.accept_if_live_matches(&BulkHeader {
                         checkout_id: key.0.clone(),
                         path: key.1.clone(),
                         want_hash: pending.new.content_hash,
-                        encoding: crate::protocol::BulkEncoding::Whole,
-                        size: bytes.len() as u64,
+                        encoding: BulkEncoding::Whole,
+                        size: 0,
                     });
                 }
                 let pending = self.pending.remove(&key).expect("pending");
@@ -813,7 +869,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                         current,
                     }));
                 }
-                self.publish(&pending.path, &pending.new, live.as_ref(), &bytes)?;
+                self.publish_verified(&pending.path, &pending.new, live.as_ref(), verified)?;
                 self.commit(
                     &pending.origin,
                     &pending.path,
@@ -853,11 +909,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
 
     fn accept_if_live_matches(&self, header: &BulkHeader) -> Result<Reply, MasterError> {
         let host = canonical_to_host(&self.central_root, &header.path);
-        let live = apply::try_read_file_or_link(&host).map_err(MasterError::io(&host))?;
-        if live
-            .as_deref()
-            .is_some_and(|bytes| hash_bytes(bytes) == header.want_hash)
-        {
+        if apply::content_matches(&host, header.want_hash).map_err(MasterError::io(&host))? {
             let node = self.meta(&header.path)?.as_ref().map(file_node);
             return Ok(Reply::Send(ProtocolMessage::CasAccept {
                 checkout_id: header.checkout_id.clone(),
@@ -1931,6 +1983,27 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 continue;
             }
             self.write_index(&path, Some(&found), last_synced)?;
+        }
+        Ok(())
+    }
+
+    fn publish_verified(
+        &mut self,
+        path: &CanonicalPath,
+        new: &FileMetadata,
+        previous: Option<&FileMetadata>,
+        verified: apply::VerifiedContent,
+    ) -> Result<(), MasterError> {
+        self.inflight.arm(path.clone(), new.content_hash);
+        if let Err(err) = self.index_ancestors(path) {
+            self.inflight.disarm(path);
+            return Err(err);
+        }
+        if let Err(err) =
+            apply::install_verified(&self.central_root, path, new, previous, verified)
+        {
+            self.inflight.disarm(path);
+            return Err(err.into());
         }
         Ok(())
     }

@@ -57,12 +57,26 @@ pub fn delta_bytes(source: &[u8], signature: &[u8]) -> Result<Vec<u8>, TransferE
 }
 
 pub fn patch_bytes(basis: &[u8], delta: &[u8]) -> Result<Vec<u8>, TransferError> {
-    let delta: copia::Delta = decode_copia(delta)?;
     let mut out = Vec::new();
-    engine()
-        .patch(Cursor::new(basis), &delta, &mut out)
-        .map_err(|err| TransferError::Copia(err.to_string()))?;
+    patch_into(Some(Cursor::new(basis)), delta, &mut out)?;
     Ok(out)
+}
+
+pub fn patch_into<R: std::io::Read + std::io::Seek, W: std::io::Write>(
+    basis: Option<R>,
+    delta: &[u8],
+    out: &mut W,
+) -> Result<(), TransferError> {
+    let delta: copia::Delta = decode_copia(delta)?;
+    match basis {
+        Some(basis) => engine()
+            .patch(basis, &delta, out)
+            .map_err(|err| TransferError::Copia(err.to_string()))?,
+        None => engine()
+            .patch(Cursor::new(&[][..]), &delta, out)
+            .map_err(|err| TransferError::Copia(err.to_string()))?,
+    }
+    Ok(())
 }
 
 pub fn fulfill(

@@ -16,7 +16,9 @@ use arborsync_core::master::{
 use arborsync_core::path::host_to_canonical;
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::storage::Storage;
-use arborsync_core::transport::{AttemptLimiter, Transport, listen, read_bulk, stream_err};
+use arborsync_core::transport::{
+    copy_bulk_body, listen, read_bulk_header, stream_err, AttemptLimiter, Transport,
+};
 use arborsync_core::watch::to_local_events;
 use arborsync_core::{LoadedMaster, RedbStorage};
 use notify::RecursiveMode;
@@ -311,19 +313,31 @@ async fn accept_session(
                 }
                 incoming = conn.accept_uni() => {
                     let mut recv = incoming.map_err(stream_err)?;
-                    let (header, body) = read_bulk(&mut recv).await?;
+                    let header = read_bulk_header(&mut recv).await?;
                     let plan = {
                         let mut guard = master.lock().expect("master");
-                        guard.begin_apply_bulk(peer, body.len() as u64);
-                        guard.prepare_apply_bulk(peer, header)?
+                        guard.begin_apply_bulk(peer, header.size);
+                        guard.prepare_apply_bulk(peer, header.clone())?
                     };
                     let reply = match plan {
-                        ApplyBulkPlan::Done(reply) => reply,
+                        ApplyBulkPlan::Done(reply) => {
+                            copy_bulk_body(&mut recv, header.size, &mut std::io::sink()).await?;
+                            reply
+                        }
                         ApplyBulkPlan::Reconstruct(job) => {
-                            let outcome =
-                                tokio::task::spawn_blocking(move || job.reconstruct(&body))
+                            let outcome = if job.is_delta() {
+                                let mut body = Vec::new();
+                                copy_bulk_body(&mut recv, header.size, &mut body).await?;
+                                tokio::task::spawn_blocking(move || job.complete_delta(body))
                                     .await
-                                    .map_err(|err| anyhow::anyhow!("apply join: {err}"))?;
+                                    .map_err(|err| anyhow::anyhow!("apply join: {err}"))?
+                            } else {
+                                let mut stage = job.open_stage()?;
+                                copy_bulk_body(&mut recv, header.size, &mut stage).await?;
+                                tokio::task::spawn_blocking(move || job.complete_whole(stage))
+                                    .await
+                                    .map_err(|err| anyhow::anyhow!("apply join: {err}"))?
+                            };
                             master
                                 .lock()
                                 .expect("master")

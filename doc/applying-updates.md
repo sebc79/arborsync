@@ -52,7 +52,7 @@ No `conflict_resolution` knob, no `max_conflict_files_per_dir`, no `max_update_a
 ## Atomic write
 
 1. Ensure parent dirs exist. A directory announce sets `mode & 0o7777` on every directory that create creates. Parent dirs created only to hold a file or symlink use `0o755` after create.
-2. Write `{local}/.arborsync-tmp/{unique}` (same filesystem as `local`). Specified as built. Spec §8 says never patch in place. `reconstruct` patches in RAM, then `atomic_put` writes the full buffer. For whole-file: stream bytes into tmp. For a symlink: tmp is unused; `symlink` after removing the previous name.
+2. Write `{local}/.arborsync-tmp/{unique}` (same filesystem as `local`). Specified as built. Spec §8 says never patch in place. A whole-file body is streamed into that tmp one chunk at a time. A delta snapshots the live file, then patches onto a second tmp. A symlink reads the staged target and calls `symlink` after removing the previous name.
 3. `fsync` the tmp file.
 4. Verify BLAKE3 of the tmp file (or symlink target) equals `new.content_hash`. Mismatch: drop tmp, send `SignatureRequest` with empty signature (whole-file retry) once; still wrong → log, keep the previous live file, leave `last_synced` unchanged.
 5. Set tmp mode (`mode & 0o7777`) and mtime (`filetime`, announced `mtime_ns`).
@@ -72,7 +72,7 @@ Type change deletes the old kind, then creates the new kind, in one master accep
 Recipient-driven (`spec.md` §9). After the slave (or master) **decides it will apply** `want_hash`:
 
 1. If no local basis, basis size < 4 KiB, kind is symlink, or `encode_control` of the `SignatureRequest` would exceed 1 MiB: `SignatureRequest` with empty `signature` → sender opens a bulk stream `encoding = Whole`. A `SignatureRequest` for a directory replies `missing_hash`. Directories have no bulk body. A fulfill that cannot send bytes (missing file, hash mismatch, or transfer error) answers on the control stream with `Error`.
-2. Else: `copia` signature of the live file → bulk `encoding = Delta` → `reconstruct` in RAM → whole write through tmp.
+2. Else: `copia` signature of the live file → bulk `encoding = Delta` → snapshot the basis into `.arborsync-tmp`, patch the delta onto another tmp file, then hash that file.
 3. Sender that does not have `want_hash` replies `Error` and the recipient waits for the next reconcile.
 
 Do not compute a delta against a remembered remote snapshot. Do not put bodies in bincode.
