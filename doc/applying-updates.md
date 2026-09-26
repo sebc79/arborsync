@@ -95,7 +95,7 @@ Master `publish` writes the new live file. It does not write a sidecar. Spec §8
 
 ## Echo
 
-`inflight[(checkout_id, canonical)] = content_hash` before the live `rename`, `mkdir`, or meta apply, until the next watcher event for that path is consumed or 2× debounce elapses. Dirs arm `ContentHash::ZERO`. Matching hash → drop the event, do not announce. A later real edit has a different hash and announces as usual. A type change vacates the old kind first, so the watcher may emit `Remove` then create; `Remove` while `inflight` is armed is dropped and does not consume the arm.
+`inflight[(checkout_id, canonical)] = content_hash` before the live `rename`, `mkdir`, or meta apply, until 2× debounce elapses. Dirs arm `ContentHash::ZERO`. The first matching-hash watcher event is the echo and is not announced. The arm stays until the window ends, so a later `Remove` is still dropped. A later event after that echo, including a mode-only change with the same content hash, announces as usual.
 
 Set announced mtime on the file **before** clearing `inflight`.
 

@@ -124,7 +124,7 @@ impl VerifiedContent {
     /// crash after it leaves an index the next rescan repairs.
     pub fn publish(self, target: &Path, meta: &FileMetadata) -> Result<(), ApplyError> {
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(at(parent))?;
+            create_dir_all_with_mode(parent, 0o755)?;
         }
         fs::set_permissions(&self.tmp, Permissions::from_mode(meta.mode & 0o7777))
             .map_err(at(&self.tmp))?;
@@ -156,7 +156,7 @@ pub fn atomic_symlink(
     }
     let link = host_in_root(central_root, path)?;
     if let Some(parent) = link.parent() {
-        fs::create_dir_all(parent).map_err(at(parent))?;
+        create_dir_all_with_mode(parent, 0o755)?;
     }
     remove_if_present(&link)?;
     std::os::unix::fs::symlink(OsStr::from_bytes(target_bytes), &link).map_err(at(&link))?;
@@ -208,7 +208,7 @@ pub fn rename_live(
     let from_host = host_in_root(root, from)?;
     let to_host = host_in_root(root, to)?;
     if let Some(parent) = to_host.parent() {
-        fs::create_dir_all(parent).map_err(at(parent))?;
+        create_dir_all_with_mode(parent, 0o755)?;
     }
     fs::rename(&from_host, &to_host).map_err(at(&to_host))?;
     match meta.kind {
@@ -411,6 +411,28 @@ mod tests {
             parent_mode, 0o0750,
             "dirs created for this announce must keep the announced mode"
         );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn file_parents_are_0755_under_a_restrictive_umask() {
+        let unique = unique_name();
+        let base = std::env::temp_dir().join(format!("arborsync-file-parent-{unique}"));
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"hello";
+        let meta = FileMetadata::file(bytes.len() as u64, 0, 0o100644, hash_bytes(bytes));
+        let path = CanonicalPath::parse("/nested/hello.txt").unwrap();
+
+        let old = unsafe { umask(0o077) };
+        let result = atomic_put(&root, &path, &meta, bytes);
+        unsafe {
+            umask(old);
+        }
+        result.unwrap();
+
+        let parent_mode = fs::symlink_metadata(root.join("nested")).unwrap().mode() & 0o777;
+        assert_eq!(parent_mode, 0o755);
         let _ = fs::remove_dir_all(&base);
     }
 }

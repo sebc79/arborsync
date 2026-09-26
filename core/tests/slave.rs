@@ -456,6 +456,11 @@ fn echo_of_an_applied_announce_does_not_reannounce() {
         .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
         .unwrap();
     assert!(out.is_empty());
+    let removed = slave
+        .note_local("src", LocalEvent::Removed(p("/src/hello.txt")))
+        .unwrap();
+    assert!(removed.is_empty());
+    assert!(slave.checkout_local("src").unwrap().join("hello.txt").is_file());
 }
 
 #[test]

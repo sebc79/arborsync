@@ -637,7 +637,8 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §14 slave checkout reload is one commit | `Slave::reload` validates resolved local overlap on a provisional checkout set, then deletes/inserts index rows and assigns `cfg` only after that check succeeds. |
 | ✅ | §4 reload lists match `plan_reload` | §4 Reloadable / Not reloadable match `plan_reload` for both roles, including slave checkouts, `master_public_keys`, `max_connections`, and `max_checkouts_per_slave`. `slave_id` is not reloadable. Debounce, rescan interval, status interval, and tune reload. Shrinking `max_checkouts_per_slave` does not prune live interest (next `Subscribe` enforces). `configuration.md` Applied live still omits `max_checkouts_per_slave`. |
 | ✅ | §4 `keygen --out` | Clap requires `--out`. `keygen::run` writes that path. |
-| ✅ | §6 created directories use the announced mode | `mkdir_live` creates missing parents, then sets `mode & 0o7777` on each directory that call created, then mtime. Umask does not leave the announced mode. |
+| ✅ | §6 created directories use the announced mode | `mkdir_live` creates missing parents, then sets `mode & 0o7777` on each directory that call created, then mtime. Umask does not leave the announced mode. File and symlink parents, and rename destinations, use `0o755` via the same helper. |
+| ✅ | §7 type-change echo | The first matching-hash watcher event is the echo. The arm stays until 2× debounce, so a `Remove` after that `Create` is still dropped and cannot delete the CAS winner. A later mode-only change still announces. |
 | ✅ | §6 symlink hash reuse | Symlinks always re-read the target. Same-size same-mtime reuse is files only. |
 | ✅ | §11 inbound `Error` | Inbound `Error` is recorded on both roles and answered with no control reply (`Reply::Quiet` on master; empty `Send` on slave). Unmatched variants still reply `unsupported`. |
 | ✅ | §11 `decode_control` consumes the frame | `decode_control` requires the length prefix to cover exactly the bincode payload. Trailing bytes inside the prefix are `FrameError::TrailingBytes`. Bytes after the frame stay for the next read. |
@@ -659,8 +660,6 @@ Review findings (tree at `37f8671`, working tree clean). High-confidence gaps ag
 
 | | Gap | Evidence |
 |---|---|---|
-| ⚠️ | §7 type-change / symlink echo | `Remove` while armed is dropped and does not consume (`applying-updates.md` Echo). Create/Changed matching the armed hash does consume. If Create runs first, a late Remove can `reconcile_delete` the CAS winner. Tests cover Remove while still armed. |
-| ⚠️ | applying-updates parent dirs `0o755` | File and symlink parents use bare `fs::create_dir_all` (`VerifiedContent::publish`, `atomic_symlink`, `rename_live`). Only directory announces use `create_dir_all_with_mode`. Under a restrictive umask, auto-created parents are not `0755`. |
 | ⚠️ | §9 / item 5 whole-file RAM | Spec allows a logical body larger than 1 GiB. `read_bulk` concatenates into one `Vec`, reconstruct holds the result, and `StagedContent::verify` re-reads the tmp into another buffer before rename. |
 | ⚠️ | Reload path untested at the binary | Core `plan_reload` / `Master::reload` / `Slave::reload` and `src/reload.rs` watch-setup backoff are covered. `tests/cli.rs` does not drive SIGHUP or config-watch through ACL drop / `close` / resubscribe. |
 

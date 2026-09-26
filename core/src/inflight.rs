@@ -7,6 +7,7 @@ use crate::path::CanonicalPath;
 struct InflightEntry {
     hash: ContentHash,
     until: Instant,
+    consumed: bool,
 }
 
 pub(crate) struct Inflight {
@@ -28,7 +29,14 @@ impl Inflight {
 
     pub(crate) fn arm(&mut self, path: CanonicalPath, hash: ContentHash) {
         let until = Instant::now() + self.window;
-        self.entries.insert(path, InflightEntry { hash, until });
+        self.entries.insert(
+            path,
+            InflightEntry {
+                hash,
+                until,
+                consumed: false,
+            },
+        );
     }
 
     pub(crate) fn disarm(&mut self, path: &CanonicalPath) {
@@ -38,11 +46,14 @@ impl Inflight {
     pub(crate) fn consume_if_echo(&mut self, path: &CanonicalPath, hash: &ContentHash) -> bool {
         let now = Instant::now();
         self.entries.retain(|_, entry| entry.until > now);
-        if self.entries.get(path).is_some_and(|e| &e.hash == hash) {
-            self.entries.remove(path);
-            return true;
+        let Some(entry) = self.entries.get_mut(path) else {
+            return false;
+        };
+        if entry.consumed || &entry.hash != hash {
+            return false;
         }
-        false
+        entry.consumed = true;
+        true
     }
 
     pub(crate) fn is_armed(&mut self, path: &CanonicalPath) -> bool {
