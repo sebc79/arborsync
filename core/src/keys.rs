@@ -17,6 +17,8 @@ pub enum KeyError {
     AlreadyExists { path: PathBuf },
     #[error("key file {path} is not 32 raw bytes or hex: + 64 hex digits")]
     BadSecret { path: PathBuf },
+    #[error("key file {path} mode is {mode:o}, want 600")]
+    InsecureMode { path: PathBuf, mode: u32 },
     #[error("expected hex: followed by 64 hex digits")]
     BadPin,
 }
@@ -94,6 +96,21 @@ pub fn write_static_key(path: impl AsRef<Path>) -> Result<[u8; 32], KeyError> {
 
 pub fn read_static_key(path: impl AsRef<Path>) -> Result<[u8; 32], KeyError> {
     let path = path.as_ref();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::metadata(path).map_err(|source| KeyError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(KeyError::InsecureMode {
+                path: path.to_path_buf(),
+                mode,
+            });
+        }
+    }
     let bytes = fs::read(path).map_err(|source| KeyError::Io {
         path: path.to_path_buf(),
         source,

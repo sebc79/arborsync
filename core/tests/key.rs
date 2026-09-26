@@ -67,5 +67,24 @@ fn read_static_key_accepts_raw_bytes_and_hex_form() {
 
     let hex_path = dir.path().join("hex.key");
     fs::write(&hex_path, format_hex_key(&secret)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hex_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
     assert_eq!(read_static_key(&hex_path).unwrap(), secret);
+}
+
+#[test]
+fn read_static_key_rejects_a_file_that_is_not_0600() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("k");
+    write_static_key(&path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = read_static_key(&path).unwrap_err();
+        assert!(matches!(err, KeyError::InsecureMode { mode: 0o644, .. }));
+    }
 }

@@ -1088,6 +1088,14 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             self.status.forget_gauge(&slave);
         }
         self.roster.disconnect_peer(&peer);
+        self.drop_pending(peer);
+    }
+
+    /// Drop in-flight applies for `peer` without touching the roster.
+    ///
+    /// A replaced session must not call [`Self::disconnect`]: the new task may
+    /// already own this peer. The old bulk is dead either way.
+    pub fn drop_pending(&mut self, peer: [u8; 32]) {
         self.pending.retain(|_, row| row.peer != peer);
     }
 
