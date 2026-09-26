@@ -578,8 +578,11 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             status: StatusLedger::default(),
             wipes: WipeSet { paths: Vec::new() },
         };
-        if index::root_is_dirty(&master.store, &CheckoutId::master()).map_err(MasterError::index)? {
+        if index::root_is_dirty(&master.store, &CheckoutId::master()).map_err(MasterError::index)?
+        {
             master.rescan()?;
+        } else {
+            master.repair_dir_nodes()?;
         }
         Ok(master)
     }
@@ -946,6 +949,20 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             self.hashing.remove(&need.key);
             let next = self.commit_hashed(need.run())?;
             self.drain_plan(next)?;
+        }
+        self.repair_dir_nodes()?;
+        Ok(())
+    }
+
+    fn repair_dir_nodes(&mut self) -> Result<(), MasterError> {
+        let changed = index::repair_dir_nodes(
+            &self.store,
+            &CheckoutId::master(),
+            &CanonicalPath::root(),
+        )
+        .map_err(MasterError::index)?;
+        if changed {
+            self.dirs = index::DirChildren::default();
         }
         Ok(())
     }
@@ -2180,5 +2197,78 @@ fn reject_all(checkouts: &[CheckoutRef], reason: &str) -> ProtocolMessage {
     ProtocolMessage::SubscribeReject {
         reason: reason.into(),
         denied_centrals: checkouts.iter().map(|c| c.central.clone()).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SlaveAcl;
+    use crate::keys::format_hex_key;
+    use crate::merkle::{DirChild, dir_node, empty_dir_node};
+    use crate::path::EntryName;
+    use crate::storage::{Storage, WriteBatch};
+    use crate::test_support::{MemoryStorage, SyncSandbox};
+
+    #[test]
+    fn open_repairs_a_dir_node_when_the_root_still_matches() {
+        let sandbox = SyncSandbox::new();
+        let hello = sandbox.central_root().join("src/hello.txt");
+        std::fs::create_dir_all(hello.parent().unwrap()).unwrap();
+        std::fs::write(&hello, b"hello").unwrap();
+        let src_host = hello.parent().unwrap();
+        let src_meta = meta::collect_from_path(src_host).unwrap().unwrap();
+        let file_meta = meta::collect_from_path(&hello).unwrap().unwrap();
+        let src = CanonicalPath::parse("/src").unwrap();
+        let file_path = CanonicalPath::parse("/src/hello.txt").unwrap();
+
+        let store = MemoryStorage::new();
+        let ck = CheckoutId::master();
+        let mut cache = index::DirChildren::default();
+        index::commit_leaf_with(
+            &store,
+            &ck,
+            &src,
+            Some(&src_meta),
+            index::LastSynced::AdoptLeaf,
+            &mut cache,
+        )
+        .unwrap();
+        index::commit_leaf_with(
+            &store,
+            &ck,
+            &file_path,
+            Some(&file_meta),
+            index::LastSynced::AdoptLeaf,
+            &mut cache,
+        )
+        .unwrap();
+        let good = store.get_dir_node(&ck, &src).unwrap().unwrap();
+
+        let stale = empty_dir_node();
+        let root = dir_node(&[DirChild::Directory {
+            name: EntryName::parse("src").unwrap(),
+            node: stale,
+        }]);
+        let mut batch = store.begin_write().unwrap();
+        batch.put_dir_node(&ck, &src, stale).unwrap();
+        batch
+            .put_dir_node(&ck, &CanonicalPath::root(), root)
+            .unwrap();
+        batch.commit().unwrap();
+        assert!(!index::root_is_dirty(&store, &ck).unwrap());
+
+        let cfg_path = sandbox.write_master_config(vec![SlaveAcl {
+            id: "dev-alice".into(),
+            public_keys: vec![format_hex_key(&[0xA1; 32])],
+            allowed_prefixes: vec!["/src".into()],
+        }]);
+        let master = Master::open(
+            LoadedMaster::load(&cfg_path).unwrap(),
+            store,
+            MemoryContent::new(),
+        )
+        .unwrap();
+        assert_eq!(master.store.get_dir_node(&ck, &src).unwrap(), Some(good));
     }
 }
