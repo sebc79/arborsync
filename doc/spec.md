@@ -579,7 +579,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 5. ✅ Bulk `copia` streams; whole-file fallback. A whole-file body is written to `.arborsync-tmp` one chunk at a time and hashed from that file. A delta is patched from a streamed basis snapshot. Peak RAM for a whole file is one 16 MiB chunk. Bodies larger than 1 GiB still sync.
 6. ✅ Reconcile walk + rescan + reconnect.
 7. ✅ Config watch for checkout add/remove; SIGHUP ACL/log/status-interval/tune reload.
-8. ✅ Tests: `core/tests/scenarios.rs` covers reserved dirs (local skip), two checkouts on one slave (`/src` and `/`), CAS conflict, echo suppression, ACL deny, and rescan-as-missed-watcher. Those tests call `handle`, `note_local`, and `rescan` on `MemoryStorage`. `src/watch.rs` starts a real `notify-debouncer-full` thread and asserts a FileAnnounce after a post-arm write. `tests/sync.rs` starts master and slave over QUIC and asserts a post-connect write crosses. Wire reserved-name reject is covered in `core/tests/master.rs` and `core/tests/slave.rs`. No end-to-end SIGHUP reload test in `tests/cli.rs`.
+8. ✅ Tests: `core/tests/scenarios.rs` covers reserved dirs (local skip), two checkouts on one slave (`/src` and `/`), CAS conflict, echo suppression, ACL deny, and rescan-as-missed-watcher. Those tests call `handle`, `note_local`, and `rescan` on `MemoryStorage`. `src/watch.rs` starts a real `notify-debouncer-full` thread and asserts a FileAnnounce after a post-arm write. `tests/sync.rs` starts master and slave over QUIC and asserts a post-connect write crosses. Wire reserved-name reject is covered in `core/tests/master.rs` and `core/tests/slave.rs`. `tests/cli.rs` sends SIGHUP after an ACL row is removed and waits for the close plus a refused reconnect, and rewrites the slave config and waits for resubscribe from the config watch.
 
 **✅ Framing and storage.** `decode_control` reads `Envelope.version`, then `ProtocolMessage`. An unknown version is `FrameError::UnsupportedVersion`, including a v2 variant index under version 2. On-disk `FileMetadata` is `u16le META_SCHEMA_VERSION || bincode` with its own `meta_bincode_config`. Wire frames use `wire_bincode_config`. Both configs are `bincode::config::standard()` today. The schema prefix is what stops a wire change from silently reinterpreting stored rows.
 
@@ -656,12 +656,9 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §3 path safety re-checks the joined path | `confine_host` canonicalizes each existing ancestor and returns `PathError::EscapesRoot` when that ancestor leaves the root. Apply, ancestor mkdir, and rename undo use it. `canonical_to_host` stays the lexical join for reads. |
 | ✅ | §5 post-commit Merkle check | Debug builds panic when a directory `commit_leaves_with` just wrote does not match a recompute from its children. `arborsync recompute` rewrites the master index from `/`. |
 | ✅ | §9 / item 5 whole-file RAM | A whole-file body is written to `.arborsync-tmp` one chunk at a time. `StagedContent::verify` and `BulkStage::finish` hash that file with `hash_file`. A delta snapshots the basis to tmp and patches onto another tmp file. `read_bulk` still concatenates for the in-memory transport. |
+| ✅ | Reload path at the binary | `tests/cli.rs` sends SIGHUP after an ACL row is removed and waits for `acl reload closed` and `unknown static key from`. It rewrites the slave config and waits for `resubscribe after reload` from the config watch. |
 
-Review findings (tree at `37f8671`, working tree clean). High-confidence gaps against this map. Icons stay ⚠️ until fixed in code or tests.
-
-| | Gap | Evidence |
-|---|---|---|
-| ⚠️ | Reload path untested at the binary | Core `plan_reload` / `Master::reload` / `Slave::reload` and `src/reload.rs` watch-setup backoff are covered. `tests/cli.rs` does not drive SIGHUP or config-watch through ACL drop / `close` / resubscribe. |
+Review findings from tree `37f8671` are closed. |
 
 Topic documents:
 
