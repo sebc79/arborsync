@@ -604,6 +604,7 @@ fn apply_live_slave_reload(
         anyhow::bail!("{reason}");
     }
     if plan.resubscribe {
+        log::info!("resubscribe after reload");
         let subscribe = slave.lock().expect("slave").subscribe();
         write_tx
             .send(subscribe)

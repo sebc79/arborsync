@@ -187,6 +187,7 @@ fn reload_master_from_disk(
             drop(guard);
             let mut live = sessions.lock().expect("sessions");
             for id in &plan.drop_slave_ids {
+                log::info!("acl reload closed {id}");
                 if let Some(handle) = live.remove(id) {
                     handle.conn.close(0u32.into(), b"acl reload");
                 }
