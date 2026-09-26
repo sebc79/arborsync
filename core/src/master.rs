@@ -497,6 +497,8 @@ struct PendingApply {
     checkout_id: String,
     path: CanonicalPath,
     new: FileMetadata,
+    /// Basis from the announce. Checked again at bulk finish against the live node.
+    basis: Option<FileNode>,
     origin: Origin,
     previous: Option<FileMetadata>,
     retried: bool,
@@ -798,17 +800,22 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                     });
                 }
                 let pending = self.pending.remove(&key).expect("pending");
-                self.publish(
-                    &pending.path,
-                    &pending.new,
-                    pending.previous.as_ref(),
-                    &bytes,
-                )?;
+                let live = self.meta(&pending.path)?;
+                if let CasDecision::Reject { current } =
+                    decide_cas(live.as_ref(), pending.basis, Some(pending.new.kind))
+                {
+                    return Ok(Reply::Send(ProtocolMessage::CasReject {
+                        checkout_id: pending.checkout_id,
+                        path: pending.path,
+                        current,
+                    }));
+                }
+                self.publish(&pending.path, &pending.new, live.as_ref(), &bytes)?;
                 self.commit(
                     &pending.origin,
                     &pending.path,
                     Some(&pending.new),
-                    pending.previous.as_ref(),
+                    live.as_ref(),
                 )?;
                 Ok(Reply::Send(ProtocolMessage::CasAccept {
                     checkout_id: pending.checkout_id,
@@ -1358,6 +1365,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                             checkout_id: checkout_id.clone(),
                             path: path.clone(),
                             new,
+                            basis,
                             origin: Origin::Slave {
                                 slave: session.slave,
                                 checkout,

@@ -13,7 +13,7 @@ use arborsync_core::master::{
 use arborsync_core::merkle::{self, DirChild, file_node};
 use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};
 use arborsync_core::path::RESERVED_CONFLICTS;
-use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
+use arborsync_core::protocol::{BulkEncoding, BulkHeader, CheckoutRef, ProtocolMessage};
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
 
 const ALICE: [u8; 32] = [0xA1; 32];
@@ -1250,6 +1250,89 @@ fn an_announce_outside_the_subscribed_central_is_an_error_not_a_cas_reject() {
         other => panic!("expected Error, got {other:?}"),
     }
     assert!(!sandbox.central_root().join("docs/hello.txt").exists());
+}
+
+#[test]
+fn a_later_bulk_finish_loses_cas_against_the_live_node() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    master
+        .handle(BACKUP, subscribe("backup-1", &[("bak", "/")]))
+        .unwrap();
+
+    let path = p("/src/hello.txt");
+    let alice_body = b"alice-bytes";
+    let backup_body = b"backup-bytes";
+    let alice_new = FileMetadata::file(
+        alice_body.len() as u64,
+        MTIME,
+        0o100644,
+        hash_bytes(alice_body),
+    );
+    let backup_new = FileMetadata::file(
+        backup_body.len() as u64,
+        MTIME,
+        0o100644,
+        hash_bytes(backup_body),
+    );
+    for (peer, checkout_id, new) in [
+        (ALICE, "src", alice_new.clone()),
+        (BACKUP, "bak", backup_new.clone()),
+    ] {
+        match master
+            .handle(
+                peer,
+                ProtocolMessage::FileAnnounce {
+                    checkout_id: checkout_id.into(),
+                    path: path.clone(),
+                    new,
+                    basis: None,
+                },
+            )
+            .unwrap()
+        {
+            Reply::Send(ProtocolMessage::SignatureRequest { .. }) => {}
+            other => panic!("expected SignatureRequest, got {other:?}"),
+        }
+    }
+
+    let finish = |master: &mut Master<MemoryStorage, MemoryContent>,
+                  peer: [u8; 32],
+                  checkout_id: &str,
+                  body: &[u8]| {
+        master.apply_bulk(
+            peer,
+            BulkHeader {
+                path: path.clone(),
+                checkout_id: checkout_id.into(),
+                want_hash: hash_bytes(body),
+                encoding: BulkEncoding::Whole,
+                size: body.len() as u64,
+            },
+            body,
+        )
+    };
+
+    match finish(&mut master, BACKUP, "bak", backup_body).unwrap() {
+        Reply::Send(ProtocolMessage::CasAccept { file_node: node, .. }) => {
+            assert_eq!(node, Some(file_node(&backup_new)));
+        }
+        other => panic!("expected CasAccept, got {other:?}"),
+    }
+    match finish(&mut master, ALICE, "src", alice_body).unwrap() {
+        Reply::Send(ProtocolMessage::CasReject { current, .. }) => {
+            assert_eq!(current.as_ref(), Some(&backup_new));
+        }
+        other => panic!("expected CasReject, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(sandbox.central_root().join("src/hello.txt")).unwrap(),
+        backup_body
+    );
+    assert_eq!(master.meta(&path).unwrap().as_ref(), Some(&backup_new));
 }
 
 #[test]
