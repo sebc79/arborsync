@@ -622,12 +622,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             status: StatusLedger::default(),
             wipes: WipeSet { paths: Vec::new() },
         };
-        if index::root_is_dirty(&master.store, &CheckoutId::master()).map_err(MasterError::index)?
-        {
-            master.rescan()?;
-        } else {
-            master.repair_dir_nodes()?;
-        }
+        // A clean directory hash still names files the disk has lost. Surveying
+        // on open drops those rows so the next reconcile can copy them back.
+        master.rescan()?;
         Ok(master)
     }
 

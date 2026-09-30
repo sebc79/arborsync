@@ -42,9 +42,8 @@ pub fn decide_child(
         }
         (None, Some(_)) => WalkAction::Pull,
         (Some(_), None) => match last_synced {
-            None => WalkAction::AnnounceCreate,
-            Some(synced) if local_node == Some(synced) => WalkAction::AnnounceDelete,
-            Some(_) => WalkAction::AnnounceCas,
+            Some(_) if local_node != last_synced => WalkAction::AnnounceCas,
+            _ => WalkAction::AnnounceCreate,
         },
         (Some(_), Some(_)) => {
             if last_synced.is_some() && local_node == last_synced {
