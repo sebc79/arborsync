@@ -193,6 +193,10 @@ impl<K: Eq + Hash, V> Waiting<K, V> {
         self.rows.values().map(|row| &row.value)
     }
 
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.rows.keys()
+    }
+
     pub fn clear(&mut self) {
         self.rows.clear();
     }
