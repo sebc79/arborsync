@@ -23,6 +23,7 @@ arborsync master [--config /etc/arborsync/master.toml]
 arborsync slave  [--config ~/.config/arborsync/slave.toml]
 arborsync keygen --out PATH
 arborsync recompute [--config /etc/arborsync/master.toml]
+arborsync path [--config /etc/arborsync/master.toml] PATH
 ```
 
 Config is TOML only.
@@ -536,7 +537,7 @@ arborsync/
 ├── flake.lock
 ├── nix/                # module.nix, eval fixture
 ├── core/               # arborsync-core
-└── src/                # master / slave / keygen / recompute subcommands
+└── src/                # master / slave / keygen / recompute / path subcommands
 ```
 
 ```toml
@@ -637,6 +638,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §14 slave checkout reload is one commit | `Slave::reload` validates resolved local overlap on a provisional checkout set, then deletes/inserts index rows and assigns `cfg` only after that check succeeds. |
 | ✅ | §4 reload lists match `plan_reload` | §4 Reloadable / Not reloadable match `plan_reload` for both roles, including slave checkouts, `master_public_keys`, `max_connections`, and `max_checkouts_per_slave`. `slave_id` is not reloadable. Debounce, rescan interval, status interval, and tune reload. Shrinking `max_checkouts_per_slave` does not prune live interest (next `Subscribe` enforces). `configuration.md` Applied live still omits `max_checkouts_per_slave`. |
 | ✅ | §4 `keygen --out` | Clap requires `--out`. `keygen::run` writes that path. |
+| ✅ | §4 `path` | `arborsync path --config PATH HOST_OR_CANONICAL` prints disk, index, dir node, and last_synced for that path on a master or slave. A locked index is copied and marked `snapshot=copy`. |
 | ✅ | §6 created directories use the announced mode | `mkdir_live` creates missing parents, then sets `mode & 0o7777` on each directory that call created, then mtime. Umask does not leave the announced mode. File and symlink parents, and rename destinations, use `0o755` via the same helper. |
 | ✅ | §7 type-change echo | The first matching-hash watcher event is the echo. The arm stays until 2× debounce, so a `Remove` after that `Create` is still dropped and cannot delete the CAS winner. A later mode-only change still announces. |
 | ✅ | §6 symlink hash reuse | Symlinks always re-read the target. Same-size same-mtime reuse is files only. |

@@ -112,6 +112,7 @@ Rescan is a full `stat` walk, not a dirty-subtree walk. `collect_for_rescan` has
 ## Identity and reload
 
 `arborsync keygen --out PATH` writes a 32-byte secret at mode `0600` and prints `hex:` plus 64 hex digits. That pin is what XX authenticates.
+`arborsync path` prints the disk row and the index row for one host or canonical path, including `last_synced`, so a missing file can be compared on the master and the slave.
 `master` and `slave` log that pin at startup after they read the secret file.
 
 Config is TOML. `--config` and `ARBORSYNC_CONFIG` pick the file. `ARBORSYNC_LOG_LEVEL` overrides `log_level`. Key material does not go in the environment.

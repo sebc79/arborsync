@@ -16,10 +16,12 @@ arborsync master [--config PATH]
 arborsync slave  [--config PATH]
 arborsync keygen [--out PATH]
 arborsync recompute [--config PATH]
+arborsync path [--config PATH] PATH
 ```
 
 `keygen` writes a 32-byte X25519 secret (0600) and prints the public key as `hex:` + 64 hex chars to stdout for pasting into the peer’s config.
 `recompute` loads a master config and rewrites directory hashes that do not match indexed children. It prints `recomputed directory hashes` when it writes, and `directory hashes already match` when it does not.
+`path` prints what that config’s index and the live disk know about one path. The argument is a host path under `central_root` or a checkout `local`, or a canonical path such as `/src/hello.txt`. A running daemon holds the index lock, so the command copies the file and prints `snapshot=copy`. The copy can miss a write that has not reached disk.
 `master` and `slave` log that same public pin at startup after they read the secret file.
 
 ## Master

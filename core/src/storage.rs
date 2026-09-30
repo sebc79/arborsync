@@ -5,7 +5,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::hash::{ContentHash, DirNode, FileNode};
 use crate::meta::FileMetadata;
-use crate::path::{join_central, CanonicalPath};
+use crate::path::{CanonicalPath, join_central};
 
 /// Layout of a stored `meta` value. Bumped when the row encoding changes.
 const META_SCHEMA_VERSION: u16 = 1;
@@ -234,6 +234,13 @@ pub struct RedbStorage {
 }
 
 impl RedbStorage {
+    /// Open a database that already exists. Does not create a file and does not
+    /// write table headers, so a dump can read a daemon's index.
+    pub fn open_existing(path: &Path) -> Result<Self, RedbStoreError> {
+        let db = Database::open(path)?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
     fn ensure_tables(db: &Database) -> Result<(), RedbStoreError> {
         let txn = db.begin_write()?;
         txn.open_table(META)?;
