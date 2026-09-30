@@ -265,8 +265,11 @@ fn dir_list_does_not_delete_while_rescan_is_still_walking() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::Delete { path, .. }] => assert_eq!(path, &p("/src/hello.txt")),
-        other => panic!("expected Delete after the walk, got {other:?}"),
+        [ProtocolMessage::FileAnnounce { path, basis, .. }] => {
+            assert_eq!(path, &p("/src/hello.txt"));
+            assert_eq!(*basis, None);
+        }
+        other => panic!("expected FileAnnounce after the walk, got {other:?}"),
     }
 }
 
@@ -347,8 +350,11 @@ fn dir_list_skips_delete_when_cas_accept_landed_after_the_request() {
             .unwrap(),
     )[..]
     {
-        [ProtocolMessage::Delete { path, .. }] => assert_eq!(path, &p("/src/hello.txt")),
-        other => panic!("expected Delete on a fresh listing, got {other:?}"),
+        [ProtocolMessage::FileAnnounce { path, basis, .. }] => {
+            assert_eq!(path, &p("/src/hello.txt"));
+            assert_eq!(*basis, None);
+        }
+        other => panic!("expected FileAnnounce on a fresh listing, got {other:?}"),
     }
 }
 

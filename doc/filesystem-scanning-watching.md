@@ -65,7 +65,7 @@ Watching is the fast path. Correctness is reconcile:
 
 - Slave `RootReport` ↔ master `RootAck`.
 - Walk `DirList*` on mismatch. Continue with `DirListRequest.after` while `more` is true.
-- 3-way with `last_synced`.
+- 3-way with `last_synced`. A name only on the slave is announced, including when local still equals `last_synced`.
 
 Triggers: after each rescan, after `SubscribeAck`, after reconnect. Not “after every batch of FS events” (that is the announce fast path).
 

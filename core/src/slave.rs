@@ -1977,6 +1977,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                     .push(self.dir_list_request(checkout_id, child_path.clone(), None));
             }
             WalkAction::AnnounceCreate | WalkAction::AnnounceCas => {
+                if master_child.is_none() && last_synced.is_some() && local_file == last_synced {
+                    self.write_last_synced(checkout_id, &child_path, None, None)?;
+                    self.checkout_mut(checkout_id)?.inflight.disarm(&child_path);
+                }
                 let walk_dir = local_meta
                     .as_ref()
                     .is_some_and(|meta| meta.kind == EntryKind::Dir);
