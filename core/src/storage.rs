@@ -644,7 +644,11 @@ where
     Ok(())
 }
 
-/// Walk only direct children of `dir`, seeking past each child's descendant keys.
+/// Walk only direct children of `dir`.
+///
+/// After a child row, the next key may be a sibling that sorts before that
+/// child's descendants (`pages` then `pages-v2`, then `pages/index.md`). Skip
+/// a subtree only once the cursor is already inside it.
 fn for_each_direct_child<T>(
     table: &T,
     ck: &CheckoutId,
@@ -686,12 +690,15 @@ where
 
         if path == child {
             visit(child.clone(), value.value())?;
-        } else if let Some(guard) = table.get(storage_key(ck, &child).as_slice())? {
-            visit(child.clone(), guard.value())?;
+            // The next sibling can sort before this child's descendants.
+            // `pages-v2` is after `pages` and before `pages/…`, and jumping
+            // to the descendant bound (`pages0`) skips it.
+            cursor = key.value().to_vec();
+            cursor.push(0);
+        } else {
+            let (_, after_child) = descendant_range(ck, &child);
+            cursor = after_child;
         }
-
-        let (_, after_child) = descendant_range(ck, &child);
-        cursor = after_child;
     }
     Ok(())
 }
@@ -865,8 +872,49 @@ mod prefix_keys {
         let steps = take_direct_child_range_steps();
         assert_eq!(kids.len(), 8);
         assert!(
-            steps <= 16,
-            "direct-child load touched {steps} range steps; expected one seek per child, not all grandchildren"
+            steps <= 24,
+            "direct-child load touched {steps} range steps; expected a couple of seeks per child, not all grandchildren"
+        );
+    }
+
+    #[test]
+    fn range_meta_children_keeps_a_sibling_that_extends_a_shorter_name() {
+        let (_dir, store) = open_tmp();
+        let ck = CheckoutId::master();
+        let mut batch = store.begin_write().unwrap();
+        for path in [
+            "/course",
+            "/course/pages",
+            "/course/pages/index.md",
+            "/course/pages-v2",
+            "/course/pages-v2/brief.md",
+            "/course/ice",
+            "/course/ice-car",
+            "/course/readme",
+            "/course/readme.md",
+        ] {
+            let meta = if path.ends_with(".md") {
+                meta(1)
+            } else {
+                FileMetadata::directory(0, 0o040755)
+            };
+            batch.put_meta(&ck, &p(path), &meta).unwrap();
+        }
+        batch.commit().unwrap();
+
+        let kids = store.range_meta_children(&ck, &p("/course")).unwrap();
+        assert_eq!(
+            kids.iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "/course/ice",
+                "/course/ice-car",
+                "/course/pages",
+                "/course/pages-v2",
+                "/course/readme",
+                "/course/readme.md",
+            ]
         );
     }
 }
