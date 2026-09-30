@@ -1603,6 +1603,15 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         let mut ids: Vec<String> = self.checkouts.keys().cloned().collect();
         ids.sort();
         for id in &ids {
+            let (ck, central) = {
+                let checkout = self.checkout(id)?;
+                (checkout.id.clone(), checkout.central.clone())
+            };
+            // A parent hash can still match the master after a child was indexed.
+            // The listing then never opens that parent, so a slave-only file stays
+            // put until this rescan finishes. Rewrite those hashes before the report.
+            index::repair_dir_nodes(&self.store, &ck, &central).map_err(SlaveError::index)?;
+            self.dirs.remove(&ck);
             self.start_rescan(id)?;
         }
         let plan = self.step_crawl(STEP_BUDGET)?;
