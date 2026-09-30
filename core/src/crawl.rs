@@ -88,7 +88,7 @@ pub(crate) struct DirListPage {
     pub after: Option<EntryName>,
     pub more: bool,
     pub page_end: Option<String>,
-    pub deletes_stale: bool,
+    pub list_epoch: u64,
     pub remaining: VecDeque<(String, (Option<DirChild>, Option<DirChild>))>,
 }
 
@@ -392,7 +392,7 @@ impl DirListPage {
         after: Option<EntryName>,
         more: bool,
         page_end: Option<String>,
-        deletes_stale: bool,
+        list_epoch: u64,
         by_name: BTreeMap<String, (Option<DirChild>, Option<DirChild>)>,
     ) -> Self {
         Self {
@@ -401,7 +401,7 @@ impl DirListPage {
             after,
             more,
             page_end,
-            deletes_stale,
+            list_epoch,
             remaining: by_name.into_iter().collect(),
         }
     }
