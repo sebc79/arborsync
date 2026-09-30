@@ -299,6 +299,7 @@ pub struct Slave<S: Storage, C: ContentHook> {
     dirs: HashMap<CheckoutId, index::DirChildren>,
     status: StatusLedger,
     cas_since_dir_list: HashMap<String, u64>,
+    dir_list_sent: HashMap<(String, CanonicalPath, Option<EntryName>), u64>,
 }
 
 impl<S: Storage, C: ContentHook> Slave<S, C> {
@@ -336,6 +337,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             dirs: HashMap::new(),
             status: StatusLedger::default(),
             cas_since_dir_list: HashMap::new(),
+            dir_list_sent: HashMap::new(),
         };
         let mut ids: Vec<String> = slave.checkouts.keys().cloned().collect();
         ids.sort();
@@ -972,7 +974,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                         staged.push(row);
                     }
                 }
-                HashOutcome::Absent => out.extend(self.note_removed(&id, &path)?),
+                HashOutcome::Absent => {
+                    out.extend(self.note_removed(&id, &path)?);
+                }
                 HashOutcome::Io(kind) => {
                     log::warn!("hash {}: {kind}", path.as_str());
                 }
@@ -1648,13 +1652,22 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         )]))
     }
 
+    fn cas_epoch(&self, checkout_id: &str) -> u64 {
+        self.cas_since_dir_list
+            .get(checkout_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn dir_list_request(
         &mut self,
         checkout_id: &str,
         path: CanonicalPath,
         after: Option<EntryName>,
     ) -> ProtocolMessage {
-        self.cas_since_dir_list.insert(checkout_id.to_string(), 0);
+        let epoch = self.cas_epoch(checkout_id);
+        self.dir_list_sent
+            .insert((checkout_id.to_string(), path.clone(), after.clone()), epoch);
         ProtocolMessage::DirListRequest {
             checkout_id: checkout_id.into(),
             path,
@@ -1687,17 +1700,17 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 .or_insert((None, Some(child.clone())));
         }
 
-        let deletes_stale = self
-            .cas_since_dir_list
-            .get(&checkout_id)
-            .is_some_and(|n| *n > 0);
+        let list_epoch = self
+            .dir_list_sent
+            .remove(&(checkout_id.clone(), path.clone(), after.clone()))
+            .unwrap_or(0);
         self.crawl.push_page(DirListPage::from_merge(
             checkout_id,
             path,
             after,
             more,
             page_end,
-            deletes_stale,
+            list_epoch,
             by_name,
         ));
         let plan = self.step_crawl(STEP_BUDGET)?;
@@ -1861,7 +1874,7 @@ fn stat_still_present(
 
 impl<S: Storage, C: ContentHook> Slave<S, C> {
     fn step_dir_list(&mut self, budget: usize) -> Result<HashPlan, SlaveError> {
-        let (checkout_id, parent, batch, next) = {
+        let (checkout_id, parent, batch, next, list_epoch) = {
             let Some(page) = self.crawl.front_page_mut() else {
                 return Ok(HashPlan::default());
             };
@@ -1870,7 +1883,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             let after = page.after.clone();
             let more = page.more;
             let page_end = page.page_end.clone();
-            let _ = page.deletes_stale;
+            let list_epoch = page.list_epoch;
             let mut batch = Vec::new();
             let mut used = 0;
             while used < budget {
@@ -1899,7 +1912,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             } else {
                 None
             };
-            (checkout_id, parent, batch, next)
+            (checkout_id, parent, batch, next, list_epoch)
         };
         self.crawl.pop_page_if_empty();
         let mut plan = HashPlan::default();
@@ -1910,6 +1923,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 &entry,
                 slave_child.as_ref(),
                 master_child.as_ref(),
+                list_epoch,
             )?);
         }
         if let Some(ProtocolMessage::DirListRequest {
@@ -1931,6 +1945,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         entry: &str,
         slave_child: Option<&DirChild>,
         master_child: Option<&DirChild>,
+        list_epoch: u64,
     ) -> Result<HashPlan, SlaveError> {
         let child_path = join_central(path, entry)?;
         let last_synced = self.last_synced(checkout_id, &child_path)?;
@@ -1974,11 +1989,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 }
             }
             WalkAction::AnnounceDelete => {
-                let deletes_stale = self
-                    .cas_since_dir_list
-                    .get(checkout_id)
-                    .is_some_and(|n| *n > 0);
-                if deletes_stale || self.crawl.rescanning(checkout_id) {
+                if self.cas_epoch(checkout_id) > list_epoch || self.crawl.rescanning(checkout_id)
+                {
                     return Ok(plan);
                 }
                 plan.send

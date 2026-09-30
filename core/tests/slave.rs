@@ -1458,6 +1458,60 @@ fn cas_accept_during_dir_list_walk_skips_stale_delete() {
 }
 
 #[test]
+fn a_later_dir_list_request_does_not_refresh_an_older_page() {
+    let sandbox = SyncSandbox::new();
+    let local = sandbox.add_checkout("dev-alice", "src");
+    std::fs::create_dir(local.join("d")).unwrap();
+    std::fs::write(local.join("z.txt"), b"hello").unwrap();
+    let cfg_path = sandbox.write_slave_config(
+        "dev-alice",
+        vec![CheckoutConfig {
+            id: "src".into(),
+            central: "/src".into(),
+            local: local.to_string_lossy().into_owned(),
+        }],
+        vec![format_hex_key(&MASTER)],
+    );
+    let cfg = LoadedSlave::load(&cfg_path).unwrap();
+    let mut slave = Slave::open(cfg, MemoryStorage::new(), MemoryContent::new()).unwrap();
+    slave.rescan("src").unwrap();
+    let node = file_node(&slave.meta("src", &p("/src/z.txt")).unwrap().unwrap());
+    slave
+        .handle(ProtocolMessage::CasAccept {
+            checkout_id: "src".into(),
+            path: p("/src/z.txt"),
+            file_node: Some(node),
+        })
+        .unwrap();
+
+    let reply = slave
+        .handle(ProtocolMessage::DirListResponse {
+            checkout_id: "src".into(),
+            path: p("/src"),
+            after: None,
+            entries: vec![arborsync_core::merkle::DirChild::Directory {
+                name: name("d"),
+                node: arborsync_core::hash::DirNode::from_bytes([9; 32]),
+            }],
+            more: false,
+        })
+        .unwrap();
+    let Reply::Send(msgs) = reply else {
+        panic!("expected Send");
+    };
+    assert!(
+        msgs.iter()
+            .any(|msg| matches!(msg, ProtocolMessage::DirListRequest { path, .. } if path == &p("/src/d"))),
+        "nested listing should be requested, got {msgs:?}"
+    );
+    assert!(
+        !msgs.iter().any(|msg| matches!(msg, ProtocolMessage::Delete { .. })),
+        "stale page must not delete z.txt after a nested request, got {msgs:?}"
+    );
+    assert!(local.join("z.txt").is_file());
+}
+
+#[test]
 fn reload_overlap_failure_keeps_index_and_cfg() {
     let sandbox = SyncSandbox::new();
     let mut slave = alice_slave(&sandbox, MemoryContent::new());
