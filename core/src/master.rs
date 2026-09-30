@@ -543,6 +543,9 @@ struct PendingApply {
     origin: Origin,
     previous: Option<FileMetadata>,
     retried: bool,
+    /// When the last `SignatureRequest` for this row went out. The origin-bytes
+    /// wait keeps its original stamp; this clock only gates a re-ask.
+    asked_at: Instant,
 }
 
 pub struct CentralWalk {
@@ -897,6 +900,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                     }));
                 }
                 pending.retried = true;
+                pending.asked_at = Instant::now();
                 Ok(Reply::Send(ProtocolMessage::SignatureRequest {
                     checkout_id: pending.checkout_id.clone(),
                     path: pending.path.clone(),
@@ -1149,6 +1153,69 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     /// already own this peer. The old bulk is dead either way.
     pub fn drop_pending(&mut self, peer: [u8; 32]) {
         self.pending.retain(|_, row| row.peer != peer);
+    }
+
+    /// Re-send `SignatureRequest`s when this peer's gauge is fresh, idle, and
+    /// the origin-bytes row is older than one status interval.
+    ///
+    /// A finished bulk does not clear `pending` until apply. The slave drops a
+    /// second ask only while that ask is parked or in flight, so a row that
+    /// outlives the send stays stuck unless the master asks again. A gauge that
+    /// still names fulfill work, or no gauge at all, is left alone.
+    pub fn reask_idle(&mut self, peer: [u8; 32], now: Instant) -> Vec<ProtocolMessage> {
+        let Some(slave) = self.live_slave_id(&peer) else {
+            return Vec::new();
+        };
+        let interval = self.cfg.status_interval_seconds();
+        if !self.status.peer_idle_fulfill(&slave, now, interval) {
+            return Vec::new();
+        }
+        let gap = match interval {
+            0 => Duration::from_secs(5),
+            seconds => Duration::from_secs(seconds),
+        };
+        let due: Vec<(String, CanonicalPath)> = self
+            .pending
+            .keys()
+            .cloned()
+            .filter(|key| {
+                self.pending.get(key).is_some_and(|row| {
+                    row.peer == peer && now.saturating_duration_since(row.asked_at) >= gap
+                })
+            })
+            .collect();
+        let mut out = Vec::with_capacity(due.len());
+        for key in due {
+            let Some(row) = self.pending.get_mut(&key) else {
+                continue;
+            };
+            row.asked_at = now;
+            let kind = row.new.kind;
+            let want_hash = row.new.content_hash;
+            let checkout_id = row.checkout_id.clone();
+            let path = row.path.clone();
+            let skip_live = row.previous.as_ref().is_some_and(|live| live.kind != kind);
+            let live = if skip_live {
+                None
+            } else {
+                let host = canonical_to_host(&self.central_root, &path);
+                match apply::try_read_file_or_link(&host) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        log::warn!("reask {}: {err}", path.as_str());
+                        None
+                    }
+                }
+            };
+            let msg =
+                transfer::signature_request(checkout_id, path, want_hash, kind, live.as_deref());
+            self.status.outbound(Some(&slave), &msg);
+            out.push(msg);
+        }
+        if !out.is_empty() {
+            log::warn!("reask idle origin_bytes slave={slave} count={}", out.len());
+        }
+        out
     }
 
     /// The id of a peer that has subscribed, which is the only peer a gauge can
@@ -1449,6 +1516,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                             },
                             previous: current,
                             retried: false,
+                            asked_at: Instant::now(),
                         },
                         Instant::now(),
                     );

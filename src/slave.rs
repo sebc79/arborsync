@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -632,7 +632,6 @@ struct Outbound {
     walk_tx: UnboundedSender<ProtocolMessage>,
     parked: Waiting<AskKey, ParkedAsk>,
     sending: Waiting<AskKey, IsLarge>,
-    fulfilled_asks: HashSet<AskKey>,
     bulk_tx: UnboundedSender<BulkDone>,
     gauge_seq: u32,
 }
@@ -648,7 +647,6 @@ impl Outbound {
             walk_tx,
             parked: Waiting::new(Stage::FulfillParked),
             sending: Waiting::new(Stage::FulfillRead),
-            fulfilled_asks: HashSet::new(),
             bulk_tx,
             gauge_seq: 0,
         }
@@ -687,7 +685,7 @@ impl Outbound {
                 let admission = guard.tune().fulfill_admission().expect("slave role");
                 (admission, size)
             };
-            if self.fulfilled_asks.contains(&key) || self.parked.get(&key).is_some() {
+            if self.suppress_ask(&key) {
                 return Ok(());
             }
             if !self.admits(admission, size) {
@@ -720,6 +718,14 @@ impl Outbound {
             Reply::Send(msgs) => self.enqueue(msgs),
             Reply::Bulk(_) => anyhow::bail!("bulk reply must start via start_ask"),
         }
+    }
+
+    /// A second ask for the same key is dropped only while that ask is parked
+    /// or on the wire. After `on_bulk_done` removes it, a later ask fulfills
+    /// again. Remembering every finished ask left the master holding
+    /// `origin_bytes` after a send the slave would not repeat.
+    fn suppress_ask(&self, key: &AskKey) -> bool {
+        self.sending.get(key).is_some() || self.parked.get(key).is_some()
     }
 
     fn admits(&self, admission: FulfillAdmission, size: Option<u64>) -> bool {
@@ -757,7 +763,6 @@ impl Outbound {
             (host, large)
         };
         let key = (checkout_id.clone(), path.clone(), want_hash);
-        self.fulfilled_asks.insert(key.clone());
         self.sending.insert(key.clone(), large, Instant::now());
         let conn = conn.clone();
         let tx = self.bulk_tx.clone();
@@ -948,5 +953,45 @@ fn default_config_path() -> PathBuf {
     match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home).join(".config/arborsync/slave.toml"),
         None => PathBuf::from("/nonexistent/slave.toml"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_finished_ask_is_not_suppressed() {
+        let (urgent_tx, _urgent_rx) = unbounded_channel();
+        let (walk_tx, _walk_rx) = unbounded_channel();
+        let (bulk_tx, _bulk_rx) = unbounded_channel();
+        let mut outbound = Outbound::new(urgent_tx, walk_tx, bulk_tx);
+        let key = (
+            "src".into(),
+            CanonicalPath::parse("/src/a.txt").unwrap(),
+            ContentHash::ZERO,
+        );
+        assert!(!outbound.suppress_ask(&key));
+        outbound.sending.insert(key.clone(), false, Instant::now());
+        assert!(outbound.suppress_ask(&key));
+        outbound.sending.remove(&key);
+        assert!(
+            !outbound.suppress_ask(&key),
+            "a send that finished must accept the master's re-ask"
+        );
+        outbound.parked.insert(
+            key.clone(),
+            ParkedAsk {
+                msg: ProtocolMessage::SignatureRequest {
+                    checkout_id: "src".into(),
+                    path: key.1.clone(),
+                    want_hash: key.2,
+                    signature: Vec::new(),
+                },
+                size: None,
+            },
+            Instant::now(),
+        );
+        assert!(outbound.suppress_ask(&key));
     }
 }

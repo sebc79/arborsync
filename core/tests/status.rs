@@ -72,6 +72,19 @@ fn alice_slave(
     Slave::open(cfg, MemoryStorage::new(), bodies).unwrap()
 }
 
+/// What an idle slave sends: no fulfill stage, nothing parked or sending.
+fn idle_gauge(seq: u32) -> Gauge {
+    Gauge {
+        seq,
+        stage: None,
+        age_ms: 0,
+        depth: 0,
+        parked: 0,
+        sending: 0,
+        pending: 0,
+    }
+}
+
 /// What a parked slave sends: 41 s behind on the third of three asks.
 fn parked_gauge(seq: u32) -> Gauge {
     Gauge {
@@ -321,6 +334,55 @@ fn master_waiting_on_slave_bytes_names_origin_bytes() {
         without_age(&status.lines(5)[1]),
         "status slave=dev-alice health=stuck bottleneck=origin_bytes age=<n> depth=1 hint=absent connected=true checkouts=1 in=1 out=1 cas_ok=0 cas_rej=0 apply_ok=0 apply_fail=0 bulk_in=0 bulk_out=0 bytes_in=0 bytes_out=0 dir_list=0 root=0 local=0 rescan=0 flushed=0 pending=1 outbox=0 writable=true fanout_dropped=0 last_error=-"
     );
+}
+
+#[test]
+fn an_idle_slave_gauge_reasks_origin_bytes_older_than_one_status_interval() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    let _handshake = master.take_status();
+    ask_alice_for_bytes(&mut master);
+    master.observe_gauge(ALICE, &idle_gauge(1).encode());
+
+    assert!(
+        master.reask_idle(ALICE, Instant::now()).is_empty(),
+        "the first ask is still inside one status interval"
+    );
+
+    // Sandbox status interval is 0, treated as a 5s period. Six seconds is past
+    // one period and inside the three-period gauge window.
+    let later = Instant::now() + Duration::from_secs(6);
+    let asks = master.reask_idle(ALICE, later);
+    assert!(
+        matches!(
+            asks.as_slice(),
+            [ProtocolMessage::SignatureRequest { path, .. }] if path == &p("/src/big.bin")
+        ),
+        "idle gauge with an old origin_bytes row must reask, got {asks:?}"
+    );
+    assert!(
+        master.reask_idle(ALICE, later).is_empty(),
+        "the same instant must not ask twice"
+    );
+}
+
+#[test]
+fn a_parked_or_missing_gauge_does_not_reask_origin_bytes() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+    let _handshake = master.take_status();
+    ask_alice_for_bytes(&mut master);
+    let later = Instant::now() + Duration::from_secs(6);
+    assert!(master.reask_idle(ALICE, later).is_empty());
+
+    master.observe_gauge(ALICE, &parked_gauge(1).encode());
+    assert!(master.reask_idle(ALICE, later).is_empty());
 }
 
 #[test]

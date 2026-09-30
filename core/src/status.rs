@@ -293,6 +293,23 @@ impl StatusLedger {
         self.gauges.remove(slave);
     }
 
+    /// A fresh gauge that names no fulfill work. Stale and absent gauges are
+    /// not idle: the peer may still be sending.
+    pub fn peer_idle_fulfill(
+        &self,
+        slave: &str,
+        now: Instant,
+        status_interval_seconds: u64,
+    ) -> bool {
+        let Some(heard) = self.gauges.get(slave) else {
+            return false;
+        };
+        if now.saturating_duration_since(heard.at) > gauge_window(status_interval_seconds) {
+            return false;
+        }
+        heard.gauge.stage.is_none() && heard.gauge.sending == 0 && heard.gauge.parked == 0
+    }
+
     pub fn take_master(
         &mut self,
         live: Vec<PeerLive>,

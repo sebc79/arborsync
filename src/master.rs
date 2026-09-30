@@ -358,7 +358,11 @@ async fn accept_session(
                 }
                 Some(err) = write_err_rx.recv() => return Err(err.into()),
                 _ = wipe_ready.notified() => {}
-                _ = tick.tick() => flush_outbox(&master, peer, &write_tx)?,
+                _ = tick.tick() => {
+                    let asks = master.lock().expect("master").reask_idle(peer, Instant::now());
+                    enqueue_control(&write_tx, asks)?;
+                    flush_outbox(&master, peer, &write_tx)?;
+                }
             }
         }
         Ok(())
