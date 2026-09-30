@@ -1151,6 +1151,13 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         self.pending.retain(|_, row| row.peer != peer);
     }
 
+    /// Re-send `SignatureRequest`s for origin-byte waits this peer has stopped
+    /// working. The real body lands in a later change; this stub exists so the
+    /// idle-gauge test can fail on the missing ask.
+    pub fn reask_idle(&mut self, _peer: [u8; 32], _now: Instant) -> Vec<ProtocolMessage> {
+        Vec::new()
+    }
+
     /// The id of a peer that has subscribed, which is the only peer a gauge can
     /// belong to. Unlike `status_slave`, an ACL row alone is not enough.
     fn live_slave_id(&self, peer: &[u8; 32]) -> Option<String> {
