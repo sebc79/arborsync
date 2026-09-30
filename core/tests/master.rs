@@ -1,4 +1,6 @@
 use arborsync_core::LoadedMaster;
+use arborsync_core::RedbStorage;
+use arborsync_core::Storage;
 use arborsync_core::LocalEvent;
 use arborsync_core::config::{ReloadError, SlaveAcl};
 use arborsync_core::hash::{ContentHash, FileNode};
@@ -1462,6 +1464,38 @@ fn resubscribing_from_a_rotated_key_makes_the_old_key_inert() {
         }
         other => panic!("the live session survived the stale disconnect, got {other:?}"),
     }
+}
+
+#[test]
+fn open_drops_an_indexed_file_that_is_gone_from_disk() {
+    let sandbox = SyncSandbox::new();
+    let cfg_path = sandbox.write_master_config(vec![slave_acl("dev-alice", ALICE, &["/src"])]);
+    let cfg = LoadedMaster::load(&cfg_path).unwrap();
+    let mut master = Master::open(
+        cfg,
+        RedbStorage::open(&sandbox.master_db()).unwrap(),
+        MemoryContent::new(),
+    )
+    .unwrap();
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("src/hello.txt", b"hello");
+    master.rescan().unwrap();
+    assert!(master.meta(&p("/src/hello.txt")).unwrap().is_some());
+    drop(master);
+    std::fs::remove_file(sandbox.central_root().join("src/hello.txt")).unwrap();
+
+    let cfg = LoadedMaster::load(&cfg_path).unwrap();
+    let master = Master::open(
+        cfg,
+        RedbStorage::open(&sandbox.master_db()).unwrap(),
+        MemoryContent::new(),
+    )
+    .unwrap();
+    assert!(
+        master.meta(&p("/src/hello.txt")).unwrap().is_none(),
+        "a restart must forget a file the disk no longer has"
+    );
 }
 
 #[test]

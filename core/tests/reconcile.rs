@@ -79,20 +79,20 @@ fn decide_child_slave_only_without_last_synced_is_announce_create() {
 }
 
 #[test]
-fn decide_child_slave_only_local_equals_last_synced_is_announce_delete() {
+fn decide_child_slave_only_local_equals_last_synced_is_announce_create() {
     let local = file("hello.txt", 1);
     assert_eq!(
         decide_child(Some(&local), None, Some(node(1)), Some(node(1))),
-        WalkAction::AnnounceDelete
+        WalkAction::AnnounceCreate
     );
 }
 
 #[test]
-fn decide_child_slave_only_dir_local_equals_last_synced_is_announce_delete() {
+fn decide_child_slave_only_dir_local_equals_last_synced_is_announce_create() {
     let local = directory("nested", false);
     assert_eq!(
         decide_child(Some(&local), None, Some(node(1)), Some(node(1))),
-        WalkAction::AnnounceDelete
+        WalkAction::AnnounceCreate
     );
 }
 

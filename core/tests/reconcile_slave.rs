@@ -627,7 +627,7 @@ fn dir_list_slave_only_nested_dir_announces_the_nested_file() {
 }
 
 #[test]
-fn dir_list_slave_only_with_last_synced_equal_local_deletes() {
+fn dir_list_slave_only_with_last_synced_equal_local_announces() {
     let sandbox = SyncSandbox::new();
     let hello = b"hello";
     let hash = hash_bytes(hello);
@@ -660,23 +660,27 @@ fn dir_list_slave_only_with_last_synced_equal_local_deletes() {
         })
         .unwrap();
     match &send_and_drain(&mut slave, reply)[..] {
-        [
-            ProtocolMessage::Delete {
-                checkout_id,
-                path,
-                basis,
-            },
-        ] => {
+        [ProtocolMessage::FileAnnounce {
+            checkout_id,
+            path,
+            new: announced,
+            basis,
+        }] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src/hello.txt"));
-            assert_eq!(*basis, file_node(&new));
+            assert_eq!(announced.content_hash, hash);
+            assert_eq!(*basis, None);
         }
-        other => panic!("expected Delete, got {other:?}"),
+        other => panic!("expected FileAnnounce, got {other:?}"),
     }
+    assert!(
+        slave.checkout_local("src").unwrap().join("hello.txt").is_file(),
+        "the slave copy is the only bytes left"
+    );
 }
 
 #[test]
-fn dir_list_slave_only_dir_with_last_synced_equal_local_deletes() {
+fn dir_list_slave_only_dir_with_last_synced_equal_local_announces() {
     let sandbox = SyncSandbox::new();
     let mut slave = alice_slave(&sandbox, MemoryContent::new());
     let dir = FileMetadata::directory(MTIME, 0o040755);
@@ -706,17 +710,20 @@ fn dir_list_slave_only_dir_with_last_synced_equal_local_deletes() {
         .unwrap();
     match &send_and_drain(&mut slave, reply)[..] {
         [
-            ProtocolMessage::Delete {
+            ProtocolMessage::FileAnnounce {
                 checkout_id,
                 path,
                 basis,
+                ..
             },
+            ProtocolMessage::DirListRequest { path: walk, .. },
         ] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src/nested"));
-            assert_eq!(*basis, file_node(&dir));
+            assert_eq!(*basis, None);
+            assert_eq!(walk, &p("/src/nested"));
         }
-        other => panic!("expected Delete, got {other:?}"),
+        other => panic!("expected directory announce and walk, got {other:?}"),
     }
 }
 
