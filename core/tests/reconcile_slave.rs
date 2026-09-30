@@ -2,11 +2,12 @@ use arborsync_core::LoadedSlave;
 use arborsync_core::LocalEvent;
 use arborsync_core::config::CheckoutConfig;
 use arborsync_core::keys::format_hex_key;
-use arborsync_core::merkle::{DirChild, empty_dir_node, file_node};
-use arborsync_core::meta::{FileMetadata, hash_bytes};
+use arborsync_core::merkle::{DirChild, dir_node, empty_dir_node, file_node};
+use arborsync_core::meta::{self, FileMetadata, hash_bytes};
 use arborsync_core::path::{RESERVED_TMP, conflict_sidecar_path};
 use arborsync_core::protocol::{CheckoutAck, ProtocolMessage};
 use arborsync_core::slave::{MemoryContent, Reply, RescanStat, Slave};
+use arborsync_core::storage::{CheckoutId, Storage, WriteBatch};
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
 
 const MASTER_PIN: [u8; 32] = [0x11; 32];
@@ -666,12 +667,14 @@ fn dir_list_slave_only_with_last_synced_equal_local_announces() {
         })
         .unwrap();
     match &send_and_drain(&mut slave, reply)[..] {
-        [ProtocolMessage::FileAnnounce {
-            checkout_id,
-            path,
-            new: announced,
-            basis,
-        }] => {
+        [
+            ProtocolMessage::FileAnnounce {
+                checkout_id,
+                path,
+                new: announced,
+                basis,
+            },
+        ] => {
             assert_eq!(checkout_id, "src");
             assert_eq!(path, &p("/src/hello.txt"));
             assert_eq!(announced.content_hash, hash);
@@ -680,7 +683,11 @@ fn dir_list_slave_only_with_last_synced_equal_local_announces() {
         other => panic!("expected FileAnnounce, got {other:?}"),
     }
     assert!(
-        slave.checkout_local("src").unwrap().join("hello.txt").is_file(),
+        slave
+            .checkout_local("src")
+            .unwrap()
+            .join("hello.txt")
+            .is_file(),
         "the slave copy is the only bytes left"
     );
 }
@@ -977,5 +984,85 @@ fn rescan_keeps_a_file_when_the_checkout_cannot_be_listed() {
     assert!(
         slave.meta("src", &p("/src/keep.txt")).unwrap().is_some(),
         "unreadable checkout cleared the index"
+    );
+}
+
+#[test]
+fn subscribe_ack_repairs_a_stale_parent_before_listing() {
+    let sandbox = SyncSandbox::new();
+    let local = sandbox.add_checkout("dev-alice", "src");
+    for i in 0..80 {
+        sandbox
+            .tree(&local)
+            .file(&format!("f{i:02}.txt"), format!("b{i}").as_bytes());
+    }
+    let mid = local.join("mid");
+    std::fs::create_dir_all(&mid).unwrap();
+    std::fs::write(mid.join("brief.md"), b"brief").unwrap();
+    let src_meta = meta::collect_from_path(&local).unwrap().unwrap();
+    let mid_meta = meta::collect_from_path(&mid).unwrap().unwrap();
+    let brief_meta = meta::collect_from_path(&mid.join("brief.md"))
+        .unwrap()
+        .unwrap();
+
+    let ck = CheckoutId::new("src");
+    let empty = empty_dir_node();
+    let stale_src = dir_node(&[DirChild::Directory {
+        name: name("mid"),
+        node: empty,
+    }]);
+    let stale_root = dir_node(&[DirChild::Directory {
+        name: name("src"),
+        node: stale_src,
+    }]);
+    let store = MemoryStorage::new();
+    {
+        let mut batch = store.begin_write().unwrap();
+        batch
+            .put_meta(&ck, &p("/"), &FileMetadata::directory(0, 0o040755))
+            .unwrap();
+        batch.put_meta(&ck, &p("/src"), &src_meta).unwrap();
+        batch.put_meta(&ck, &p("/src/mid"), &mid_meta).unwrap();
+        batch
+            .put_meta(&ck, &p("/src/mid/brief.md"), &brief_meta)
+            .unwrap();
+        batch.put_dir_node(&ck, &p("/src/mid"), empty).unwrap();
+        batch.put_dir_node(&ck, &p("/src"), stale_src).unwrap();
+        batch.put_dir_node(&ck, &p("/"), stale_root).unwrap();
+        batch.commit().unwrap();
+    }
+    let cfg_path = sandbox.write_slave_config(
+        "dev-alice",
+        vec![CheckoutConfig {
+            id: "src".into(),
+            central: "/src".into(),
+            local: local.to_string_lossy().into_owned(),
+        }],
+        vec![format_hex_key(&MASTER_PIN)],
+    );
+    let cfg = LoadedSlave::load(&cfg_path).unwrap();
+    let mut slave = Slave::open(cfg, store, MemoryContent::new()).unwrap();
+    send(slave.handle(subscribe_ack()).unwrap());
+
+    let listed = send(
+        slave
+            .handle(ProtocolMessage::DirListResponse {
+                checkout_id: "src".into(),
+                path: p("/src"),
+                after: None,
+                entries: vec![DirChild::Directory {
+                    name: name("mid"),
+                    node: empty,
+                }],
+                more: false,
+            })
+            .unwrap(),
+    );
+    assert!(
+        listed.iter().any(|msg| matches!(
+            msg,
+            ProtocolMessage::DirListRequest { path, .. } if path == &p("/src/mid")
+        )),
+        "stale parent hash hid the indexed file, got {listed:?}"
     );
 }

@@ -312,7 +312,7 @@ Recipient-driven. Never compute a forward delta against a cached snapshot of the
 
 After `SubscribeAck`, every rescan interval, and on reconnect:
 
-1. Slave sends `RootReport { checkout_id, path: central, root }` for each checkout. The `SubscribeAck` report uses the current index and does not wait for a still-running rescan walk. Names the walk indexes in that session are announced as they are found.
+1. Slave sends `RootReport { checkout_id, path: central, root }` for each checkout. The `SubscribeAck` report uses the current index and does not wait for a still-running rescan walk. Before that report, directory hashes that do not match indexed children are rewritten, so a stale parent hash cannot match the master and hide a slave-only file. Names the walk indexes in that session are announced as they are found.
 2. Master replies `RootAck { matched, master_root }`.
 3. On mismatch (or empty slave), slave walks:
    - `DirListRequest` / `DirListResponse` for the directory (`name`, `kind`, `node_hash`). A listing that would exceed the 1 MiB control frame is split. `DirListResponse.more` means later names remain. The slave must not treat those unsent names as absent. It continues with `DirListRequest.after` set to the last name on the page.
@@ -654,6 +654,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §6 collection uses `symlink_metadata` | Collection uses `symlink_metadata`. `mtime_ns` is `st_mtime * 1e9 + st_mtime_nsec`, including negative stamps. Paths are not skipped when `Metadata::modified()` would fail. |
 | ✅ | §13 `last_synced` value is 32 or 64 bytes | `last_synced` values are 32 bytes (`FileNode`) or 64 bytes (`FileNode` || `content_hash`). Both widths decode. |
 | ✅ | §13 dirty root before network CAS | `Slave::open` rescans when `root_is_dirty` before accepting network CAS. `Master::open` always surveys the disk. A directory hash can match its index while the named files are gone, and that used to skip the survey. Slave `commit_rescan` runs `repair_dir_nodes`. Master `rescan` does too. |
+| ✅ | §10 `SubscribeAck` repairs directory hashes before `RootReport` | A parent `DirNode` can still equal the master after a child was indexed. The listing then stops and a slave-only file is never announced. `on_subscribe_ack` runs `repair_dir_nodes` before the report, so that parent hash includes the child. |
 | ✅ | §7 slave watcher death rescans | If `watch_checkout` returns `Err` or `WatchStop::Restart`, the slave logs (on `Err`), queues `Work::Rescan`, re-arms, and on `Err` sleeps 1s so a broken watch cannot spin. |
 | ✅ | §3 path safety re-checks the joined path | `confine_host` canonicalizes each existing ancestor and returns `PathError::EscapesRoot` when that ancestor leaves the root. Apply, ancestor mkdir, and rename undo use it. `canonical_to_host` stays the lexical join for reads. |
 | ✅ | §5 post-commit Merkle check | Debug builds panic when a directory `commit_leaves_with` just wrote does not match a recompute from its children. `arborsync recompute` rewrites the master index from `/`. |
