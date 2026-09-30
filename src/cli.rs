@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::{keygen, master, recompute, slave};
+use crate::{keygen, master, path_dump, recompute, slave};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,6 +37,13 @@ pub enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Print disk, index, directory hash, and last_synced for one path
+    Path {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Host path under the central root or a checkout, or a canonical path
+        path: PathBuf,
+    },
 }
 
 impl Cli {
@@ -46,6 +53,7 @@ impl Cli {
             Command::Slave { config } => slave::run(resolve_config(config)),
             Command::Keygen { out } => keygen::run(&out),
             Command::Recompute { config } => recompute::run(resolve_config(config)),
+            Command::Path { config, path } => path_dump::run(resolve_config(config), path),
         }
     }
 }

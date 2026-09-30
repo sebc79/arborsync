@@ -58,6 +58,7 @@ fn help_lists_master_slave_and_keygen() {
     assert!(stdout.contains("master"));
     assert!(stdout.contains("slave"));
     assert!(stdout.contains("keygen"));
+    assert!(stdout.contains("path"));
 }
 
 #[test]
@@ -533,5 +534,120 @@ fn config_watch_resubscribes_after_a_checkout_is_added() {
         &pair.slave_log,
         "resubscribe after reload",
         Duration::from_secs(10),
+    );
+}
+
+fn path_stdout(config: &Path, arg: &str) -> String {
+    let output = bin()
+        .args(["path", "--config"])
+        .arg(config)
+        .arg(arg)
+        .output()
+        .expect("run path");
+    assert!(
+        output.status.success(),
+        "path {arg}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("path stdout")
+}
+
+#[test]
+fn path_dump_shows_a_master_file_on_disk_and_in_the_index() {
+    let (sandbox, config) = master_sandbox();
+    let host = sandbox.central_root().join("src/hello.txt");
+    fs::create_dir_all(host.parent().unwrap()).unwrap();
+    fs::write(&host, b"hello").unwrap();
+    let child = bin()
+        .args(["master", "--config"])
+        .arg(&config)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn master");
+    let _ = stderr_after_kill(child);
+
+    let dumped = path_stdout(&config, host.to_str().unwrap());
+    assert!(dumped.contains("role=master\n"), "{dumped}");
+    assert!(dumped.contains("snapshot=live\n"), "{dumped}");
+    assert!(dumped.contains("checkout=-\n"), "{dumped}");
+    assert!(dumped.contains("central=/src/hello.txt\n"), "{dumped}");
+    assert!(dumped.contains("disk=file "), "{dumped}");
+    assert!(dumped.contains("index=file "), "{dumped}");
+    assert!(dumped.contains("disk_index=match\n"), "{dumped}");
+
+    let by_canonical = path_stdout(&config, "/src/hello.txt");
+    assert!(
+        by_canonical.contains(&format!("host={}\n", host.display())),
+        "{by_canonical}"
+    );
+
+    let missing = path_stdout(&config, "/src/missing.txt");
+    assert!(missing.contains("disk=absent\n"), "{missing}");
+    assert!(missing.contains("index=absent\n"), "{missing}");
+    assert!(missing.contains("disk_index=both_absent\n"), "{missing}");
+
+    let outside = bin()
+        .args(["path", "--config"])
+        .arg(&config)
+        .arg("not-a-canonical-path")
+        .output()
+        .expect("run path");
+    assert!(!outside.status.success());
+}
+
+#[test]
+fn path_dump_copies_the_index_while_the_master_holds_it() {
+    let (sandbox, config) = master_sandbox();
+    let host = sandbox.central_root().join("src/hello.txt");
+    fs::create_dir_all(host.parent().unwrap()).unwrap();
+    fs::write(&host, b"hello").unwrap();
+    let log = sandbox.path().join("master.log");
+    let mut child = spawn_logged(&["master", "--config", config.to_str().unwrap()], &log);
+    wait_log(&mut child, &log, "master watching", Duration::from_secs(10));
+    let dumped = path_stdout(&config, host.to_str().unwrap());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(dumped.contains("snapshot=copy\n"), "{dumped}");
+    assert!(dumped.contains("disk_index=match\n"), "{dumped}");
+    assert!(dumped.contains("central=/src/hello.txt\n"), "{dumped}");
+}
+
+#[test]
+fn path_dump_shows_a_slave_checkout_file() {
+    let sandbox = SyncSandbox::new();
+    let local = sandbox.add_checkout("dev-alice", "src");
+    let host = local.join("hello.txt");
+    fs::write(&host, b"hello").unwrap();
+    let key = sandbox.slave_root("dev-alice").join("slave.key");
+    let keygen = bin().args(["keygen", "--out"]).arg(&key).output().unwrap();
+    assert!(keygen.status.success());
+    let config = sandbox.write_slave_config(
+        "dev-alice",
+        vec![CheckoutConfig {
+            id: "src".into(),
+            central: "/src".into(),
+            local: local.to_string_lossy().into_owned(),
+        }],
+        vec!["hex:".to_string() + &"11".repeat(32)],
+    );
+    let child = bin()
+        .args(["slave", "--config"])
+        .arg(&config)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn slave");
+    let _ = stderr_after_kill(child);
+
+    let dumped = path_stdout(&config, host.to_str().unwrap());
+    assert!(dumped.contains("role=slave\n"), "{dumped}");
+    assert!(dumped.contains("checkout=src\n"), "{dumped}");
+    assert!(dumped.contains("central=/src/hello.txt\n"), "{dumped}");
+    assert!(dumped.contains("disk_index=match\n"), "{dumped}");
+
+    let by_canonical = path_stdout(&config, "/src/hello.txt");
+    assert!(by_canonical.contains("checkout=src\n"), "{by_canonical}");
+    assert!(
+        by_canonical.contains(&format!("host={}\n", host.display())),
+        "{by_canonical}"
     );
 }
