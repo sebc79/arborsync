@@ -66,7 +66,7 @@ No `slave_subscriptions` table. Active interest is process memory, rebuilt from 
 
 ## Transactions
 
-Specified: one batch per debounce window, per accepted CAS, or per reconcile directory. Slave `rescan` uses one `commit_leaves` batch for every create, update, and local delete the walk found. The slave holds hashed `FileAnnounce`s until 64 are ready or hashing workers are idle, then one `commit_leaves` batch writes them. Watcher events and apply still use one `commit_leaf` per path. The master and the slave each keep a `DirChildren` map so a later `commit_leaf` patches one child's hash or splices one new entry into the loaded concat. A `commit_leaves` of more than one path marks new children stale and rebuilds that concat once, as a delete or a kind change does, then BLAKE3s it instead of listing every descendant. The first load of a directory uses `range_meta_children`, which returns only direct children and (on redb) seeks past each child's subtree. `range_meta` still walks keys from the prefix through its descendants and stops before a sorting sibling. Stored keys are rebuilt with `CanonicalPath::from_stored`, not a second `parse`. Origin `CasAccept` writes `last_synced` in a following batch. Order inside a `commit_leaf` / `commit_leaves` batch:
+Specified: one batch per debounce window, per accepted CAS, or per reconcile directory. Slave `rescan` uses one `commit_leaves` batch for every create, update, and local delete the walk found. The slave holds hashed `FileAnnounce`s until 64 are ready or hashing workers are idle, then one `commit_leaves` batch writes them. Watcher events and apply still use one `commit_leaf` per path. The master and the slave each keep a `DirChildren` map so a later `commit_leaf` patches one child's hash or splices one new entry into the loaded concat. A `commit_leaves` of more than one path marks new children stale and rebuilds that concat once, as a delete or a kind change does, then BLAKE3s it instead of listing every descendant. The first load of a directory uses `range_meta_children`, which returns only direct children and (on redb) seeks past a subtree only once the cursor is inside it, so `pages-v2` is not dropped after `pages`. `range_meta` still walks keys from the prefix through its descendants and stops before a sorting sibling. Stored keys are rebuilt with `CanonicalPath::from_stored`, not a second `parse`. Origin `CasAccept` writes `last_synced` in a following batch. Order inside a `commit_leaf` / `commit_leaves` batch:
 
 1. Apply leaf `meta` / deletes. A directory remove and a non-dir leaf both drop the path prefix so descendants cannot remain.
 2. Recompute and `put_dir_node` for each affected ancestor, root-ward.
@@ -84,7 +84,7 @@ storage.range_meta(&CheckoutId("".into()), "/src")?;
 storage.range_meta(&CheckoutId("bak".into()), "/src")?;
 ```
 
-Directory child lists for reconcile and `DirChildren` loads come from `range_meta_children` (direct children only: one path component past the directory). Do not send the entire descendant range on the wire. `range_meta` / `range_dir_nodes` remain the full descendant range for other callers.
+Directory child lists for reconcile and `DirChildren` loads come from `range_meta_children` (direct children only: one path component past the directory). A sibling that extends a shorter name stays in that list: `pages-v2` is not skipped because `pages` was seen first. Do not send the entire descendant range on the wire. `range_meta` / `range_dir_nodes` remain the full descendant range for other callers.
 
 ## Checkout removal
 
