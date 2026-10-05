@@ -32,7 +32,8 @@ A `need_rescan()` event runs the existing rescan path. It is not mapped as a fil
 | File or symlink present after Create or Write | `collect_for_rescan` (hash only on kind, size, or mtime miss), index, announce if `FileNode != last_synced` (slave) or meta changed (master) |
 | Metadata (chmod or mtime) | `collect_for_rescan` (hash only on kind, size, or mtime miss), then the same announce rule |
 | Directory present | index, recompute ancestors, no bulk |
-| Path gone | `note_removed`. Announce `Delete` if an index row exists |
+| Remove, path still present | same as a write. `git checkout` unlinks and recreates inside one debounce window. Deleting from the event alone accepts on the master, `CasReject`s the new bytes with no current file, and the slave sidecars then removes the live file |
+| Path gone after stat | `note_removed`. Announce `Delete` if an index row exists |
 | Same-window same-checkout rename | one `ProtocolMessage::Rename`. Apply is `fs::rename` plus index update |
 | Unpaired or cross-checkout rename | `Removed` plus `Changed`, which is Delete plus Create |
 

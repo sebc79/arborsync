@@ -966,7 +966,21 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         let plan = match event {
             LocalEvent::Changed(path) => self.note_changed(checkout_id, path)?,
             LocalEvent::Metadata(path) => self.note_metadata(checkout_id, path)?,
-            LocalEvent::Removed(path) => HashPlan::send(self.note_removed(checkout_id, &path)?),
+            LocalEvent::Removed(path) => {
+                let (local, central) = {
+                    let checkout = self.checkout(checkout_id)?;
+                    (checkout.local.clone(), checkout.central.clone())
+                };
+                // `git checkout` unlinks and recreates inside one debounce window.
+                // The path is back before this event runs. A delete here is accepted,
+                // the new bytes are `CasReject`ed with no current file, and that
+                // reject sidecars then removes the live file.
+                if stat_still_present(&local, &central, &path)? {
+                    self.note_changed(checkout_id, path)?
+                } else {
+                    HashPlan::send(self.note_removed(checkout_id, &path)?)
+                }
+            }
             LocalEvent::Renamed { from, to } => self.note_renamed(checkout_id, from, to)?,
         };
         self.status.local(None);
