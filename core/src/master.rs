@@ -998,7 +998,6 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             LocalEvent::Changed(path) => self.note_changed(path)?,
             LocalEvent::Metadata(path) => self.note_metadata(path)?,
             LocalEvent::Removed(path) => {
-                // Same window as the slave: a recreate is a write, not a delete.
                 if Self::central_still_present(&self.central_root, &path)? {
                     self.note_changed(path)?
                 } else {
