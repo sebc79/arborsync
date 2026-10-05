@@ -2153,7 +2153,6 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 let walk = found.kind == EntryKind::Dir;
                 self.note_present(path.clone(), found)?;
                 if walk {
-                    // The watcher event names only this directory.
                     self.plan_existing_children(&path)
                 } else {
                     Ok(HashPlan::default())

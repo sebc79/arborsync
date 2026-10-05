@@ -2287,7 +2287,6 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 let mut plan =
                     HashPlan::send(self.announce_live(checkout_id, path.clone(), found)?);
                 if walk {
-                    // The watcher event names only this directory.
                     plan.append(self.plan_existing_children(checkout_id, &path)?);
                 }
                 Ok(plan)
