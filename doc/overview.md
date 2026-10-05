@@ -161,7 +161,7 @@ Tightening `allowed_prefixes` drops those checkouts from interest and leaves the
 
 `arborsync-fuzz` is a separate workspace binary. It starts its own master and slave under a temp directory. A connected master's `status` line stayed `health=busy` on every sampled second while rescan windows and root-report windows alternated. `pending=0` on those lines. The slave line did reach `health=idle`. Seeds 3, 11, and 13 (`--steps 12 --slaves 1`) and seeds 1 and 5 (`--steps 16 --slaves 2`) exited 0 after the fuzzer used that split. Grammar and bad-bulk injection are not generated. See [fuzzing.md](fuzzing.md).
 
-§16 has one open from a later sweep on `main`. A new file inside a new directory stays on the writer. The new directory is on the peer. Both sides then log `health=idle` and `pending=0`, and no bulk bytes move. The replays are seed 8 (`--steps 16 --slaves 1`) and seed 6 (`--steps 16 --slaves 2`).
+A directory create that lands while children are already on disk walks those children into the same `HashPlan`. Seed 8 (`--steps 16 --slaves 1`) and the shrunk seed 6 `nested/z` artifact exit 0.
 
 ## What to read next
 

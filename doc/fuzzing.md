@@ -61,17 +61,19 @@ With `rescan_interval_seconds` at 2 and `status_interval_seconds` at 1, a connec
 
 The fuzzer treats a master line as drained when `pending=0` after a rescan bump. It still requires the slave line to be `health=idle` with `pending=0`. A 30 second wait with neither of those is a hang finding.
 
-## Open from a sweep on main
+## Directory create with children already on disk
 
-These two commands exit 1. Replay of the artifact exits 1 with the same mismatch. `doc/spec.md` §16 records that as open.
+A `Create` can name only the new directory when the file was written while the daemon was stopped, or before the recursive watch was armed. `note_changed` walks children already on disk into the same `HashPlan`.
+
+These commands exit 0 after that walk.
 
 ```bash
 arborsync-fuzz run --bin /path/to/arborsync --seed 8 --steps 16 --slaves 1
-arborsync-fuzz run --bin /path/to/arborsync --seed 6 --steps 16 --slaves 2
+arborsync-fuzz replay --bin /path/to/arborsync findings/mismatch-6.json
 ```
 
-Seed 8 shrinks to a master `put` of `dir/x`. The file stays on the master. The slave has an empty `dir`. Seed 6 shrinks to a slave `put` of `nested/z`. The file stays on that slave. The master has an empty `nested`. In both replays the next `status` second is `health=idle` and `pending=0` on each side, and `bulk_in` and `bulk_out` stay 0.
+The second command is the shrunk seed 6 artifact (`nested/z` on a slave). A fresh `run --seed 6 --steps 16 --slaves 2` can still exit 1 on a struck-key restore parse (`duplicate key quic_idle_timeout_ms`). That is a harness stop, not a tree mismatch.
 
-Seed 7 (`--steps 16`, either `--slaves 1` or `--slaves 2`) exits 1 with `path=dir unexpected` after a non-UTF-8 name under `dir`. The directory is on the master. The non-UTF-8 name stays on the slave. That matches the skip for those names, so it is not an open.
+Seed 7 (`--steps 16`, either `--slaves 1` or `--slaves 2`) exits 1 with `path=dir unexpected` after a non-UTF-8 name under `dir`. The directory is on the master. The non-UTF-8 name stays on the slave. That matches the skip for those names.
 
 Some seeds stop inside the fuzzer and do not judge the trees. Seed 1 with `--steps 32 --slaves 2` exits 2 with `File exists` on `mkdir` of a file. Seed 2 with `--steps 16 --slaves 2` exits 2 with `Is a directory` on a put. Seed 10 with `--steps 16 --slaves 2` does not return within 400s. The slave being mutated stops logging while that disk op is still running.
