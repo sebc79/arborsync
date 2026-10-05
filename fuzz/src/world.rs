@@ -48,7 +48,6 @@ struct Timespec {
     tv_nsec: i64,
 }
 
-/// Directory this process created for one run.
 pub(crate) struct PrivateRoot {
     path: PathBuf,
 }
@@ -59,35 +58,30 @@ impl PrivateRoot {
     }
 }
 
-/// `127.0.0.1` and a port the kernel assigned. Port 0 cannot be represented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BoundAddr {
     addr: SocketAddr,
 }
 
 impl BoundAddr {
+    fn new(addr: SocketAddr) -> Option<Self> {
+        if addr.port() == 0 || addr.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+            return None;
+        }
+        Some(Self { addr })
+    }
+
     pub(crate) fn addr(self) -> SocketAddr {
         self.addr
     }
 }
 
-/// `listening on <ip>:<port>` from the master log.
-/// `None` when the line is not that sentence, the port is 0, or the
-/// address is not `127.0.0.1`.
 pub(crate) fn parse_listening(line: &str) -> Option<BoundAddr> {
     let rest = line.split_once("listening on ")?.1;
     let token = rest.split_whitespace().next()?.trim().trim_end_matches('.');
-    let addr: SocketAddr = token.parse().ok()?;
-    if addr.port() == 0 {
-        return None;
-    }
-    if addr.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
-        return None;
-    }
-    Some(BoundAddr { addr })
+    BoundAddr::new(token.parse().ok()?)
 }
 
-/// One daemon status line. `None` when the line is not a status line.
 pub(crate) fn parse_status(line: &str) -> Option<StatusSnap> {
     if !line.contains("status ") || !line.contains("health=") || line.contains("status slave=") {
         return None;
@@ -131,9 +125,6 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(1)
 }
 
-/// Kills every recorded daemon whose `owner` pid is dead, then deletes
-/// that root. A live owner is a concurrent run and is skipped. Safe to
-/// call twice. Never returns a root for the caller to reuse.
 pub(crate) fn reap_abandoned() -> Result<(), HarnessError> {
     let temp = std::env::temp_dir();
     let entries = fs::read_dir(&temp).map_err(|err| {
@@ -221,7 +212,6 @@ pub(crate) enum Phase {
     Closed,
 }
 
-/// Capability returned by [`World::freeze`]. Not a path.
 pub(crate) struct FreezeToken {
     actor: Actor,
 }
@@ -271,7 +261,6 @@ pub(crate) struct World {
     frozen: BTreeSet<Actor>,
 }
 
-/// The product came up, or it already failed and the world is still closable.
 pub(crate) enum Boot {
     Up,
     Failed(Finding),
@@ -283,8 +272,6 @@ pub(crate) enum Wait {
 }
 
 impl World {
-    /// Mint a new root, write keys with `arborsync keygen`, and write the
-    /// master TOML. Does not spawn and does not reopen an existing root.
     pub(crate) fn claim(bin: &Bin, layout: &Layout) -> Result<Self, HarnessError> {
         let root = create_root()?;
         let owner = std::process::id();
@@ -418,7 +405,7 @@ impl World {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn log_path(&self, actor: Actor) -> &Path {
         match actor {
             Actor::Master => &self.master_log,
@@ -426,7 +413,6 @@ impl World {
         }
     }
 
-    /// Spawn the master, parse [`BoundAddr`], write each slave TOML, spawn the slaves.
     pub(crate) fn spawn(&mut self) -> Result<Boot, HarnessError> {
         if self.phase != Phase::Claimed {
             return Err(HarnessError::Sandbox("spawn requires a claimed world".into()));
@@ -544,10 +530,6 @@ impl World {
         }
     }
 
-    /// Block until each thawed daemon has logged a rescan after entry and
-    /// `pending=0`, or 30s. The slave line must also be `health=idle`.
-    /// The master line may stay `health=busy` while that window counts a
-    /// rescan or a root report.
     pub(crate) fn wait_idle(&mut self) -> Result<Wait, HarnessError> {
         self.require_live()?;
         let _ = self.pump_logs()?;
@@ -654,8 +636,6 @@ impl World {
         Ok(())
     }
 
-    /// SIGKILL every recorded pid, fsync the closed mark, then stay closed.
-    /// A second call is a no-op.
     pub(crate) fn close(&mut self) {
         if self.phase == Phase::Closed {
             return;

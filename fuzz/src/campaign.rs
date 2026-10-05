@@ -12,12 +12,35 @@ pub(crate) enum Shrink {
 }
 
 pub(crate) struct Drive {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub intent: Intent,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub observed: Option<oracle::Observed>,
     pub finding: Option<Finding>,
     pub steps_ran: usize,
+}
+
+impl Drive {
+    fn finish(
+        intent: Intent,
+        observed: Option<oracle::Observed>,
+        finding: Option<Finding>,
+        steps_ran: usize,
+    ) -> Self {
+        #[cfg(not(test))]
+        {
+            drop(intent);
+            drop(observed);
+        }
+        Self {
+            #[cfg(test)]
+            intent,
+            #[cfg(test)]
+            observed,
+            finding,
+            steps_ran,
+        }
+    }
 }
 
 pub(crate) fn drive(world: &mut World, schedule: &Schedule) -> Result<Drive, HarnessError> {
@@ -54,33 +77,18 @@ pub(crate) fn drive(world: &mut World, schedule: &Schedule) -> Result<Drive, Har
             Step::World(op) => match world.probe(op)? {
                 Boot::Up => intent.push(oracle::Event::World(op.clone())),
                 Boot::Failed(found) => {
-                    return Ok(Drive {
-                        intent,
-                        observed,
-                        finding: Some(found),
-                        steps_ran,
-                    });
+                    return Ok(Drive::finish(intent, observed, Some(found), steps_ran));
                 }
             },
             Step::Quiesce => match world.wait_idle()? {
                 Wait::Idle(_) => intent.push(oracle::Event::Quiesce),
                 Wait::Failed(found) => {
-                    return Ok(Drive {
-                        intent,
-                        observed,
-                        finding: Some(found),
-                        steps_ran,
-                    });
+                    return Ok(Drive::finish(intent, observed, Some(found), steps_ran));
                 }
             },
             Step::Settle => match world.wait_idle()? {
                 Wait::Failed(found) => {
-                    return Ok(Drive {
-                        intent,
-                        observed,
-                        finding: Some(found),
-                        steps_ran,
-                    });
+                    return Ok(Drive::finish(intent, observed, Some(found), steps_ran));
                 }
                 Wait::Idle(obs) => {
                     intent.push(oracle::Event::Settle);
@@ -88,24 +96,19 @@ pub(crate) fn drive(world: &mut World, schedule: &Schedule) -> Result<Drive, Har
                     epoch += 1;
                     let projection = project(&intent);
                     if let Some(found) = judge(&projection, &obs) {
-                        return Ok(Drive {
-                            intent,
-                            observed: Some(obs),
-                            finding: Some(found),
-                            steps_ran,
-                        });
+                        return Ok(Drive::finish(intent, Some(obs), Some(found), steps_ran));
                     }
                     observed = Some(obs);
                 }
             },
         }
     }
-    Ok(Drive {
+    Ok(Drive::finish(
         intent,
         observed,
-        finding: None,
-        steps_ran: schedule.steps().len(),
-    })
+        None,
+        schedule.steps().len(),
+    ))
 }
 
 enum Run {

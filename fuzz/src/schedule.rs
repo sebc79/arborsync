@@ -65,7 +65,6 @@ pub struct Limits {
     slaves: SlaveCount,
 }
 
-/// Invariant: the inner value is 1 or 2.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SlaveCount(NonZeroU8);
 
@@ -110,7 +109,6 @@ pub struct Schedule {
     steps: Vec<Step>,
 }
 
-/// Slave 0 always mirrors `/src`. A second slave is either `/src` or `/src/nested`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Layout {
     One,
@@ -138,9 +136,7 @@ pub(crate) enum Step {
     Thaw(Actor),
     Disk(DiskOp),
     World(WorldOp),
-    /// Wait until every thawed daemon is idle. Does not judge.
     Quiesce,
-    /// Quiesce, then compare the disks to [`crate::oracle::project`].
     Settle,
 }
 
@@ -159,7 +155,6 @@ impl Actor {
     }
 }
 
-/// Invariant: the index is less than the schedule's slave count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SlaveIx(u8);
 
@@ -183,9 +178,6 @@ impl SlaveIx {
     }
 }
 
-/// A relative path inside one tree.
-/// Invariant: non-empty; each component is UTF-8, not empty, not `.` or
-/// `..`, and contains no `/`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct RelPath {
     parts: Vec<String>,
@@ -250,7 +242,6 @@ impl MtimeNs {
     }
 }
 
-/// Filesystem writes. The actor must be frozen before the step runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DiskOp {
     Put {
@@ -272,7 +263,6 @@ pub(crate) enum DiskOp {
         path: RelPath,
         mode: UnixMode,
     },
-    /// `target` is the link text. A missing target is a valid dangling symlink.
     Symlink {
         actor: Actor,
         path: RelPath,
@@ -304,11 +294,7 @@ pub(crate) enum DiskOp {
         from: RelPath,
         to: RelPath,
     },
-    /// Intermediate symlink whose target is the yard: inside the private
-    /// root, outside every replicated tree.
     EscapeLink { actor: Actor, path: RelPath },
-    /// Clear user read and execute. The epoch that contains this op is
-    /// [`crate::oracle::Projection::UnspecifiedIo`].
     Deny { actor: Actor, path: RelPath },
 }
 
@@ -338,17 +324,13 @@ pub(crate) enum SpecialFile {
     Device,
 }
 
-/// Steps that are not a write into a frozen tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WorldOp {
     Grammar(GrammarFault),
-    /// One real QUIC transfer of a body whose hash will not match `path`.
     BadBulk { path: RelPath },
     /// Rewrite the live master TOML with a struck key. Mode stays `0600`.
     /// The process must stay on the old root.
     StruckReload,
-    /// `arborsync restore` without `--pretend`. The master is stopped.
-    /// The source is the fuzzer-owned copy sealed at `Settle` number `epoch`.
     Restore { epoch: u32 },
 }
 
@@ -367,7 +349,6 @@ pub(crate) enum GrammarFault {
 
 impl Schedule {
     /// Deterministic. The result passes [`Schedule::validate`].
-    /// One weighted draw over the op enums, not a catalog of named scenarios.
     /// Does not emit [`WorldOp::Grammar`] or [`WorldOp::BadBulk`].
     pub fn from_seed(seed: u64, limits: Limits) -> Self {
         let schedule = generate(seed, &limits);
@@ -439,7 +420,6 @@ impl Schedule {
         Self::try_from_parts(self.seed, self.layout.clone(), self.steps[..len].to_vec())
     }
 
-    /// Structural invariants listed on [`Schedule`]. Both constructors call this.
     pub(crate) fn validate(&self) -> Result<(), HarnessError> {
         let slaves = self.layout.slave_count();
         let mut frozen = BTreeSet::new();
@@ -625,10 +605,8 @@ fn generate(seed: u64, limits: &Limits) -> Schedule {
         if !frozen.is_empty() {
             menu.push((3, Gen::Thaw));
         }
-        if !frozen.is_empty() && remaining > frozen.len() {
-            if deny {
-                // The epoch already has a deny. No further disk op.
-            } else if disk {
+        if !frozen.is_empty() && remaining > frozen.len() && !deny {
+            if disk {
                 menu.extend([
                     (5, Gen::Put),
                     (2, Gen::Retouch),

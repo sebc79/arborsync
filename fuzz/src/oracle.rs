@@ -7,7 +7,6 @@ use crate::schedule::{
 };
 use crate::types::Finding;
 
-/// Append-only log of what the fuzzer did. Daemons never write it.
 pub(crate) struct Intent {
     layout: Layout,
     events: Vec<Event>,
@@ -24,13 +23,9 @@ pub(crate) enum Event {
     Settle,
 }
 
-/// What [`crate::world::World::apply`] saw before thaw.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LocalSnap {
     Applied(SnapBody),
-    /// `mknod` returned `EPERM`, or the live path lacked the op's precondition.
-    /// [`project`] ignores this op, except [`DiskOp::Deny`], which still opens
-    /// an unspecified epoch.
     Skipped,
 }
 
@@ -59,12 +54,8 @@ pub(crate) enum SnapBody {
     Dir {
         mode: UnixMode,
         mtime: MtimeNs,
-        /// Set when this directory itself was mkdir'd or chmod'd.
-        /// Child-only edits leave this false, and [`judge`] then skips
-        /// mode and mtime.
         meta_authoritative: bool,
     },
-    /// Equality is the target bytes. Disk mode is not compared.
     Symlink { target: Vec<u8> },
     Residue(Residue),
     Absent,
@@ -103,7 +94,6 @@ pub(crate) struct Sidecar {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Observed {
     pub master: ActorView,
-    /// Length equals the layout's slave count.
     pub slaves: Vec<ActorView>,
     pub yard: [u8; 32],
     pub dead: Vec<Actor>,
@@ -135,11 +125,9 @@ pub(crate) enum Health {
     Other(String),
 }
 
-/// Spec projection of an [`Intent`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Projection {
     Determined(Determined),
-    /// A `Deny` landed since the previous settle. Tree bytes are not asserted.
     UnspecifiedIo { yard: [u8; 32] },
 }
 
@@ -148,8 +136,7 @@ pub(crate) struct Determined {
     pub master: TreeSnap,
     pub master_error: ErrorExpect,
     pub slaves: Vec<SlaveExpect>,
-    /// Yard digest captured at claim. A difference is an escape.
-    pub yard: [u8; 32],
+        pub yard: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,7 +166,6 @@ impl Intent {
         self.yard = yard;
     }
 
-    /// The only way to extend the log.
     pub(crate) fn push(&mut self, event: Event) {
         self.events.push(event);
     }
@@ -244,7 +230,6 @@ impl Fold {
 
 use std::collections::BTreeMap as FoldMap;
 
-/// Fold `intent` into the trees the spec requires at the last event.
 pub(crate) fn project(intent: &Intent) -> Projection {
     let mut fold = Fold::new(&intent.layout, intent.yard);
     let mut closed_deny = false;
@@ -843,7 +828,6 @@ fn nested(layout: &Layout, slave: usize) -> bool {
     ) && slave == 1
 }
 
-/// `None` means the observation matches the projection.
 pub(crate) fn judge(projection: &Projection, observed: &Observed) -> Option<Finding> {
     if let Some(actor) = observed.dead.first() {
         return Some(Finding::Crash {

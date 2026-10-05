@@ -79,7 +79,6 @@ pub(crate) fn main_from_env() -> i32 {
     }
 }
 
-/// `0` clean, `1` finding, `2` harness error. Prints the seed before any spawn.
 pub(crate) fn main_result(cmd: Command) -> i32 {
     match cmd {
         Command::Run {
