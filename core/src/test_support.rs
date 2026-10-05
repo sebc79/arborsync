@@ -522,6 +522,7 @@ impl SyncSandbox {
             rescan_interval_seconds: 60,
             status_interval_seconds: 0,
             peer_socket: None,
+            peer_socket_mode: None,
             checkouts,
             tune: TuneSpec::default(),
         };

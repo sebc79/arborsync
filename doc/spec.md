@@ -153,7 +153,7 @@ Handshake: Noise `XX_25519_ChaChaPoly_BLAKE2s` via `quinn-hyphae`. After XX, eac
 - Master key: add the new public key to every slave’s `master_public_keys` first, rotate the master key, then remove the old pin.
 
 **Reloadable** without restart: log level, rate limits, `max_connections` (new accepts only), `max_checkouts_per_slave` (enforced on the next `Subscribe`; live interest is not pruned), ACL rows (add/remove slaves, prefixes, extra public keys), slave `master_public_keys`, slave `checkouts` (add/remove per §3), watcher debounce, rescan interval, status interval, and `[tune]` knobs (`hashing.workers` on both roles; slave `fulfill_parked.inflight`).  
-**Not reloadable:** `listen_addr`, `db_path`, `central_root`, key *paths*, `master_addr`, slave `slave_id`, slave `peer_socket`.
+**Not reloadable:** `listen_addr`, `db_path`, `central_root`, key *paths*, `master_addr`, slave `slave_id`, slave `peer_socket`, slave `peer_socket_mode`.
 
 ---
 
@@ -407,7 +407,7 @@ The report is the slave's own pace and queue depth. Pace is `idle`, `busy`, or `
 
 The directory is `Waiting` until this link has received one. `Current` lists every other ACL id and may be empty. The local slave is omitted. An id that has never subscribed is disconnected, idle, depth 0, and not fresh. Disconnect keeps the last pace and depth, clears presence, and is not fresh. Fresh is true only while the card is connected and the master accepted a report within three report periods (15 seconds). Silence does not change pace.
 
-A co-located client reads one snapshot from the slave's unix socket and then the connection closes. That frame uses `aspv`, not `asp1`. The query does not touch the status ledger.
+A co-located client reads one snapshot from the slave's unix socket and then the connection closes. That frame uses `aspv`, not `asp1`. The query does not touch the status ledger. The socket mode defaults to `0660` so a process in the slave's group can connect. `peer_socket_mode` is an octal string (`600` restores owner-only). Connecting requires write permission on the socket.
 
 ---
 
@@ -513,6 +513,7 @@ watcher_debounce_ms = 200
 rescan_interval_seconds = 60
 status_interval_seconds = 5
 # peer_socket = "/var/cache/arborsync/peers.sock"  # omitted: peers.sock beside db_path
+# peer_socket_mode = "660"                        # octal, omitted means 660
 
 # [tune.hashing]
 # workers = "nproc"
@@ -669,7 +670,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §5 post-commit Merkle check | Debug builds panic when a directory `commit_leaves_with` just wrote does not match a recompute from its children. `arborsync recompute` rewrites the master index from `/`. |
 | ✅ | §9 / item 5 whole-file RAM | A whole-file body is written to `.arborsync-tmp` one chunk at a time. `StagedContent::verify` and `BulkStage::finish` hash that file with `hash_file`. A delta snapshots the basis to tmp and patches onto another tmp file. `read_bulk` still concatenates for the in-memory transport. |
 | ✅ | Reload path at the binary | `tests/cli.rs` sends SIGHUP after an ACL row is removed and waits for `acl reload closed` and `unknown static key from`. It rewrites the slave config and waits for `resubscribe after reload` from the config watch. |
-| ✅ | §11 peer directory query | Slave `peer_socket` (default `peers.sock` beside `db_path`, mode `0600`, restart-required) serves one `PeerView` per connection. The master publishes a directory on the control stream. Pace stays the last report. Fresh is three report periods. Failed health is `stuck` on the report and `failed` on the status line. No metrics port. |
+| ✅ | §11 peer directory query | Slave `peer_socket` (default `peers.sock` beside `db_path`, mode `0660` or `peer_socket_mode`, restart-required) serves one `PeerView` per connection. The master publishes a directory on the control stream. Pace stays the last report. Fresh is three report periods. Failed health is `stuck` on the report and `failed` on the status line. No metrics port. |
 
 Review findings from tree `37f8671` are closed. |
 

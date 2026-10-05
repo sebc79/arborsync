@@ -73,6 +73,9 @@ pub struct SlaveConfig {
     /// Unix socket for the co-located peer query. Omitted means `peers.sock` beside `db_path`.
     #[serde(default)]
     pub peer_socket: Option<String>,
+    /// Octal mode for `peer_socket`. Omitted means `660`.
+    #[serde(default)]
+    pub peer_socket_mode: Option<String>,
     #[serde(default)]
     pub checkouts: Vec<CheckoutConfig>,
     #[serde(default)]
@@ -191,6 +194,8 @@ pub enum ConfigError {
     BadWorkers { value: String },
     #[error("{field} is not valid on {role}")]
     TuneNotOnRole { field: String, role: &'static str },
+    #[error("peer_socket_mode {value} is not an octal mode 000..=777")]
+    BadSocketMode { value: String },
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -261,6 +266,7 @@ pub struct LoadedSlave {
     rescan_interval_seconds: u64,
     status_interval_seconds: u64,
     peer_socket: PathBuf,
+    peer_socket_mode: u32,
     max_checkouts_per_slave: u32,
     tune: Tune,
 }
@@ -506,6 +512,10 @@ impl LoadedSlave {
         &self.peer_socket
     }
 
+    pub fn peer_socket_mode(&self) -> u32 {
+        self.peer_socket_mode
+    }
+
     pub fn max_checkouts_per_slave(&self) -> u32 {
         self.max_checkouts_per_slave
     }
@@ -530,6 +540,9 @@ impl LoadedSlave {
         }
         if self.peer_socket != next.peer_socket {
             fields.push("peer_socket".into());
+        }
+        if self.peer_socket_mode != next.peer_socket_mode {
+            fields.push("peer_socket_mode".into());
         }
         fields.sort();
         if !fields.is_empty() {
@@ -694,6 +707,7 @@ fn project_slave(config: SlaveConfig) -> Result<LoadedSlave, ConfigError> {
             .unwrap_or_else(|| Path::new("/"))
             .join("peers.sock"),
     };
+    let peer_socket_mode = check_socket_mode(config.peer_socket_mode.as_deref())?;
     check_log_level(&config.log_level)?;
     check_debounce(config.watcher_debounce_ms)?;
     check_rescan_interval(config.rescan_interval_seconds)?;
@@ -753,6 +767,7 @@ fn project_slave(config: SlaveConfig) -> Result<LoadedSlave, ConfigError> {
         rescan_interval_seconds: config.rescan_interval_seconds,
         status_interval_seconds: config.status_interval_seconds,
         peer_socket,
+        peer_socket_mode,
         max_checkouts_per_slave: config.max_checkouts_per_slave,
         tune,
     })
@@ -860,6 +875,26 @@ fn check_rescan_interval(seconds: u64) -> Result<(), ConfigError> {
     } else {
         Ok(())
     }
+}
+
+fn check_socket_mode(raw: Option<&str>) -> Result<u32, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(0o660);
+    };
+    if raw.is_empty() || raw.len() > 4 || !raw.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return Err(ConfigError::BadSocketMode {
+            value: raw.to_string(),
+        });
+    }
+    let mode = u32::from_str_radix(raw, 8).map_err(|_| ConfigError::BadSocketMode {
+        value: raw.to_string(),
+    })?;
+    if mode > 0o777 {
+        return Err(ConfigError::BadSocketMode {
+            value: raw.to_string(),
+        });
+    }
+    Ok(mode)
 }
 
 fn check_status_interval(seconds: u64) -> Result<(), ConfigError> {

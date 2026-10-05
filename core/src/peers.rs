@@ -154,6 +154,7 @@ fn read_exact(stream: &mut UnixStream, buf: &mut [u8]) -> Result<(), PeerError> 
 
 pub(crate) fn serve_peers(
     socket: PathBuf,
+    mode: u32,
     rx: tokio::sync::watch::Receiver<PeerView>,
 ) -> io::Result<tokio::task::JoinHandle<()>> {
     if let Ok(meta) = fs::symlink_metadata(&socket) {
@@ -163,7 +164,7 @@ pub(crate) fn serve_peers(
     }
     let listener = std::os::unix::net::UnixListener::bind(&socket)?;
     let mut perms = fs::metadata(&socket)?.permissions();
-    perms.set_mode(0o600);
+    perms.set_mode(mode & 0o777);
     fs::set_permissions(&socket, perms)?;
     listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(listener)?;
@@ -731,9 +732,9 @@ mod tests {
             fresh: false,
         }]);
         let (tx, rx) = tokio::sync::watch::channel(PeerView::Waiting);
-        let serve = serve_peers(sock.clone(), rx).unwrap();
+        let serve = serve_peers(sock.clone(), 0o660, rx).unwrap();
         let mode = fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        assert_eq!(mode, 0o660);
         let waiting = tokio::task::spawn_blocking({
             let sock = sock.clone();
             move || query_peers(&sock)
