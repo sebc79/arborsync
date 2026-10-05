@@ -982,6 +982,49 @@ fn a_local_edit_the_master_did_not_write_fans_out() {
 }
 
 #[test]
+fn a_remove_event_for_a_recreated_central_file_fans_out_the_new_bytes() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(BACKUP, subscribe("backup-1", &[("bak", "/")]))
+        .unwrap();
+
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("src/edit.txt", b"old");
+    master
+        .note_local(LocalEvent::Changed(p("/src/edit.txt")))
+        .unwrap();
+    let _ = master.poll(BACKUP);
+    let old = master.meta(&p("/src/edit.txt")).unwrap().unwrap();
+
+    let host = sandbox.central_root().join("src/edit.txt");
+    std::fs::remove_file(&host).unwrap();
+    std::fs::write(&host, b"new").unwrap();
+    master
+        .note_local(LocalEvent::Removed(p("/src/edit.txt")))
+        .unwrap();
+
+    let pushed = master.poll(BACKUP);
+    assert_eq!(pushed.len(), 1);
+    match &pushed[0] {
+        ProtocolMessage::FileAnnounce {
+            path, new, basis, ..
+        } => {
+            assert_eq!(path, &p("/src/edit.txt"));
+            assert_eq!(new.content_hash, hash_bytes(b"new"));
+            assert_eq!(*basis, Some(file_node(&old)));
+        }
+        other => panic!("expected FileAnnounce of the recreated file, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&host).unwrap(), b"new");
+    assert_eq!(
+        master.meta(&p("/src/edit.txt")).unwrap().unwrap().content_hash,
+        hash_bytes(b"new")
+    );
+}
+
+#[test]
 fn handle_rename_moves_the_file_accepts_both_paths_and_fans_out() {
     let sandbox = SyncSandbox::new();
     let mut master = two_slave_master(&sandbox, MemoryContent::new());

@@ -998,8 +998,12 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             LocalEvent::Changed(path) => self.note_changed(path)?,
             LocalEvent::Metadata(path) => self.note_metadata(path)?,
             LocalEvent::Removed(path) => {
-                self.note_removed(&path)?;
-                HashPlan::default()
+                if Self::central_still_present(&self.central_root, &path)? {
+                    self.note_changed(path)?
+                } else {
+                    self.note_removed(&path)?;
+                    HashPlan::default()
+                }
             }
             LocalEvent::Renamed { from, to } => self.note_renamed(from, to)?,
         };
@@ -2280,6 +2284,19 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             want_hash,
             signature,
         })
+    }
+
+    fn central_still_present(root: &Path, path: &CanonicalPath) -> Result<bool, MasterError> {
+        let host = canonical_to_host(root, path);
+        match fs::symlink_metadata(&host) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                log::warn!("keeping {}: permission denied", host.display());
+                Ok(true)
+            }
+            Err(err) => Err(MasterError::io(&host)(err)),
+        }
     }
 
     fn note_removed(&mut self, path: &CanonicalPath) -> Result<(), MasterError> {
