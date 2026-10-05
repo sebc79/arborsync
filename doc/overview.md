@@ -159,6 +159,8 @@ Tightening `allowed_prefixes` drops those checkouts from interest and leaves the
 
 `core/tests/scenarios.rs` names the §16.8 cases and drives them through `handle` and `note_local` on `MemoryStorage`. `src/watch.rs` starts a real `notify-debouncer-full` thread. `tests/sync.rs` starts master and slave over QUIC and asserts a post-connect write crosses.
 
+`arborsync-fuzz` is a separate workspace binary. It starts its own master and slave under a temp directory. A connected master's `status` line stayed `health=busy` on every sampled second while rescan windows and root-report windows alternated. `pending=0` on those lines. The slave line did reach `health=idle`. Seeds 3, 11, and 13 (`--steps 12 --slaves 1`) and seeds 1 and 5 (`--steps 16 --slaves 2`) exited 0 after the fuzzer used that split. Grammar and bad-bulk injection are not generated. See [fuzzing.md](fuzzing.md).
+
 ## What to read next
 
 | If you need | Open |
@@ -174,3 +176,4 @@ Tightening `allowed_prefixes` drops those checkouts from interest and leaves the
 | Frames, XX, streams | [`quic-transport.md`](quic-transport.md) |
 | TOML, reload, env | [`configuration.md`](configuration.md) |
 | Restore a prefix | [`restoring.md`](restoring.md) |
+| Run a private campaign | [`fuzzing.md`](fuzzing.md) |

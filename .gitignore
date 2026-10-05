@@ -1,5 +1,6 @@
 .DS_Store
 .idea/
+.arena/
 /target
 /result
 **/*.rs.bk

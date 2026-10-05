@@ -1,0 +1,19 @@
+[package]
+name = "arborsync-fuzz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Schedule runner for live ArborSync master and slave processes"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "arborsync-fuzz"
+path = "src/main.rs"
+
+[dependencies]
+arborsync-core.workspace = true
+clap.workspace = true
+thiserror.workspace = true
