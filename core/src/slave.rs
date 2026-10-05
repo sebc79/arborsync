@@ -17,7 +17,7 @@ use crate::merkle::{DirChild, file_node};
 use crate::meta::{self, EntryKind, FileMetadata, Inspected};
 use crate::path::{
     CanonicalPath, EntryName, PathError, canonical_to_host, confine_host, conflict_sidecar_path,
-    join_central, local_paths_overlap, strip_central,
+    is_reserved_root_entry, join_central, local_paths_overlap, strip_central,
 };
 use crate::peers::{self, PeerView, QueueDepth};
 use crate::protocol::{BulkEncoding, BulkHeader, CheckoutRef, ProtocolMessage, RestoreEpoch};
@@ -2282,11 +2282,16 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         let host = canonical_to_host(&local, &relative);
         let previous = self.meta(checkout_id, &path)?;
         match meta::inspect_for_hash(&host, previous.as_ref()).map_err(SlaveError::io(&host))? {
-            Inspected::Ready(found) => Ok(HashPlan::send(self.announce_live(
-                checkout_id,
-                path,
-                found,
-            )?)),
+            Inspected::Ready(found) => {
+                let walk = found.kind == EntryKind::Dir;
+                let mut plan =
+                    HashPlan::send(self.announce_live(checkout_id, path.clone(), found)?);
+                if walk {
+                    // The watcher event names only this directory.
+                    plan.append(self.plan_existing_children(checkout_id, &path)?);
+                }
+                Ok(plan)
+            }
             Inspected::Absent => Ok(HashPlan::send(self.note_removed(checkout_id, &path)?)),
             Inspected::NeedHash(host) => Ok(self.enqueue_hash(HashNeed {
                 key: HashKey::Checkout {
@@ -2297,6 +2302,70 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 previous,
             })),
         }
+    }
+
+    fn plan_existing_children(
+        &mut self,
+        checkout_id: &str,
+        dir: &CanonicalPath,
+    ) -> Result<HashPlan, SlaveError> {
+        let (local, central) = {
+            let checkout = self.checkout(checkout_id)?;
+            (checkout.local.clone(), checkout.central.clone())
+        };
+        let mut plan = HashPlan::default();
+        let mut pending = vec![dir.clone()];
+        while let Some(dir) = pending.pop() {
+            let relative = strip_central(&central, &dir)?;
+            let host = canonical_to_host(&local, &relative);
+            let entries = match fs::read_dir(&host) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                    log::warn!("skipping {}: permission denied", host.display());
+                    continue;
+                }
+                Err(err) => return Err(SlaveError::io(&host)(err)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(SlaveError::io(&host))?;
+                let raw = entry.file_name();
+                let Some(name) = raw.to_str() else {
+                    log::warn!("skipping non-UTF-8 name under {}", host.display());
+                    continue;
+                };
+                if relative.as_str() == "/" && is_reserved_root_entry(name) {
+                    continue;
+                }
+                let child = join_central(&dir, name)?;
+                let child_rel = strip_central(&central, &child)?;
+                let host_child = canonical_to_host(&local, &child_rel);
+                let previous = self.meta(checkout_id, &child)?;
+                match meta::inspect_for_hash(&host_child, previous.as_ref())
+                    .map_err(SlaveError::io(&host_child))?
+                {
+                    Inspected::Ready(found) => {
+                        let is_dir = found.kind == EntryKind::Dir;
+                        plan.send
+                            .extend(self.announce_live(checkout_id, child.clone(), found)?);
+                        if is_dir {
+                            pending.push(child);
+                        }
+                    }
+                    Inspected::NeedHash(host) => {
+                        plan.append(self.enqueue_hash(HashNeed {
+                            key: HashKey::Checkout {
+                                id: checkout_id.into(),
+                                path: child,
+                            },
+                            host,
+                            previous,
+                        }));
+                    }
+                    Inspected::Absent => {}
+                }
+            }
+        }
+        Ok(plan)
     }
 
     fn announce_new_to_index(
