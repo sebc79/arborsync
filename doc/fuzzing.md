@@ -60,3 +60,18 @@ These commands exited 0 after the status check below was in place.
 With `rescan_interval_seconds` at 2 and `status_interval_seconds` at 1, a connected master's `status 1s` line stayed `health=busy` on every sampled second. The busy windows alternated between `rescan=1` and `root=2`. `pending=0` on those lines. The slave's own `status 1s` line did reach `health=idle` with every counter at 0.
 
 The fuzzer treats a master line as drained when `pending=0` after a rescan bump. It still requires the slave line to be `health=idle` with `pending=0`. A 30 second wait with neither of those is a hang finding.
+
+## Open from a sweep on main
+
+These two commands exit 1. Replay of the artifact exits 1 with the same mismatch. `doc/spec.md` §16 records that as open.
+
+```bash
+arborsync-fuzz run --bin /path/to/arborsync --seed 8 --steps 16 --slaves 1
+arborsync-fuzz run --bin /path/to/arborsync --seed 6 --steps 16 --slaves 2
+```
+
+Seed 8 shrinks to a master `put` of `dir/x`. The file stays on the master. The slave has an empty `dir`. Seed 6 shrinks to a slave `put` of `nested/z`. The file stays on that slave. The master has an empty `nested`. In both replays the next `status` second is `health=idle` and `pending=0` on each side, and `bulk_in` and `bulk_out` stay 0.
+
+Seed 7 (`--steps 16`, either `--slaves 1` or `--slaves 2`) exits 1 with `path=dir unexpected` after a non-UTF-8 name under `dir`. The directory is on the master. The non-UTF-8 name stays on the slave. That matches the skip for those names, so it is not an open.
+
+Some seeds stop inside the fuzzer and do not judge the trees. Seed 1 with `--steps 32 --slaves 2` exits 2 with `File exists` on `mkdir` of a file. Seed 2 with `--steps 16 --slaves 2` exits 2 with `Is a directory` on a put. Seed 10 with `--steps 16 --slaves 2` does not return within 400s. The slave being mutated stops logging while that disk op is still running.
