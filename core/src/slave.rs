@@ -32,9 +32,10 @@ pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, Who
 
 pub fn serve_peers(
     socket: PathBuf,
+    mode: u32,
     rx: tokio::sync::watch::Receiver<PeerView>,
 ) -> io::Result<tokio::task::JoinHandle<()>> {
-    peers::serve_peers(socket, rx)
+    peers::serve_peers(socket, mode, rx)
 }
 pub use crate::crawl::{RescanStat, RescanStated};
 
@@ -487,6 +488,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
 
     pub fn peer_socket(&self) -> &std::path::Path {
         self.cfg.peer_socket()
+    }
+
+    pub fn peer_socket_mode(&self) -> u32 {
+        self.cfg.peer_socket_mode()
     }
 
     pub fn crawl_pending(&self) -> bool {

@@ -71,7 +71,7 @@ watcher_debounce_ms = 200
 rescan_interval_seconds = 60          # at least 1
 status_interval_seconds = 5           # 0 disables, max 3600
 # peer_socket = "/var/cache/arborsync/peers.sock"
-# omitted: peers.sock beside db_path. Mode 0600. Not a metrics port.
+# peer_socket_mode = "660"              # octal. Omitted means 660. Not a metrics port.
 
 # [tune.hashing]
 # workers = "nproc"                   # or 1–256. Omit the table for this default.
@@ -88,7 +88,7 @@ A `/` checkout on `dev-alice` is rejected (her ACL is `/src` and `/docs`). Full-
 
 Required: `slave_id`, `master_addr`, `slave_key_path`, `master_public_keys`, `checkouts` (may be empty: the process idles until the config watch adds some).
 
-`peer_socket` is optional. Omitted, the slave binds `peers.sock` beside `db_path`. The file is mode `0600`. A leftover socket at that path is removed before bind. Bind failure is logged and sync continues. The socket is not a metrics port. Changing the path requires a restart.
+`peer_socket` is optional. Omitted, the slave binds `peers.sock` beside `db_path`. `peer_socket_mode` is an octal string. Omitted, the mode is `0660`, so the slave's group can connect. `600` is owner-only. A client needs write permission on the socket. A leftover socket at that path is removed before bind. Bind failure is logged and sync continues. The socket is not a metrics port. Changing the path or the mode requires a restart.
 
 `local` paths are created if missing (`0o755`) and canonicalized at `Slave::open`. Parse checks tilde-expanded paths and `canonicalize`s a local that already exists. `Slave::open` and checkout-add reload reject `LocalOverlap` on the resolved paths. `id` unique. `central` absolute canonical (see `subscriptions.md`).
 
@@ -120,7 +120,7 @@ Both knobs apply on SIGHUP. Hash admission and leftover `kick` read `Loaded*` af
 
 **Applied live:** `log_level`, `max_connection_attempts_per_minute`, `max_connections` (affects new accepts), `[[slaves]]` (add/remove rows, change `allowed_prefixes`, add rotation keys), slave `master_public_keys`, slave `checkouts` (add/remove per `spec.md` §3), debounce, rescan, and status intervals (the next window uses the new value), `[tune.hashing].workers`, and slave `[tune.fulfill_parked].inflight`. Watcher restart is only for debounce or rescan. A status interval change is read on the next tick. A worker or inflight change is read on the next hash admission or leftover `kick`.
 
-**Requires restart:** `listen_addr`, `db_path`, `central_root`, `master_addr`, `*_key_path`, slave `slave_id`, and slave `peer_socket`.
+**Requires restart:** `listen_addr`, `db_path`, `central_root`, `master_addr`, `*_key_path`, slave `slave_id`, slave `peer_socket`, and slave `peer_socket_mode`.
 
 SIGHUP reloads this file. It does not start reconcile.
 

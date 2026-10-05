@@ -294,9 +294,9 @@ async fn query_peers_on_the_slave_socket_returns_a_literal_view() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("peers.sock");
     let (tx, rx) = tokio::sync::watch::channel(PeerView::Waiting);
-    let _serve = slave::serve_peers(sock.clone(), rx).unwrap();
+    let _serve = slave::serve_peers(sock.clone(), 0o640, rx).unwrap();
     let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600);
+    assert_eq!(mode, 0o640);
 
     let sock_waiting = sock.clone();
     let waiting = tokio::task::spawn_blocking(move || query_peers(&sock_waiting).unwrap())
@@ -352,6 +352,7 @@ checkouts = []
         current.peer_socket(),
         std::path::Path::new("/var/cache/arborsync/peers.sock")
     );
+    assert_eq!(current.peer_socket_mode(), 0o660);
     let next = LoadedSlave::parse(
         r#"
 slave_id = "dev-alice"
@@ -371,4 +372,62 @@ checkouts = []
         }
         other => panic!("expected RestartRequired, got {other:?}"),
     }
+}
+
+#[test]
+fn peer_socket_mode_is_octal_and_a_change_restarts() {
+    let owner = LoadedSlave::parse(
+        r#"
+slave_id = "dev-alice"
+master_addr = "master.example.com:8443"
+slave_key_path = "/etc/arborsync/slave.key"
+master_public_keys = ["hex:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+db_path = "/var/cache/arborsync/cache.redb"
+peer_socket_mode = "600"
+watcher_debounce_ms = 200
+checkouts = []
+"#,
+    )
+    .unwrap();
+    assert_eq!(owner.peer_socket_mode(), 0o600);
+    let group = LoadedSlave::parse(
+        r#"
+slave_id = "dev-alice"
+master_addr = "master.example.com:8443"
+slave_key_path = "/etc/arborsync/slave.key"
+master_public_keys = ["hex:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+db_path = "/var/cache/arborsync/cache.redb"
+peer_socket_mode = "660"
+watcher_debounce_ms = 200
+checkouts = []
+"#,
+    )
+    .unwrap();
+    match owner.plan_reload(&group) {
+        Err(ReloadError::RestartRequired { fields }) => {
+            assert!(
+                fields.contains(&"peer_socket_mode".to_string()),
+                "{fields:?}"
+            );
+        }
+        other => panic!("expected RestartRequired, got {other:?}"),
+    }
+    let err = LoadedSlave::parse(
+        r#"
+slave_id = "dev-alice"
+master_addr = "master.example.com:8443"
+slave_key_path = "/etc/arborsync/slave.key"
+master_public_keys = ["hex:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+db_path = "/var/cache/arborsync/cache.redb"
+peer_socket_mode = "888"
+watcher_debounce_ms = 200
+checkouts = []
+"#,
+    )
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("peer_socket_mode") && message.contains("888"),
+        "{message}"
+    );
 }

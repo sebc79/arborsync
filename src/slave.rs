@@ -123,10 +123,13 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
 
     let slave = Arc::new(Mutex::new(Slave::open(cfg, store, WholeFileLater)?));
     {
-        let socket = slave.lock().expect("slave").peer_socket().to_path_buf();
+        let guard = slave.lock().expect("slave");
+        let socket = guard.peer_socket().to_path_buf();
+        let mode = guard.peer_socket_mode();
+        drop(guard);
         let (peer_tx, peer_rx) = tokio::sync::watch::channel(PeerView::Waiting);
         slave.lock().expect("slave").bind_served_peers(peer_tx);
-        if let Err(err) = serve_peers(socket.clone(), peer_rx) {
+        if let Err(err) = serve_peers(socket.clone(), mode, peer_rx) {
             log::warn!("peer socket {}: {err}", socket.display());
         }
     }
