@@ -3,8 +3,8 @@ use arborsync_core::meta::FileMetadata;
 use arborsync_core::path::{CanonicalPath, EntryName};
 use arborsync_core::protocol::{
     BulkEncoding, BulkHeader, DirEntry, Envelope, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE,
-    PROTOCOL_VERSION, ProtocolMessage, decode_bulk, decode_control, encode_bulk, encode_bulk_chunks,
-    encode_bulk_owned, encode_control, page_dir_list,
+    PROTOCOL_VERSION, ProtocolMessage, decode_bulk, decode_control, encode_bulk,
+    encode_bulk_chunks, encode_bulk_owned, encode_control, page_dir_list,
 };
 use arborsync_core::test_support::{name, p};
 

@@ -4,6 +4,7 @@ mod master;
 mod path_dump;
 mod recompute;
 mod reload;
+mod restore;
 mod slave;
 mod status;
 mod watch;

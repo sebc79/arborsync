@@ -539,6 +539,11 @@ async fn drive_control(
                                 log::warn!("master fulfill: {err:#}");
                             }
                         }
+                        Ok(Ok(Reply::SendMany(msgs))) => {
+                            if let Err(err) = enqueue_control(&write_tx, msgs) {
+                                log::warn!("master fulfill: {err:#}");
+                            }
+                        }
                         Ok(Ok(Reply::Quiet)) => {}
                         Ok(Ok(Reply::Hangup { reason, .. })) => {
                             log::warn!("master fulfill hangup: {reason}");
@@ -657,6 +662,11 @@ fn dispatch_master(
         }
         Reply::Send(out) => {
             enqueue_control(write_tx, vec![out])?;
+            flush_outbox(master, peer, write_tx)?;
+            Ok(false)
+        }
+        Reply::SendMany(msgs) => {
+            enqueue_control(write_tx, msgs)?;
             flush_outbox(master, peer, write_tx)?;
             Ok(false)
         }

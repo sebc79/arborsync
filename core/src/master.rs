@@ -28,7 +28,8 @@ use crate::path::{
 };
 use crate::peers::{self, Pace, PeerName, PeerView, QueueDepth};
 use crate::protocol::{
-    BulkEncoding, BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage, page_dir_list,
+    BulkEncoding, BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage, RestoreEpoch,
+    page_dir_list,
 };
 use crate::status::{MasterStatus, PeerLive, Queues, StatusLedger};
 use crate::storage::{CheckoutId, Storage};
@@ -95,6 +96,7 @@ impl Origin {
 #[derive(Debug)]
 pub enum Reply {
     Send(ProtocolMessage),
+    SendMany(Vec<ProtocolMessage>),
     /// Inbound control that needs no response (for example a peer `Error`).
     Quiet,
     Hangup {
@@ -254,6 +256,8 @@ pub enum MasterError {
     Index(Box<dyn std::error::Error + Send + Sync>),
     #[error("central_root holds a name that is not a canonical path component: {0}")]
     BadHostName(#[from] PathError),
+    #[error("finish arborsync restore before starting the master. Still replacing {0}")]
+    RestoreIncomplete(String),
 }
 
 impl MasterError {
@@ -683,6 +687,18 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             pending_notifies: HashMap::new(),
         };
         master.sync_board();
+        let replacing = master
+            .store
+            .replacing_prefixes()
+            .map_err(MasterError::index)?;
+        if !replacing.is_empty() {
+            let names = replacing
+                .iter()
+                .map(|path| path.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Err(MasterError::RestoreIncomplete(names));
+        }
         // A clean directory hash still names files the disk has lost. Surveying
         // on open drops those rows so the next reconcile can copy them back.
         master.rescan()?;
@@ -721,7 +737,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                         });
                     }
                 }
-                Ok(Reply::Send(self.on_subscribe(peer, slave_id, checkouts)?))
+                self.on_subscribe(peer, slave_id, checkouts)
             }
             ProtocolMessage::FileAnnounce {
                 checkout_id,
@@ -1373,6 +1389,11 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     fn record_reply(&mut self, slave: Option<&str>, reply: &Reply) {
         match reply {
             Reply::Send(msg) => self.status.outbound(slave, msg),
+            Reply::SendMany(msgs) => {
+                for msg in msgs {
+                    self.status.outbound(slave, msg);
+                }
+            }
             Reply::Quiet => {}
             Reply::Hangup { reason, .. } => {
                 self.status.error(slave, format!("hangup:{reason}"));
@@ -1527,12 +1548,12 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         peer: [u8; 32],
         slave_id: String,
         checkouts: Vec<CheckoutRef>,
-    ) -> Result<ProtocolMessage, MasterError> {
+    ) -> Result<Reply, MasterError> {
         let Some(acl) = self.cfg.acl_for_public_key(&peer) else {
-            return Ok(reject_all(&checkouts, "unknown static key"));
+            return Ok(Reply::Send(reject_all(&checkouts, "unknown static key")));
         };
         if checkouts.len() > self.cfg.max_checkouts_per_slave() as usize {
-            return Ok(reject_all(&checkouts, "too many checkouts"));
+            return Ok(Reply::Send(reject_all(&checkouts, "too many checkouts")));
         }
 
         let mut live: HashMap<CheckoutName, CanonicalPath> = HashMap::new();
@@ -1546,17 +1567,17 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 .insert(CheckoutName::new(&checkout.id), checkout.central.clone())
                 .is_some()
             {
-                return Ok(reject_all(
+                return Ok(Reply::Send(reject_all(
                     &checkouts,
                     &format!("duplicate checkout id {}", checkout.id),
-                ));
+                )));
             }
         }
         if !denied.is_empty() {
-            return Ok(ProtocolMessage::SubscribeReject {
+            return Ok(Reply::Send(ProtocolMessage::SubscribeReject {
                 reason: "central is outside allowed_prefixes".into(),
                 denied_centrals: denied,
-            });
+            }));
         }
 
         let slave = SlaveId::new(slave_id);
@@ -1593,7 +1614,22 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 central: checkout.central,
             });
         }
-        Ok(ProtocolMessage::SubscribeAck { checkouts: acks })
+        let ack = ProtocolMessage::SubscribeAck { checkouts: acks };
+        let epochs = self
+            .store
+            .restore_epochs()
+            .map_err(MasterError::index)?
+            .into_iter()
+            .map(|(prefix, generation)| RestoreEpoch { prefix, generation })
+            .collect::<Vec<_>>();
+        if epochs.is_empty() {
+            Ok(Reply::Send(ack))
+        } else {
+            Ok(Reply::SendMany(vec![
+                ProtocolMessage::RestoreEpochs { epochs },
+                ack,
+            ]))
+        }
     }
 
     fn on_announce(
@@ -1931,7 +1967,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             Ok(session) => session,
             Err(refusal) => return Ok(refusal.into_error(&checkout)),
         };
-        if path != session.central {
+        if !session.central.covers(&path) {
             return Ok(outside_central(&path));
         }
         let master_root = index::subtree_root(&self.store, &CheckoutId::master(), &path)

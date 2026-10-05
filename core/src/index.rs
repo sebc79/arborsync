@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::hash::{DirNode, SubtreeRoot};
 use crate::merkle::{
-    dir_entry_hash_off, dir_node, dir_node_from_concat, empty_dir_node, encode_dir_entry,
-    file_node, DirChild,
+    DirChild, dir_entry_hash_off, dir_node, dir_node_from_concat, empty_dir_node, encode_dir_entry,
+    file_node,
 };
 use crate::meta::{EntryKind, FileMetadata};
 use crate::path::{CanonicalPath, EntryName};
@@ -629,7 +629,7 @@ fn children_of<S: Storage>(
 mod tests {
     use super::*;
     use crate::hash::ContentHash;
-    use crate::test_support::{expected_dir_node, p, MemoryStorage};
+    use crate::test_support::{MemoryStorage, expected_dir_node, p};
 
     fn file(byte: u8) -> FileMetadata {
         FileMetadata::file(1, 0, 0o100644, ContentHash::from_bytes([byte; 32]))
@@ -1273,6 +1273,10 @@ mod tests {
             kids.by_name.keys().map(|n| n.as_str()).collect::<Vec<_>>(),
             ["a", "b.txt"]
         );
-        assert!(!kids.by_name.contains_key(&EntryName::parse("nested.txt").unwrap()));
+        assert!(
+            !kids
+                .by_name
+                .contains_key(&EntryName::parse("nested.txt").unwrap())
+        );
     }
 }

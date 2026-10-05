@@ -1,7 +1,7 @@
 use arborsync_core::hash::ContentHash;
 use arborsync_core::merkle::{DirChild, dir_node, empty_dir_node, file_node};
 use arborsync_core::meta::FileMetadata;
-use arborsync_core::reconcile::{WalkAction, decide_child};
+use arborsync_core::reconcile::{TreeAuthority, WalkAction, decide_child, decide_under};
 use arborsync_core::test_support::name;
 
 const MTIME: i64 = 1_700_000_000_000;
@@ -158,6 +158,52 @@ fn decide_child_last_synced_none_both_files_differ_is_announce_cas() {
 #[test]
 fn decide_child_both_none_is_matched() {
     assert_eq!(decide_child(None, None, None, None), WalkAction::Matched);
+}
+
+#[test]
+fn decide_under_steady_slave_only_is_announce_create() {
+    let local = file("hello.txt", 1);
+    assert_eq!(
+        decide_under(
+            TreeAuthority::Steady,
+            Some(&local),
+            None,
+            Some(node(1)),
+            Some(node(1))
+        ),
+        WalkAction::AnnounceCreate
+    );
+}
+
+#[test]
+fn decide_under_restore_slave_only_is_drop_local() {
+    let local = file("hello.txt", 1);
+    assert_eq!(
+        decide_under(
+            TreeAuthority::Restore,
+            Some(&local),
+            None,
+            Some(node(1)),
+            Some(node(1))
+        ),
+        WalkAction::DropLocal
+    );
+}
+
+#[test]
+fn decide_under_restore_both_differ_and_local_is_not_last_synced_is_pull() {
+    let local = file("hello.txt", 1);
+    let master = file("hello.txt", 2);
+    assert_eq!(
+        decide_under(
+            TreeAuthority::Restore,
+            Some(&local),
+            Some(&master),
+            Some(node(3)),
+            Some(node(1))
+        ),
+        WalkAction::Pull
+    );
 }
 
 #[test]

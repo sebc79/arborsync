@@ -3,7 +3,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use arborsync_core::hash::ContentHash;
-use arborsync_core::meta::{EntryKind, collect_for_rescan, collect_from_path, hash_bytes, hash_file};
+use arborsync_core::meta::{
+    EntryKind, collect_for_rescan, collect_from_path, hash_bytes, hash_file,
+};
 use arborsync_core::test_support::TempTree;
 
 #[test]

@@ -216,12 +216,11 @@ fn a_remove_event_for_a_recreated_file_announces_the_new_bytes() {
         .note_local("src", LocalEvent::Removed(p("/src/hello.txt")))
         .unwrap();
     match &out[..] {
-        [ProtocolMessage::FileAnnounce {
-            path,
-            new,
-            basis,
-            ..
-        }] => {
+        [
+            ProtocolMessage::FileAnnounce {
+                path, new, basis, ..
+            },
+        ] => {
             assert_eq!(path, &p("/src/hello.txt"));
             assert_eq!(new.content_hash, hash_bytes(b"new"));
             assert_eq!(*basis, Some(file_node(&old)));
@@ -501,7 +500,13 @@ fn echo_of_an_applied_announce_does_not_reannounce() {
         .note_local("src", LocalEvent::Removed(p("/src/hello.txt")))
         .unwrap();
     assert!(removed.is_empty());
-    assert!(slave.checkout_local("src").unwrap().join("hello.txt").is_file());
+    assert!(
+        slave
+            .checkout_local("src")
+            .unwrap()
+            .join("hello.txt")
+            .is_file()
+    );
 }
 
 #[test]
@@ -1318,11 +1323,7 @@ fn cas_reject_after_a_failed_rename_undo_clears_the_path_that_still_has_the_byte
             },
         )
         .unwrap();
-    std::fs::set_permissions(
-        local.join("locked"),
-        std::fs::Permissions::from_mode(0o555),
-    )
-    .unwrap();
+    std::fs::set_permissions(local.join("locked"), std::fs::Permissions::from_mode(0o555)).unwrap();
 
     slave
         .handle(ProtocolMessage::CasReject {
@@ -1332,11 +1333,7 @@ fn cas_reject_after_a_failed_rename_undo_clears_the_path_that_still_has_the_byte
         })
         .unwrap();
 
-    std::fs::set_permissions(
-        local.join("locked"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    std::fs::set_permissions(local.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
         !local.join("new.txt").exists(),
         "rejected rename left the bytes at the destination"
@@ -1546,7 +1543,9 @@ fn a_later_dir_list_request_does_not_refresh_an_older_page() {
         "nested listing should be requested, got {msgs:?}"
     );
     assert!(
-        !msgs.iter().any(|msg| matches!(msg, ProtocolMessage::Delete { .. })),
+        !msgs
+            .iter()
+            .any(|msg| matches!(msg, ProtocolMessage::Delete { .. })),
         "stale page must not delete z.txt after a nested request, got {msgs:?}"
     );
     assert!(local.join("z.txt").is_file());

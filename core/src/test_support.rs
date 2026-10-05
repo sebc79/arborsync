@@ -16,7 +16,7 @@ use crate::hash::{ContentHash, DirNode, FileNode};
 use crate::meta::FileMetadata;
 use crate::path::{CanonicalPath, EntryName, RESERVED_CONFLICTS, RESERVED_TMP};
 use crate::protocol::ProtocolMessage;
-use crate::storage::{CheckoutId, Storage, WriteBatch};
+use crate::storage::{CheckoutId, RestoreMark, Storage, WriteBatch};
 use crate::tune::TuneSpec;
 
 /// Canonical path from a test literal. Panics on a non-canonical spelling,
@@ -47,12 +47,16 @@ struct MemoryInner {
 /// In-memory [`Storage`] for unit tests. `open` ignores the path.
 pub struct MemoryStorage {
     inner: Mutex<MemoryInner>,
+    restore_epochs: Mutex<HashMap<CanonicalPath, RestoreMark>>,
+    applied_epochs: Mutex<HashMap<CanonicalPath, u64>>,
 }
 
 impl MemoryStorage {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(MemoryInner::default()),
+            restore_epochs: Mutex::new(HashMap::new()),
+            applied_epochs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -168,6 +172,92 @@ impl Storage for MemoryStorage {
         inner.meta.retain(|(id, _), _| id != &ck.0);
         inner.dir_nodes.retain(|(id, _), _| id != &ck.0);
         inner.last_synced.retain(|(id, _), _| id != &ck.0);
+        Ok(())
+    }
+
+    fn restore_epochs(&self) -> Result<Vec<(CanonicalPath, u64)>, Self::Error> {
+        let mut out: Vec<_> = self
+            .restore_epochs
+            .lock()
+            .map_err(|_| MemoryError::Poisoned)?
+            .iter()
+            .filter_map(|(path, mark)| match mark {
+                RestoreMark::Sealed { generation, .. } => Some((path.clone(), *generation)),
+                RestoreMark::Replacing { .. } => None,
+            })
+            .collect();
+        out.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(out)
+    }
+
+    fn put_restore_epoch(
+        &self,
+        prefix: &CanonicalPath,
+        generation: u64,
+    ) -> Result<(), Self::Error> {
+        self.put_restore_mark(
+            prefix,
+            RestoreMark::Sealed {
+                generation,
+                dir_node: DirNode::ZERO,
+            },
+        )
+    }
+
+    fn restore_mark(&self, prefix: &CanonicalPath) -> Result<Option<RestoreMark>, Self::Error> {
+        Ok(self
+            .restore_epochs
+            .lock()
+            .map_err(|_| MemoryError::Poisoned)?
+            .get(prefix)
+            .copied())
+    }
+
+    fn put_restore_mark(
+        &self,
+        prefix: &CanonicalPath,
+        mark: RestoreMark,
+    ) -> Result<(), Self::Error> {
+        self.restore_epochs
+            .lock()
+            .map_err(|_| MemoryError::Poisoned)?
+            .insert(prefix.clone(), mark);
+        Ok(())
+    }
+
+    fn replacing_prefixes(&self) -> Result<Vec<CanonicalPath>, Self::Error> {
+        let mut out: Vec<_> = self
+            .restore_epochs
+            .lock()
+            .map_err(|_| MemoryError::Poisoned)?
+            .iter()
+            .filter_map(|(path, mark)| match mark {
+                RestoreMark::Replacing { .. } => Some(path.clone()),
+                RestoreMark::Sealed { .. } => None,
+            })
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    fn applied_epoch(&self, prefix: &CanonicalPath) -> Result<Option<u64>, Self::Error> {
+        Ok(self
+            .applied_epochs
+            .lock()
+            .map_err(|_| MemoryError::Poisoned)?
+            .get(prefix)
+            .copied())
+    }
+
+    fn put_applied_epoch(
+        &self,
+        prefix: &CanonicalPath,
+        generation: u64,
+    ) -> Result<(), Self::Error> {
+        self.applied_epochs
+            .lock()
+            .map_err(|_| MemoryError::Poisoned)?
+            .insert(prefix.clone(), generation);
         Ok(())
     }
 }

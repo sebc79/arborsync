@@ -170,6 +170,16 @@ pub enum ProtocolMessage {
     Disconnect {
         reason: String,
     },
+    RestoreEpochs {
+        epochs: Vec<RestoreEpoch>,
+    },
+}
+
+/// One prefix the master restored, and the generation slaves have to apply.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RestoreEpoch {
+    pub prefix: CanonicalPath,
+    pub generation: u64,
 }
 
 fn wire_bincode_config() -> impl bincode::config::Config {

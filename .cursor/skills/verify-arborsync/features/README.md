@@ -52,3 +52,4 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Name the limiting hop on status lines](./bottleneck-status.md) covers `bottleneck=` and the slave-to-master gauge.
 - [Raise a named hashing or fulfill hop](./tune-hops.md) covers `[tune.hashing]`, slave `[tune.fulfill_parked]`, live SIGHUP, and `fanout_dropped=`.
 - [Resume a leftover checkout drop](./leftover-drop.md) covers a tree already on the slave at connect.
+- [Restore a central prefix onto the slave](./restore.md) covers `arborsync restore --prefix /src` while the master from `state.env` is stopped.
