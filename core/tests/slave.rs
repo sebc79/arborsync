@@ -191,6 +191,47 @@ fn local_edit_announces_without_moving_last_synced() {
 }
 
 #[test]
+fn a_remove_event_for_a_recreated_file_announces_the_new_bytes() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("hello.txt", b"old");
+    slave
+        .note_local("src", LocalEvent::Changed(p("/src/hello.txt")))
+        .unwrap();
+    let old = slave.meta("src", &p("/src/hello.txt")).unwrap().unwrap();
+    slave
+        .handle(ProtocolMessage::CasAccept {
+            checkout_id: "src".into(),
+            path: p("/src/hello.txt"),
+            file_node: Some(file_node(&old)),
+        })
+        .unwrap();
+
+    let host = local.join("hello.txt");
+    std::fs::remove_file(&host).unwrap();
+    std::fs::write(&host, b"new").unwrap();
+
+    let out = slave
+        .note_local("src", LocalEvent::Removed(p("/src/hello.txt")))
+        .unwrap();
+    match &out[..] {
+        [ProtocolMessage::FileAnnounce {
+            path,
+            new,
+            basis,
+            ..
+        }] => {
+            assert_eq!(path, &p("/src/hello.txt"));
+            assert_eq!(new.content_hash, hash_bytes(b"new"));
+            assert_eq!(*basis, Some(file_node(&old)));
+        }
+        other => panic!("expected FileAnnounce of the recreated file, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&host).unwrap(), b"new");
+}
+
+#[test]
 fn master_announce_writes_inside_the_checkout_and_sets_last_synced() {
     let sandbox = SyncSandbox::new();
     let hello = b"hello";
