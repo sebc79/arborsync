@@ -7,7 +7,7 @@ use arborsync_core::hash::ContentHash;
 use arborsync_core::hashing::HashPlan;
 use arborsync_core::keys::format_hex_key;
 use arborsync_core::merkle::file_node;
-use arborsync_core::meta::{FileMetadata, hash_bytes};
+use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};
 use arborsync_core::path::{RESERVED_CONFLICTS, conflict_sidecar_path};
 use arborsync_core::protocol::ProtocolMessage;
 use arborsync_core::slave::{
@@ -755,6 +755,33 @@ fn incoming_delete_after_local_chmod_writes_no_sidecar() {
     let sidecar = conflict_sidecar_path(&local, &p("/src/hello.txt"), &hash);
     assert!(!sidecar.exists());
     assert!(!local.join("hello.txt").exists());
+}
+
+#[test]
+fn dir_create_indexes_a_file_already_under_it() {
+    let sandbox = SyncSandbox::new();
+    let mut slave = alice_slave(&sandbox, MemoryContent::new());
+    let local = slave.checkout_local("src").unwrap().to_path_buf();
+    sandbox.tree(&local).file("dir/x", b"abcd");
+    let msgs = slave
+        .note_local("src", LocalEvent::Changed(p("/src/dir")))
+        .unwrap();
+    assert_eq!(
+        slave.meta("src", &p("/src/dir")).unwrap().map(|meta| meta.kind),
+        Some(EntryKind::Dir)
+    );
+    let child = slave
+        .meta("src", &p("/src/dir/x"))
+        .unwrap()
+        .expect("directory create must index the file already under it");
+    assert_eq!(child.kind, EntryKind::File);
+    assert_eq!(child.size, 4);
+    assert_eq!(child.content_hash, hash_bytes(b"abcd"));
+    assert!(msgs.iter().any(|msg| matches!(
+        msg,
+        ProtocolMessage::FileAnnounce { path, new, .. }
+            if path == &p("/src/dir/x") && new.content_hash == hash_bytes(b"abcd")
+    )));
 }
 
 #[test]
