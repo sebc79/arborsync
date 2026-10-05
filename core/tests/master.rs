@@ -2325,3 +2325,30 @@ fn failed_publish_disarms_inflight() {
         "failed publish must disarm inflight so a real write is planned; got {out:?}"
     );
 }
+
+#[test]
+fn dir_create_indexes_a_file_already_under_it() {
+    let sandbox = SyncSandbox::new();
+    let mut master = two_slave_master(&sandbox, MemoryContent::new());
+    master
+        .handle(ALICE, subscribe("dev-alice", &[("src", "/src")]))
+        .unwrap();
+
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("src/dir/x", b"abcd");
+    master
+        .note_local(LocalEvent::Changed(p("/src/dir")))
+        .unwrap();
+    assert_eq!(
+        master.meta(&p("/src/dir")).unwrap().map(|meta| meta.kind),
+        Some(EntryKind::Dir)
+    );
+    let child = master
+        .meta(&p("/src/dir/x"))
+        .unwrap()
+        .expect("directory create must index the file already under it");
+    assert_eq!(child.kind, EntryKind::File);
+    assert_eq!(child.size, 4);
+    assert_eq!(child.content_hash, hash_bytes(b"abcd"));
+}

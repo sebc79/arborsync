@@ -2150,8 +2150,13 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         let previous = self.meta(&path)?;
         match meta::inspect_for_hash(&host, previous.as_ref()).map_err(MasterError::io(&host))? {
             Inspected::Ready(found) => {
-                self.note_present(path, found)?;
-                Ok(HashPlan::default())
+                let walk = found.kind == EntryKind::Dir;
+                self.note_present(path.clone(), found)?;
+                if walk {
+                    self.plan_existing_children(&path)
+                } else {
+                    Ok(HashPlan::default())
+                }
             }
             Inspected::Absent => {
                 self.note_removed(&path)?;
@@ -2170,6 +2175,58 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
                 })
             }
         }
+    }
+
+    fn plan_existing_children(&mut self, dir: &CanonicalPath) -> Result<HashPlan, MasterError> {
+        let mut plan = HashPlan::default();
+        let mut pending = vec![dir.clone()];
+        while let Some(dir) = pending.pop() {
+            let host = canonical_to_host(&self.central_root, &dir);
+            let entries = match fs::read_dir(&host) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                    log::warn!("skipping {}: permission denied", host.display());
+                    continue;
+                }
+                Err(err) => return Err(MasterError::io(&host)(err)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(MasterError::io(&host))?;
+                let raw = entry.file_name();
+                let Some(name) = raw.to_str() else {
+                    log::warn!("skipping non-UTF-8 name under {}", host.display());
+                    continue;
+                };
+                if dir.as_str() == "/" && is_reserved_root_entry(name) {
+                    continue;
+                }
+                let child = join_central(&dir, name)?;
+                let host_child = entry.path();
+                let previous = self.meta(&child)?;
+                match meta::inspect_for_hash(&host_child, previous.as_ref())
+                    .map_err(MasterError::io(&host_child))?
+                {
+                    Inspected::Ready(found) => {
+                        let is_dir = found.kind == EntryKind::Dir;
+                        self.note_present(child.clone(), found)?;
+                        if is_dir {
+                            pending.push(child);
+                        }
+                    }
+                    Inspected::NeedHash(host) => {
+                        let key = HashKey::Central(child);
+                        self.hashing.insert(key.clone(), (), Instant::now());
+                        plan.hash.push(HashNeed {
+                            key,
+                            host,
+                            previous,
+                        });
+                    }
+                    Inspected::Absent => {}
+                }
+            }
+        }
+        Ok(plan)
     }
 
     fn note_metadata(&mut self, path: CanonicalPath) -> Result<HashPlan, MasterError> {
