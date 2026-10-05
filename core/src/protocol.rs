@@ -31,6 +31,8 @@ pub enum FrameError {
     Bincode(String),
     #[error("bulk body length {got} does not match header size {want}")]
     BodySize { got: u64, want: u64 },
+    #[error("peer frame was malformed")]
+    BadPeer,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

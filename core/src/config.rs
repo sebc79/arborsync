@@ -70,6 +70,9 @@ pub struct SlaveConfig {
     pub rescan_interval_seconds: u64,
     #[serde(default = "default_status_seconds")]
     pub status_interval_seconds: u64,
+    /// Unix socket for the co-located peer query. Omitted means `peers.sock` beside `db_path`.
+    #[serde(default)]
+    pub peer_socket: Option<String>,
     #[serde(default)]
     pub checkouts: Vec<CheckoutConfig>,
     #[serde(default)]
@@ -257,6 +260,7 @@ pub struct LoadedSlave {
     watcher_debounce_ms: u64,
     rescan_interval_seconds: u64,
     status_interval_seconds: u64,
+    peer_socket: PathBuf,
     max_checkouts_per_slave: u32,
     tune: Tune,
 }
@@ -498,6 +502,10 @@ impl LoadedSlave {
         self.status_interval_seconds
     }
 
+    pub fn peer_socket(&self) -> &Path {
+        &self.peer_socket
+    }
+
     pub fn max_checkouts_per_slave(&self) -> u32 {
         self.max_checkouts_per_slave
     }
@@ -519,6 +527,9 @@ impl LoadedSlave {
         }
         if self.slave_id != next.slave_id {
             fields.push("slave_id".into());
+        }
+        if self.peer_socket != next.peer_socket {
+            fields.push("peer_socket".into());
         }
         fields.sort();
         if !fields.is_empty() {
@@ -676,6 +687,13 @@ fn project_slave(config: SlaveConfig) -> Result<LoadedSlave, ConfigError> {
         master_public_keys.push(bytes);
     }
     let db_path = expand_host_path("db_path", &config.db_path)?;
+    let peer_socket = match config.peer_socket {
+        Some(raw) => expand_host_path("peer_socket", &raw)?,
+        None => db_path
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .join("peers.sock"),
+    };
     check_log_level(&config.log_level)?;
     check_debounce(config.watcher_debounce_ms)?;
     check_rescan_interval(config.rescan_interval_seconds)?;
@@ -734,6 +752,7 @@ fn project_slave(config: SlaveConfig) -> Result<LoadedSlave, ConfigError> {
         watcher_debounce_ms: config.watcher_debounce_ms,
         rescan_interval_seconds: config.rescan_interval_seconds,
         status_interval_seconds: config.status_interval_seconds,
+        peer_socket,
         max_checkouts_per_slave: config.max_checkouts_per_slave,
         tune,
     })
@@ -789,12 +808,15 @@ fn home_dir(field: &str, raw: &str) -> Result<PathBuf, ConfigError> {
     }
 }
 
-fn check_id(field: &str, value: &str) -> Result<(), ConfigError> {
-    let ok = !value.is_empty()
+pub(crate) fn is_slave_id(value: &str) -> bool {
+    !value.is_empty()
         && value
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'));
-    if ok {
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+}
+
+fn check_id(field: &str, value: &str) -> Result<(), ConfigError> {
+    if is_slave_id(value) {
         Ok(())
     } else {
         Err(ConfigError::BadId {

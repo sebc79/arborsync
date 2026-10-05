@@ -521,6 +521,7 @@ impl SyncSandbox {
             watcher_debounce_ms: 200,
             rescan_interval_seconds: 60,
             status_interval_seconds: 0,
+            peer_socket: None,
             checkouts,
             tune: TuneSpec::default(),
         };

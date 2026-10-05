@@ -9,12 +9,14 @@ use arborsync_core::keys::{format_hex_key, public_from_secret, write_static_key}
 use arborsync_core::master::{Master, MemoryContent, Reply};
 use arborsync_core::meta::FileMetadata;
 use arborsync_core::meta::hash_bytes;
+use arborsync_core::peers::PeerView;
 use arborsync_core::protocol::{BulkEncoding, BulkHeader, ProtocolMessage, encode_control};
 use arborsync_core::slave::Slave;
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
 use arborsync_core::transfer::BulkTransfer;
 use arborsync_core::transport::{
-    AttemptLimiter, MemoryTransport, Transport, TransportError, client_endpoint, connect, listen,
+    AttemptLimiter, MemoryTransport, SessionFrame, Transport, TransportError, client_endpoint,
+    connect, listen,
 };
 use quinn::Connection;
 
@@ -201,6 +203,36 @@ async fn memory_control_roundtrip() {
             reason: "ack".into()
         }
     );
+}
+
+#[tokio::test]
+async fn memory_frame_roundtrip_keeps_a_directory_off_the_file_codec() {
+    let (left, right) = MemoryTransport::pair([0x11u8; 32], [0x22u8; 32]);
+    let (mut send, _) = left.open_control().await.unwrap();
+    let (_, mut recv) = right.accept_control().await.unwrap();
+
+    MemoryTransport::write_frame(&mut send, &SessionFrame::Directory(PeerView::Waiting))
+        .await
+        .unwrap();
+    match MemoryTransport::read_frame(&mut recv).await.unwrap() {
+        SessionFrame::Directory(PeerView::Waiting) => {}
+        other => panic!("expected Waiting, got {other:?}"),
+    }
+
+    MemoryTransport::write_frame(
+        &mut send,
+        &SessionFrame::File(ProtocolMessage::Disconnect {
+            reason: "bye".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    match MemoryTransport::read_frame(&mut recv).await.unwrap() {
+        SessionFrame::File(ProtocolMessage::Disconnect { reason }) => {
+            assert_eq!(reason, "bye");
+        }
+        other => panic!("expected Disconnect, got {other:?}"),
+    }
 }
 
 #[tokio::test]

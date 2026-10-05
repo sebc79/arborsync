@@ -13,15 +13,17 @@ use arborsync_core::hash::ContentHash;
 use arborsync_core::hashing::{HashDone, HashNeed};
 use arborsync_core::keys::{format_hex_key, public_from_secret, read_static_key};
 use arborsync_core::path::local_to_canonical;
-use arborsync_core::protocol::ProtocolMessage;
+use arborsync_core::peers::{PeerView, report_period};
+use arborsync_core::protocol::{FrameError, ProtocolMessage};
 use arborsync_core::slave::{
     ApplyBulkPlan, LinkState, Reply, RescanStat, RescanStated, Slave, SlaveError, WholeFileLater,
-    fulfill_from_host,
+    fulfill_from_host, serve_peers,
 };
 use arborsync_core::status::SlaveStatus;
 use arborsync_core::storage::Storage;
 use arborsync_core::transport::{
-    client_endpoint, connect, copy_bulk_body, read_bulk_header, stream_err, Transport,
+    SessionFrame, Transport, TransportError, client_endpoint, connect, copy_bulk_body,
+    read_bulk_header, stream_err,
 };
 use arborsync_core::tune::FulfillAdmission;
 use arborsync_core::watch::to_local_events;
@@ -120,6 +122,14 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
         .with_context(|| format!("open cache {}", cfg.db_path().display()))?;
 
     let slave = Arc::new(Mutex::new(Slave::open(cfg, store, WholeFileLater)?));
+    {
+        let socket = slave.lock().expect("slave").peer_socket().to_path_buf();
+        let (peer_tx, peer_rx) = tokio::sync::watch::channel(PeerView::Waiting);
+        slave.lock().expect("slave").bind_served_peers(peer_tx);
+        if let Err(err) = serve_peers(socket.clone(), peer_rx) {
+            log::warn!("peer socket {}: {err}", socket.display());
+        }
+    }
     let watched = {
         let guard = slave.lock().expect("slave");
         log::info!(
@@ -158,9 +168,19 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
         )
         .await
         {
-            Ok(()) => backoff = Duration::from_secs(1),
+            Ok(()) => {
+                slave
+                    .lock()
+                    .expect("slave")
+                    .set_served_peers(PeerView::Waiting);
+                backoff = Duration::from_secs(1);
+            }
             Err(err) => {
                 log::warn!("{err:#}");
+                slave
+                    .lock()
+                    .expect("slave")
+                    .set_served_peers(PeerView::Waiting);
                 slave
                     .lock()
                     .expect("slave")
@@ -323,11 +343,43 @@ async fn session(
     let (urgent_tx, mut urgent_rx) = unbounded_channel::<ProtocolMessage>();
     let (walk_tx, mut walk_rx) = unbounded_channel::<ProtocolMessage>();
     let (write_err_tx, mut write_err_rx) = unbounded_channel();
+    let (report_tx, mut report_rx) = tokio::sync::watch::channel(None::<DueReport>);
     tokio::spawn(async move {
-        while let Some(msg) = next_outbound(&mut urgent_rx, &mut walk_rx).await {
-            if let Err(err) = Connection::write_control(&mut send, &msg).await {
-                let _ = write_err_tx.send(err);
-                return;
+        loop {
+            tokio::select! {
+                biased;
+                changed = report_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let due = report_rx.borrow_and_update().clone();
+                    if let Some(due) = due {
+                        if let Err(err) = Connection::write_frame(
+                            &mut send,
+                            &SessionFrame::Report {
+                                seq: due.seq,
+                                pace: due.pace,
+                                depth: due.depth,
+                            },
+                        )
+                        .await
+                        {
+                            let _ = write_err_tx.send(err);
+                            return;
+                        }
+                    }
+                }
+                msg = next_outbound(&mut urgent_rx, &mut walk_rx) => {
+                    let Some(msg) = msg else {
+                        return;
+                    };
+                    if let Err(err) =
+                        Connection::write_frame(&mut send, &SessionFrame::File(msg)).await
+                    {
+                        let _ = write_err_tx.send(err);
+                        return;
+                    }
+                }
             }
         }
     });
@@ -341,20 +393,52 @@ async fn session(
         done_tx: hash_tx,
     };
     let mut outbound = Outbound::new(urgent_tx, walk_tx.clone(), bulk_tx);
-    outbound.ingest(slave, &conn, Connection::read_control(&mut recv).await?)?;
+    slave
+        .lock()
+        .expect("slave")
+        .set_served_peers(PeerView::Waiting);
+    let ack = loop {
+        match Connection::read_frame(&mut recv).await {
+            Ok(SessionFrame::File(msg)) => break msg,
+            Ok(SessionFrame::Directory(view)) => {
+                slave.lock().expect("slave").set_served_peers(view);
+            }
+            Ok(SessionFrame::Report { .. }) => log::warn!("slave ignored a peer report"),
+            Err(err) if bad_peer(&err) => log::warn!("skipped peer frame: {err}"),
+            Err(err) => return Err(err.into()),
+        }
+    };
+    outbound.ingest(slave, &conn, ack)?;
     offer_pending_hashes(slave, &mut hasher);
     let mut stat_busy = false;
     kick_crawl(slave, &mut outbound, &mut hasher, &mut stat_busy, &stat_tx)?;
     log::info!("connected to {addr_text}");
 
     let mut status_clock = crate::status::Clock::new();
+    let mut report_clock = tokio::time::interval(report_period());
+    report_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut report_seq = 0u64;
     loop {
         let status_every = slave.lock().expect("slave").status_interval_seconds();
         let work_depth = work.len();
         tokio::select! {
-            msg = Connection::read_control(&mut recv) => {
-                outbound.ingest(slave, &conn, msg?)?;
-                offer_pending_hashes(slave, &mut hasher);
+            frame = Connection::read_frame(&mut recv) => {
+                match frame {
+                    Ok(SessionFrame::File(msg)) => {
+                        outbound.ingest(slave, &conn, msg)?;
+                        offer_pending_hashes(slave, &mut hasher);
+                    }
+                    Ok(SessionFrame::Directory(view)) => {
+                        slave.lock().expect("slave").set_served_peers(view);
+                    }
+                    Ok(SessionFrame::Report { .. }) => {
+                        log::warn!("slave ignored a peer report");
+                    }
+                    Err(err) if bad_peer(&err) => {
+                        log::warn!("skipped peer frame: {err}");
+                    }
+                    Err(err) => return Err(err.into()),
+                }
             }
             incoming = conn.accept_uni() => {
                 let mut recv = incoming.map_err(stream_err)?;
@@ -469,6 +553,20 @@ async fn session(
                     work_depth,
                 };
                 outbound.report_status(slave, &conn, link);
+            }
+            _ = report_clock.tick() => {
+                report_seq = report_seq.wrapping_add(1);
+                let link = LinkState {
+                    connected: true,
+                    waits: outbound.waits(),
+                    work_depth,
+                };
+                let (pace, depth) = slave.lock().expect("slave").sample_report(link, report_seq);
+                let _ = report_tx.send(Some(DueReport {
+                    seq: report_seq,
+                    pace,
+                    depth,
+                }));
             }
         }
     }
@@ -619,6 +717,17 @@ type IsLarge = bool;
 struct ParkedAsk {
     msg: ProtocolMessage,
     size: Option<u64>,
+}
+
+#[derive(Clone)]
+struct DueReport {
+    seq: u64,
+    pace: arborsync_core::peers::Pace,
+    depth: arborsync_core::peers::QueueDepth,
+}
+
+fn bad_peer(err: &TransportError) -> bool {
+    matches!(err, TransportError::Frame(FrameError::BadPeer))
 }
 
 struct BulkDone {

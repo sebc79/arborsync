@@ -155,7 +155,7 @@ Tightening `allowed_prefixes` drops those checkouts from interest and leaves the
 
 ## Status
 
-`spec.md` §16 items 1 through 8 are built. `[tune.hashing]` and slave `[tune.fulfill_parked]` apply on SIGHUP. The struck `quic_*` / `reconnect_*` keys are not fields. Reconnect backoff is 1 s, doubling, cap 60 s. `flake.nix` and `nix/module.nix` expose `services.arborsync.master` so NixOS can run that same `arborsync master` binary. There is no NixOS option for the tune tables.
+`spec.md` §16 items 1 through 8 are built. The §11 peer directory query is built. A slave socket serves one snapshot of the other slaves. `[tune.hashing]` and slave `[tune.fulfill_parked]` apply on SIGHUP. The struck `quic_*` / `reconnect_*` keys are not fields. Reconnect backoff is 1 s, doubling, cap 60 s. `flake.nix` and `nix/module.nix` expose `services.arborsync.master` so NixOS can run that same `arborsync master` binary. There is no NixOS option for the tune tables.
 
 `core/tests/scenarios.rs` names the §16.8 cases and drives them through `handle` and `note_local` on `MemoryStorage`. `src/watch.rs` starts a real `notify-debouncer-full` thread. `tests/sync.rs` starts master and slave over QUIC and asserts a post-connect write crosses.
 
