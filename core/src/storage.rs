@@ -55,6 +55,12 @@ impl CheckoutId {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreMark {
+    Replacing { generation: u64 },
+    Sealed { generation: u64, dir_node: DirNode },
+}
+
 /// Reads use a consistent snapshot. Writes go through a batch that can
 /// update metadata, directory nodes, and `last_synced` together.
 pub trait Storage: Send + Sync + 'static {
@@ -114,6 +120,22 @@ pub trait Storage: Send + Sync + 'static {
 
     fn begin_write(&self) -> Result<Self::WriteBatch<'_>, Self::Error>;
     fn delete_checkout(&self, ck: &CheckoutId) -> Result<(), Self::Error>;
+
+    /// Master table `restore_epochs`. Sealed generations only.
+    /// A prefix still in `Replacing` is omitted. Slaves must not apply it.
+    fn restore_epochs(&self) -> Result<Vec<(CanonicalPath, u64)>, Self::Error>;
+    fn put_restore_epoch(&self, prefix: &CanonicalPath, generation: u64)
+    -> Result<(), Self::Error>;
+    fn restore_mark(&self, prefix: &CanonicalPath) -> Result<Option<RestoreMark>, Self::Error>;
+    fn put_restore_mark(
+        &self,
+        prefix: &CanonicalPath,
+        mark: RestoreMark,
+    ) -> Result<(), Self::Error>;
+    fn replacing_prefixes(&self) -> Result<Vec<CanonicalPath>, Self::Error>;
+    fn applied_epoch(&self, prefix: &CanonicalPath) -> Result<Option<u64>, Self::Error>;
+    fn put_applied_epoch(&self, prefix: &CanonicalPath, generation: u64)
+    -> Result<(), Self::Error>;
 }
 
 pub trait WriteBatch {
@@ -178,6 +200,8 @@ pub trait WriteBatch {
 const META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("meta");
 const DIR_NODES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dir_nodes");
 const LAST_SYNCED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("last_synced");
+const RESTORE_EPOCHS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("restore_epochs");
+const APPLIED_EPOCHS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("applied_epochs");
 
 #[derive(Debug, thiserror::Error)]
 pub enum RedbStoreError {
@@ -189,6 +213,15 @@ pub enum RedbStoreError {
     UnsupportedMetaSchema(u16),
     #[error("stored hash is not 32 bytes")]
     BadHash,
+}
+
+impl RedbStoreError {
+    pub fn is_index_locked(&self) -> bool {
+        matches!(
+            self,
+            Self::Redb(err) if matches!(err.as_ref(), redb::Error::DatabaseAlreadyOpen)
+        )
+    }
 }
 
 impl From<redb::Error> for RedbStoreError {
@@ -246,6 +279,8 @@ impl RedbStorage {
         txn.open_table(META)?;
         txn.open_table(DIR_NODES)?;
         txn.open_table(LAST_SYNCED)?;
+        txn.open_table(RESTORE_EPOCHS)?;
+        txn.open_table(APPLIED_EPOCHS)?;
         txn.commit()?;
         Ok(())
     }
@@ -354,6 +389,199 @@ impl Storage for RedbStorage {
         txn.commit()?;
         Ok(())
     }
+
+    fn restore_epochs(&self) -> Result<Vec<(CanonicalPath, u64)>, Self::Error> {
+        Ok(sealed_generations(list_marks(&self.db, RESTORE_EPOCHS)?))
+    }
+
+    fn put_restore_epoch(
+        &self,
+        prefix: &CanonicalPath,
+        generation: u64,
+    ) -> Result<(), Self::Error> {
+        put_mark(
+            &self.db,
+            RESTORE_EPOCHS,
+            prefix,
+            &RestoreMark::Sealed {
+                generation,
+                dir_node: DirNode::ZERO,
+            },
+        )
+    }
+
+    fn restore_mark(&self, prefix: &CanonicalPath) -> Result<Option<RestoreMark>, Self::Error> {
+        get_mark(&self.db, RESTORE_EPOCHS, prefix)
+    }
+
+    fn put_restore_mark(
+        &self,
+        prefix: &CanonicalPath,
+        mark: RestoreMark,
+    ) -> Result<(), Self::Error> {
+        put_mark(&self.db, RESTORE_EPOCHS, prefix, &mark)
+    }
+
+    fn replacing_prefixes(&self) -> Result<Vec<CanonicalPath>, Self::Error> {
+        Ok(list_marks(&self.db, RESTORE_EPOCHS)?
+            .into_iter()
+            .filter_map(|(path, mark)| match mark {
+                RestoreMark::Replacing { .. } => Some(path),
+                RestoreMark::Sealed { .. } => None,
+            })
+            .collect())
+    }
+
+    fn applied_epoch(&self, prefix: &CanonicalPath) -> Result<Option<u64>, Self::Error> {
+        get_epoch(&self.db, APPLIED_EPOCHS, prefix)
+    }
+
+    fn put_applied_epoch(
+        &self,
+        prefix: &CanonicalPath,
+        generation: u64,
+    ) -> Result<(), Self::Error> {
+        put_epoch(&self.db, APPLIED_EPOCHS, prefix, generation)
+    }
+}
+
+fn put_epoch(
+    db: &Database,
+    table: TableDefinition<&[u8], &[u8]>,
+    prefix: &CanonicalPath,
+    generation: u64,
+) -> Result<(), RedbStoreError> {
+    let txn = db.begin_write()?;
+    {
+        let mut rows = txn.open_table(table)?;
+        let bytes = generation.to_le_bytes();
+        rows.insert(prefix.as_str().as_bytes(), bytes.as_slice())?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+fn get_epoch(
+    db: &Database,
+    table: TableDefinition<&[u8], &[u8]>,
+    prefix: &CanonicalPath,
+) -> Result<Option<u64>, RedbStoreError> {
+    let txn = db.begin_read()?;
+    let rows = txn.open_table(table)?;
+    let Some(value) = rows.get(prefix.as_str().as_bytes())? else {
+        return Ok(None);
+    };
+    Ok(Some(decode_epoch(value.value())?))
+}
+
+fn put_mark(
+    db: &Database,
+    table: TableDefinition<&[u8], &[u8]>,
+    prefix: &CanonicalPath,
+    mark: &RestoreMark,
+) -> Result<(), RedbStoreError> {
+    let txn = db.begin_write()?;
+    {
+        let mut rows = txn.open_table(table)?;
+        let bytes = encode_mark(mark);
+        rows.insert(prefix.as_str().as_bytes(), bytes.as_slice())?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+fn get_mark(
+    db: &Database,
+    table: TableDefinition<&[u8], &[u8]>,
+    prefix: &CanonicalPath,
+) -> Result<Option<RestoreMark>, RedbStoreError> {
+    let txn = db.begin_read()?;
+    let rows = txn.open_table(table)?;
+    let Some(value) = rows.get(prefix.as_str().as_bytes())? else {
+        return Ok(None);
+    };
+    Ok(Some(decode_mark(value.value())?))
+}
+
+fn list_marks(
+    db: &Database,
+    table: TableDefinition<&[u8], &[u8]>,
+) -> Result<Vec<(CanonicalPath, RestoreMark)>, RedbStoreError> {
+    let txn = db.begin_read()?;
+    let rows = txn.open_table(table)?;
+    let mut out = Vec::new();
+    for row in rows.iter()? {
+        let (key, value) = row?;
+        let path = std::str::from_utf8(key.value())
+            .map_err(|err| RedbStoreError::Bincode(err.to_string()))?;
+        let path =
+            CanonicalPath::parse(path).map_err(|err| RedbStoreError::Bincode(err.to_string()))?;
+        out.push((path, decode_mark(value.value())?));
+    }
+    out.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(out)
+}
+
+fn sealed_generations(marks: Vec<(CanonicalPath, RestoreMark)>) -> Vec<(CanonicalPath, u64)> {
+    marks
+        .into_iter()
+        .filter_map(|(path, mark)| match mark {
+            RestoreMark::Sealed { generation, .. } => Some((path, generation)),
+            RestoreMark::Replacing { .. } => None,
+        })
+        .collect()
+}
+
+fn encode_mark(mark: &RestoreMark) -> Vec<u8> {
+    match *mark {
+        RestoreMark::Replacing { generation } => {
+            let mut out = vec![1];
+            out.extend_from_slice(&generation.to_le_bytes());
+            out
+        }
+        RestoreMark::Sealed {
+            generation,
+            dir_node,
+        } => {
+            let mut out = vec![2];
+            out.extend_from_slice(&generation.to_le_bytes());
+            out.extend_from_slice(dir_node.as_bytes());
+            out
+        }
+    }
+}
+
+fn decode_mark(bytes: &[u8]) -> Result<RestoreMark, RedbStoreError> {
+    let generation = |body: &[u8]| -> Result<u64, RedbStoreError> {
+        let raw: [u8; 8] = body
+            .try_into()
+            .map_err(|_| RedbStoreError::Bincode("epoch generation is not 8 bytes".into()))?;
+        Ok(u64::from_le_bytes(raw))
+    };
+    match bytes.split_first() {
+        Some((1, rest)) if rest.len() == 8 => Ok(RestoreMark::Replacing {
+            generation: generation(rest)?,
+        }),
+        Some((2, rest)) if rest.len() == 40 => {
+            let (generation_bytes, node) = rest.split_at(8);
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(node);
+            Ok(RestoreMark::Sealed {
+                generation: generation(generation_bytes)?,
+                dir_node: DirNode::from_bytes(raw),
+            })
+        }
+        _ => Err(RedbStoreError::Bincode(
+            "epoch row is not a restore mark".into(),
+        )),
+    }
+}
+
+fn decode_epoch(bytes: &[u8]) -> Result<u64, RedbStoreError> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| RedbStoreError::Bincode("epoch row is not 8 bytes".into()))?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 pub struct RedbWriteBatch {
@@ -916,5 +1144,15 @@ mod prefix_keys {
                 "/course/readme.md",
             ]
         );
+    }
+
+    #[test]
+    fn a_second_open_of_the_same_index_is_locked() {
+        let (dir, _store) = open_tmp();
+        let err = match RedbStorage::open(&dir.path().join("index.redb")) {
+            Err(err) => err,
+            Ok(_) => panic!("second open should fail while the first handle is live"),
+        };
+        assert!(err.is_index_locked(), "{err}");
     }
 }

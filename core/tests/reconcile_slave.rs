@@ -5,7 +5,7 @@ use arborsync_core::keys::format_hex_key;
 use arborsync_core::merkle::{DirChild, dir_node, empty_dir_node, file_node};
 use arborsync_core::meta::{self, FileMetadata, hash_bytes};
 use arborsync_core::path::{RESERVED_TMP, conflict_sidecar_path};
-use arborsync_core::protocol::{CheckoutAck, ProtocolMessage};
+use arborsync_core::protocol::{CheckoutAck, ProtocolMessage, RestoreEpoch};
 use arborsync_core::slave::{MemoryContent, Reply, RescanStat, Slave};
 use arborsync_core::storage::{CheckoutId, Storage, WriteBatch};
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
@@ -689,6 +689,186 @@ fn dir_list_slave_only_with_last_synced_equal_local_announces() {
             .join("hello.txt")
             .is_file(),
         "the slave copy is the only bytes left"
+    );
+}
+
+#[test]
+fn dir_list_under_an_unapplied_epoch_drops_the_local_file() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    send(
+        slave
+            .handle(ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new,
+                basis: None,
+            })
+            .unwrap(),
+    );
+    send(
+        slave
+            .handle(ProtocolMessage::RestoreEpochs {
+                epochs: vec![RestoreEpoch {
+                    prefix: p("/src"),
+                    generation: 1,
+                }],
+            })
+            .unwrap(),
+    );
+
+    let reply = slave
+        .handle(ProtocolMessage::DirListResponse {
+            checkout_id: "src".into(),
+            path: p("/src"),
+            after: None,
+            entries: vec![],
+            more: false,
+        })
+        .unwrap();
+    assert_eq!(send_and_drain(&mut slave, reply), Vec::new());
+    assert!(
+        !slave
+            .checkout_local("src")
+            .unwrap()
+            .join("hello.txt")
+            .exists(),
+        "the live file is gone"
+    );
+}
+
+#[test]
+fn a_matched_root_ack_stores_the_generation_so_the_file_stays() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    send(
+        slave
+            .handle(ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new,
+                basis: None,
+            })
+            .unwrap(),
+    );
+    let epochs = ProtocolMessage::RestoreEpochs {
+        epochs: vec![RestoreEpoch {
+            prefix: p("/src"),
+            generation: 1,
+        }],
+    };
+    send(slave.handle(epochs.clone()).unwrap());
+    assert_eq!(
+        send(
+            slave
+                .handle(ProtocolMessage::RootAck {
+                    checkout_id: "src".into(),
+                    path: p("/src"),
+                    matched: true,
+                    master_root: empty_dir_node().into(),
+                })
+                .unwrap()
+        ),
+        Vec::new()
+    );
+    let _ = slave.subscribe();
+    send(slave.handle(epochs).unwrap());
+
+    let reply = slave
+        .handle(ProtocolMessage::DirListResponse {
+            checkout_id: "src".into(),
+            path: p("/src"),
+            after: None,
+            entries: vec![],
+            more: false,
+        })
+        .unwrap();
+    match &send_and_drain(&mut slave, reply)[..] {
+        [ProtocolMessage::FileAnnounce { path, basis, .. }] => {
+            assert_eq!(path, &p("/src/hello.txt"));
+            assert_eq!(*basis, None);
+        }
+        other => panic!("expected FileAnnounce, got {other:?}"),
+    }
+    assert!(
+        slave
+            .checkout_local("src")
+            .unwrap()
+            .join("hello.txt")
+            .is_file()
+    );
+}
+
+#[test]
+fn dir_list_outside_the_epoch_still_announces_with_basis_none() {
+    let sandbox = SyncSandbox::new();
+    let hello = b"hello";
+    let hash = hash_bytes(hello);
+    let mut bodies = MemoryContent::new();
+    bodies.offer(hash, hello.to_vec());
+    let mut slave = alice_slave(&sandbox, bodies);
+    let new = FileMetadata::file(hello.len() as u64, MTIME, 0o100644, hash);
+    send(
+        slave
+            .handle(ProtocolMessage::FileAnnounce {
+                checkout_id: "src".into(),
+                path: p("/src/hello.txt"),
+                new,
+                basis: None,
+            })
+            .unwrap(),
+    );
+    send(
+        slave
+            .handle(ProtocolMessage::RestoreEpochs {
+                epochs: vec![RestoreEpoch {
+                    prefix: p("/other"),
+                    generation: 1,
+                }],
+            })
+            .unwrap(),
+    );
+
+    let reply = slave
+        .handle(ProtocolMessage::DirListResponse {
+            checkout_id: "src".into(),
+            path: p("/src"),
+            after: None,
+            entries: vec![],
+            more: false,
+        })
+        .unwrap();
+    match &send_and_drain(&mut slave, reply)[..] {
+        [
+            ProtocolMessage::FileAnnounce {
+                path,
+                new: announced,
+                basis,
+                ..
+            },
+        ] => {
+            assert_eq!(path, &p("/src/hello.txt"));
+            assert_eq!(announced.content_hash, hash);
+            assert_eq!(*basis, None);
+        }
+        other => panic!("expected FileAnnounce, got {other:?}"),
+    }
+    assert!(
+        slave
+            .checkout_local("src")
+            .unwrap()
+            .join("hello.txt")
+            .is_file()
     );
 }
 

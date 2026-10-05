@@ -10,6 +10,41 @@ pub enum WalkAction {
     AnnounceCreate,
     AnnounceDelete,
     AnnounceCas,
+    /// Slave-only under a restore epoch. Steady reconcile still announces that path.
+    DropLocal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeAuthority {
+    Steady,
+    Restore,
+}
+
+pub fn decide_under(
+    authority: TreeAuthority,
+    slave: Option<&DirChild>,
+    master: Option<&DirChild>,
+    last_synced: Option<FileNode>,
+    local_node: Option<FileNode>,
+) -> WalkAction {
+    if authority == TreeAuthority::Steady {
+        return decide_child(slave, master, last_synced, local_node);
+    }
+    let left = presence(slave);
+    let right = presence(master);
+    if left.is_some() && right.is_none() {
+        return WalkAction::DropLocal;
+    }
+    if let (Some(left), Some(right)) = (left, right) {
+        let both_dirs = left.kind == EntryKind::Dir && right.kind == EntryKind::Dir;
+        if both_dirs && left.hash != right.hash {
+            return WalkAction::Recurse;
+        }
+        if !both_dirs && (left.kind != right.kind || left.hash != right.hash) {
+            return WalkAction::Pull;
+        }
+    }
+    decide_child(slave, master, last_synced, local_node)
 }
 
 pub fn decide_child(

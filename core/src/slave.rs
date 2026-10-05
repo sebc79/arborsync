@@ -20,8 +20,8 @@ use crate::path::{
     join_central, local_paths_overlap, strip_central,
 };
 use crate::peers::{self, PeerView, QueueDepth};
-use crate::protocol::{BulkEncoding, BulkHeader, CheckoutRef, ProtocolMessage};
-use crate::reconcile::{WalkAction, decide_child};
+use crate::protocol::{BulkEncoding, BulkHeader, CheckoutRef, ProtocolMessage, RestoreEpoch};
+use crate::reconcile::{TreeAuthority, WalkAction, decide_under};
 use crate::status::{Queues, SlaveStatus, StatusLedger};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
 use crate::transfer::{self, BulkTransfer};
@@ -309,6 +309,8 @@ pub struct Slave<S: Storage, C: ContentHook> {
     status: StatusLedger,
     cas_since_dir_list: HashMap<String, u64>,
     dir_list_sent: HashMap<(String, CanonicalPath, Option<EntryName>), u64>,
+    unapplied_epochs: Vec<RestoreEpoch>,
+    subscribed: bool,
     served: PeerView,
     served_tx: Option<tokio::sync::watch::Sender<PeerView>>,
 }
@@ -349,6 +351,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             status: StatusLedger::default(),
             cas_since_dir_list: HashMap::new(),
             dir_list_sent: HashMap::new(),
+            unapplied_epochs: Vec::new(),
+            subscribed: false,
             served: PeerView::Waiting,
             served_tx: None,
         };
@@ -374,6 +378,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     }
 
     pub fn subscribe(&mut self) -> ProtocolMessage {
+        self.subscribed = false;
+        self.unapplied_epochs.clear();
         let msg = self.subscribe_message();
         self.status.outbound(None, &msg);
         msg
@@ -758,6 +764,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     fn handle_message(&mut self, msg: ProtocolMessage) -> Result<Reply, SlaveError> {
         match msg {
             ProtocolMessage::SubscribeAck { .. } => self.on_subscribe_ack(),
+            ProtocolMessage::RestoreEpochs { epochs } => self.on_restore_epochs(epochs),
             ProtocolMessage::SubscribeReject {
                 reason,
                 denied_centrals,
@@ -1570,6 +1577,66 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         Ok(())
     }
 
+    fn authority_for(&self, path: &CanonicalPath) -> TreeAuthority {
+        if self
+            .unapplied_epochs
+            .iter()
+            .any(|epoch| epoch.prefix.covers(path))
+        {
+            TreeAuthority::Restore
+        } else {
+            TreeAuthority::Steady
+        }
+    }
+
+    fn drop_local(
+        &mut self,
+        checkout_id: &str,
+        path: &CanonicalPath,
+        indexed: Option<&FileMetadata>,
+    ) -> Result<(), SlaveError> {
+        let agreed = self.last_synced_content(checkout_id, path)?;
+        self.sidecar_when_live_differs(checkout_id, path, agreed)?;
+        self.remove_path(checkout_id, path, indexed)
+    }
+
+    fn sidecar_diverged(
+        &mut self,
+        checkout_id: &str,
+        path: &CanonicalPath,
+    ) -> Result<(), SlaveError> {
+        let agreed = self.last_synced_content(checkout_id, path)?;
+        self.sidecar_when_live_differs(checkout_id, path, agreed)
+    }
+
+    fn sidecar_when_live_differs(
+        &mut self,
+        checkout_id: &str,
+        path: &CanonicalPath,
+        agreed: Option<ContentHash>,
+    ) -> Result<(), SlaveError> {
+        let Some(agreed) = agreed else {
+            return Ok(());
+        };
+        let (local, host) = {
+            let checkout = self.checkout(checkout_id)?;
+            let relative = strip_central(&checkout.central, path)?;
+            (
+                checkout.local.clone(),
+                canonical_to_host(&checkout.local, &relative),
+            )
+        };
+        let Some(live) = meta::collect_from_path(&host).map_err(SlaveError::io(&host))? else {
+            return Ok(());
+        };
+        if live.kind == EntryKind::Dir || live.content_hash == agreed {
+            return Ok(());
+        }
+        let sidecar = conflict_sidecar_path(&local, path, &live.content_hash);
+        apply::sidecar_if_content_differs(&host, &sidecar, &live, agreed)?;
+        Ok(())
+    }
+
     fn remove_path(
         &mut self,
         checkout_id: &str,
@@ -1649,6 +1716,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     }
 
     fn on_subscribe_ack(&mut self) -> Result<Reply, SlaveError> {
+        self.subscribed = true;
         self.pending.clear();
         self.pending_pulls.clear();
         let mut ids: Vec<String> = self.checkouts.keys().cloned().collect();
@@ -1679,15 +1747,76 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     fn root_reports_for(&self, ids: &[String]) -> Result<Vec<ProtocolMessage>, SlaveError> {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            let checkout = self.checkout(id)?;
-            out.push(ProtocolMessage::RootReport {
-                root: index::subtree_root(&self.store, &checkout.id, &checkout.central)
-                    .map_err(SlaveError::index)?,
-                path: checkout.central.clone(),
-                checkout_id: id.clone(),
-            });
+            let (ck, central) = {
+                let checkout = self.checkout(id)?;
+                (checkout.id.clone(), checkout.central.clone())
+            };
+            out.push(self.root_report(id, &ck, &central)?);
+            out.extend(self.epoch_reports(id, &central, &ck)?);
         }
         Ok(out)
+    }
+
+    fn on_restore_epochs(&mut self, epochs: Vec<RestoreEpoch>) -> Result<Reply, SlaveError> {
+        let mut kept = Vec::new();
+        for epoch in epochs {
+            let stored = self
+                .store
+                .applied_epoch(&epoch.prefix)
+                .map_err(SlaveError::index)?;
+            if stored.is_none_or(|generation| epoch.generation > generation) {
+                kept.push(epoch);
+            }
+        }
+        self.unapplied_epochs = kept;
+        if !self.subscribed {
+            return Ok(Reply::Send(Vec::new()));
+        }
+        let mut ids: Vec<String> = self.checkouts.keys().cloned().collect();
+        ids.sort();
+        let mut out = Vec::new();
+        for id in ids {
+            let (ck, central) = {
+                let checkout = self.checkout(&id)?;
+                (checkout.id.clone(), checkout.central.clone())
+            };
+            for epoch in &self.unapplied_epochs {
+                if !central.covers(&epoch.prefix) {
+                    continue;
+                }
+                out.push(self.root_report(&id, &ck, &epoch.prefix)?);
+            }
+        }
+        Ok(Reply::Send(out))
+    }
+
+    fn epoch_reports(
+        &self,
+        checkout_id: &str,
+        central: &CanonicalPath,
+        ck: &CheckoutId,
+    ) -> Result<Vec<ProtocolMessage>, SlaveError> {
+        let mut out = Vec::new();
+        for epoch in &self.unapplied_epochs {
+            if epoch.prefix == *central || !central.covers(&epoch.prefix) {
+                continue;
+            }
+            out.push(self.root_report(checkout_id, ck, &epoch.prefix)?);
+        }
+        Ok(out)
+    }
+
+    fn root_report(
+        &self,
+        checkout_id: &str,
+        ck: &CheckoutId,
+        path: &CanonicalPath,
+    ) -> Result<ProtocolMessage, SlaveError> {
+        Ok(ProtocolMessage::RootReport {
+            root: index::subtree_root(&self.store, ck, path).map_err(SlaveError::index)?,
+            path: path.clone(),
+            checkout_id: checkout_id.into(),
+        })
     }
 
     fn on_root_ack(
@@ -1696,15 +1825,21 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         path: CanonicalPath,
         matched: bool,
     ) -> Result<Reply, SlaveError> {
-        let checkout = self.checkout(checkout_id)?;
+        let central = self.checkout(checkout_id)?.central.clone();
         if matched {
+            if let Some(index) = self
+                .unapplied_epochs
+                .iter()
+                .position(|epoch| epoch.prefix == path)
+            {
+                let epoch = self.unapplied_epochs.remove(index);
+                self.store
+                    .put_applied_epoch(&epoch.prefix, epoch.generation)
+                    .map_err(SlaveError::index)?;
+            }
             return Ok(Reply::Send(Vec::new()));
         }
-        let path = if path == checkout.central {
-            path
-        } else {
-            checkout.central.clone()
-        };
+        let path = if central.covers(&path) { path } else { central };
         Ok(Reply::Send(vec![self.dir_list_request(
             checkout_id,
             path,
@@ -2013,14 +2148,24 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         let last_synced = self.last_synced(checkout_id, &child_path)?;
         let local_meta = self.meta(checkout_id, &child_path)?;
         let local_file = local_meta.as_ref().map(file_node);
+        let authority = self.authority_for(&child_path);
         let mut plan = HashPlan::default();
-        match decide_child(slave_child, master_child, last_synced, local_file) {
+        match decide_under(
+            authority,
+            slave_child,
+            master_child,
+            last_synced,
+            local_file,
+        ) {
             WalkAction::Matched => {}
             WalkAction::Recurse => {
                 plan.send
                     .push(self.dir_list_request(checkout_id, child_path, None))
             }
             WalkAction::Pull => {
+                if authority == TreeAuthority::Restore {
+                    self.sidecar_diverged(checkout_id, &child_path)?;
+                }
                 let master_dir = matches!(master_child, Some(DirChild::Directory { .. }));
                 let slave_dir = matches!(slave_child, Some(DirChild::Directory { .. }));
                 if slave_child.is_some() && master_dir != slave_dir {
@@ -2053,6 +2198,9 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 } else {
                     plan.append(self.note_changed(checkout_id, child_path)?);
                 }
+            }
+            WalkAction::DropLocal => {
+                self.drop_local(checkout_id, &child_path, local_meta.as_ref())?;
             }
             WalkAction::AnnounceDelete => {
                 if self.cas_epoch(checkout_id) > list_epoch || self.crawl.rescanning(checkout_id) {

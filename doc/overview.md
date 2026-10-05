@@ -173,3 +173,4 @@ Tightening `allowed_prefixes` drops those checkouts from interest and leaves the
 | Fan-out and reconcile triggers | [`pushing-updates.md`](pushing-updates.md) |
 | Frames, XX, streams | [`quic-transport.md`](quic-transport.md) |
 | TOML, reload, env | [`configuration.md`](configuration.md) |
+| Restore a prefix | [`restoring.md`](restoring.md) |

@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::{keygen, master, path_dump, recompute, slave};
+use arborsync_core::path::CanonicalPath;
+
+use crate::{keygen, master, path_dump, recompute, restore, slave};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -32,6 +34,21 @@ pub enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Copy a directory onto one central prefix while the master is stopped
+    Restore {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Directory whose root is `--prefix`. `source/foo` becomes `{prefix}/foo`.
+        #[arg(long)]
+        source: PathBuf,
+        /// Canonical prefix. `/` is the whole central tree.
+        #[arg(long, default_value = "/", value_parser = parse_prefix)]
+        prefix: CanonicalPath,
+        /// Print pulls and write nothing. No output means a slave holding
+        /// `--source` would only push.
+        #[arg(long)]
+        pretend: bool,
+    },
     /// Recompute master directory hashes from indexed children
     Recompute {
         #[arg(long)]
@@ -52,10 +69,20 @@ impl Cli {
             Command::Master { config } => master::run(resolve_config(config)),
             Command::Slave { config } => slave::run(resolve_config(config)),
             Command::Keygen { out } => keygen::run(&out),
+            Command::Restore {
+                config,
+                source,
+                prefix,
+                pretend,
+            } => restore::run(resolve_config(config), source, prefix, pretend),
             Command::Recompute { config } => recompute::run(resolve_config(config)),
             Command::Path { config, path } => path_dump::run(resolve_config(config), path),
         }
     }
+}
+
+fn parse_prefix(raw: &str) -> Result<CanonicalPath, String> {
+    CanonicalPath::parse(raw).map_err(|err| err.to_string())
 }
 
 fn resolve_config(explicit: Option<PathBuf>) -> Option<PathBuf> {

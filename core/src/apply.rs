@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use filetime::FileTime;
 
 use crate::hash::ContentHash;
-use crate::meta::{hash_bytes, hash_file, EntryKind, FileMetadata};
-use crate::path::{confine_host, CanonicalPath, RESERVED_TMP};
+use crate::meta::{EntryKind, FileMetadata, hash_bytes, hash_file};
+use crate::path::{CanonicalPath, RESERVED_TMP, confine_host};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -561,10 +561,7 @@ mod tests {
         let host = root.join("nested/dir");
         let mode = fs::symlink_metadata(&host).unwrap().mode() & 0o7777;
         assert_eq!(mode, 0o0750, "leaf must keep the announced mode");
-        let parent_mode = fs::symlink_metadata(root.join("nested"))
-            .unwrap()
-            .mode()
-            & 0o7777;
+        let parent_mode = fs::symlink_metadata(root.join("nested")).unwrap().mode() & 0o7777;
         assert_eq!(
             parent_mode, 0o0750,
             "dirs created for this announce must keep the announced mode"

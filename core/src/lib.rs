@@ -18,6 +18,7 @@ pub mod path;
 pub mod peers;
 pub mod protocol;
 pub mod reconcile;
+pub mod restore;
 pub mod slave;
 pub mod status;
 pub mod storage;

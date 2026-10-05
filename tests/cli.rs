@@ -653,3 +653,37 @@ fn path_dump_shows_a_slave_checkout_file() {
         "{by_canonical}"
     );
 }
+
+#[test]
+fn pretend_prints_pulls_and_does_not_write() {
+    let (sandbox, config) = master_sandbox();
+    let central = sandbox.central_root();
+    fs::create_dir_all(central.join("src")).unwrap();
+    fs::write(central.join("src/keep.txt"), b"old").unwrap();
+    fs::write(central.join("src/extra.txt"), b"extra").unwrap();
+    let source = sandbox.path().join("pristine");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.txt"), b"new").unwrap();
+    fs::write(source.join("added.txt"), b"added").unwrap();
+
+    let output = bin()
+        .args(["restore", "--pretend", "--config"])
+        .arg(&config)
+        .arg("--source")
+        .arg(&source)
+        .args(["--prefix", "/src"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "delete /src/extra.txt\nreplace /src/keep.txt\n"
+    );
+    assert_eq!(fs::read(central.join("src/keep.txt")).unwrap(), b"old");
+    assert_eq!(fs::read(central.join("src/extra.txt")).unwrap(), b"extra");
+    assert!(!central.join("src/added.txt").exists());
+}

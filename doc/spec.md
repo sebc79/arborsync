@@ -323,6 +323,8 @@ After `SubscribeAck`, every rescan interval, and on reconnect:
      - local != last_synced, master == last_synced → announce CAS;
      - both differ and local != master → announce CAS; expect `CasReject` or win; §8 handles the loser.
 
+A stored restore epoch changes the slave-only arm for paths that epoch covers. `Subscribe` is answered with `RestoreEpochs` and then `SubscribeAck` when the master has at least one epoch. No stored epoch keeps a single `SubscribeAck`. The slave keeps an epoch whose generation is greater than the row in `applied_epochs`. It also sends `RootReport` for each unapplied prefix the checkout central covers. `RootAck` with `matched` true on that prefix stores the generation and drops the epoch. While it is unapplied, `decide_under` with `TreeAuthority::Restore` deletes a slave-only path (`DropLocal`) instead of announcing it. `DropLocal` sidecars the live file only when its content hash differs from the stored last-synced content hash. Both present, different hashes, and not two directories, is a pull even when local differs from `last_synced`. Two directories with different hashes still recurse. `decide_child` is unchanged, so a path outside every unapplied epoch still announces a slave-only create. The operator steps are in [`restoring.md`](restoring.md).
+
 Initial populate is this walk with `last_synced` empty.
 
 Master does **not** buffer updates for offline slaves. Reconnect + reconcile is the only catch-up.
@@ -386,7 +388,10 @@ pub enum ProtocolMessage {
     SignatureRequest { checkout_id: String, path: String, want_hash: [u8; 32], signature: Vec<u8> },
     Error { code: String, message: String },
     Disconnect { reason: String },
+    RestoreEpochs { epochs: Vec<RestoreEpoch> },
 }
+
+pub struct RestoreEpoch { pub prefix: String, pub generation: u64 }
 
 pub struct DirEntry { pub name: String, pub kind: EntryKind, pub node_hash: [u8; 32] }
 
@@ -398,6 +403,8 @@ pub struct BulkHeader {
     pub size: u64,
 }
 ```
+
+`RestoreEpochs` is appended at the end of `ProtocolMessage`, so existing variant indexes stay valid. The master sends it only when a prefix is sealed, and it sends that message before `SubscribeAck`. An empty table stays a single `SubscribeAck`, so an older slave can still connect. After the first restore, an older slave cannot decode `RestoreEpochs` and the session drops. That slave does not announce the files the restore deleted.
 
 Paths in every message are canonical. `checkout_id` is required on slave-scoped messages so a slave with central overlap can route to the right local tree. Keep-alive is QUIC’s; no application `Heartbeat`.
 
@@ -464,7 +471,7 @@ pub trait WriteBatch {
 
 A metadata change and its ancestor `DirNode` updates and `last_synced` write commit in **one** batch. The earlier sketch with `get`/`put` outside `transaction()` is not the API.
 
-**Tables:** `meta` (ck, path) → `FileMetadata`; `dir_nodes` (ck, path) → `[u8;32]`; `last_synced` (ck, path) → 32-byte `FileNode`, or 64 bytes (`FileNode` || `content_hash`) when the agreed content hash is stored. Master `ck` is the empty string.
+**Tables:** `meta` (ck, path) → `FileMetadata`; `dir_nodes` (ck, path) → `[u8;32]`; `last_synced` (ck, path) → 32-byte `FileNode`, or 64 bytes (`FileNode` || `content_hash`) when the agreed content hash is stored. Master `ck` is the empty string. `restore_epochs` maps a canonical prefix to a restore mark. `Replacing` stores the target generation and is written before the first central byte changes. `Sealed` stores that generation and the prefix `DirNode` after the index commit. A retry that finds `Replacing` keeps the generation. `Master::open` does not survey while any prefix is `Replacing`. `applied_epochs` maps a canonical prefix to a little-endian `u64` generation on the slave.
 
 ---
 
@@ -672,6 +679,7 @@ Items 1–7 below are in `arborsync-core` and the `master`, `slave`, and `keygen
 | ✅ | §9 / item 5 whole-file RAM | A whole-file body is written to `.arborsync-tmp` one chunk at a time. `StagedContent::verify` and `BulkStage::finish` hash that file with `hash_file`. A delta snapshots the basis to tmp and patches onto another tmp file. `read_bulk` still concatenates for the in-memory transport. |
 | ✅ | Reload path at the binary | `tests/cli.rs` sends SIGHUP after an ACL row is removed and waits for `acl reload closed` and `unknown static key from`. It rewrites the slave config and waits for `resubscribe after reload` from the config watch. |
 | ✅ | §11 peer directory query | Slave `peer_socket` (default `peers.sock` beside `db_path`, mode `0660` or `peer_socket_mode`, restart-required) serves one `PeerView` per connection. The master publishes a directory on the control stream. Pace stays the last report. Fresh is three report periods. Failed health is `stuck` on the report and `failed` on the status line. No metrics port. |
+| ✅ | `arborsync restore` | `arborsync restore --config PATH --source DIR [--prefix CANONICAL] [--pretend]` copies one prefix from a directory into the central tree while the master is stopped. `--prefix` defaults to `/`. The index commit is one batch, then `repair_dir_nodes` from `/`, then a `restore_epochs` row. `--pretend` writes nothing and prints each path a slave holding `--source` would pull (`replace` when the `FileNode` differs, `delete` when the path is only on central). No lines means that slave would only push. Slaves on this version apply `RestoreEpochs` before `SubscribeAck` and delete slave-only paths under an unapplied prefix instead of announcing them. A slave that cannot decode `RestoreEpochs` disconnects. See [`restoring.md`](restoring.md). |
 
 Review findings from tree `37f8671` are closed. |
 
@@ -689,3 +697,4 @@ Topic documents:
 | `pushing-updates.md` | §8–§10 (master push + fan-out) |
 | `quic-transport.md` | §11, §12 |
 | `configuration.md` | §14 |
+| `restoring.md` | How to restore one prefix while the master is stopped |

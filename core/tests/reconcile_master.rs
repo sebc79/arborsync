@@ -5,7 +5,8 @@ use arborsync_core::keys::format_hex_key;
 use arborsync_core::master::{Master, MemoryContent, Reply};
 use arborsync_core::merkle::{DirChild, dir_node, empty_dir_node, file_node};
 use arborsync_core::meta::{EntryKind, hash_bytes};
-use arborsync_core::protocol::{CheckoutRef, ProtocolMessage};
+use arborsync_core::protocol::{CheckoutRef, ProtocolMessage, RestoreEpoch};
+use arborsync_core::storage::Storage;
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
 
 const ALICE: [u8; 32] = [0xA1; 32];
@@ -195,6 +196,100 @@ fn dir_list_request_on_a_file_returns_file_announce() {
             assert_eq!(basis, None);
         }
         other => panic!("expected FileAnnounce, got {other:?}"),
+    }
+}
+
+#[test]
+fn subscribe_with_a_stored_epoch_sends_epochs_before_ack() {
+    let sandbox = SyncSandbox::new();
+    let store = MemoryStorage::new();
+    store.put_restore_epoch(&p("/src"), 4).unwrap();
+    let cfg_path = sandbox.write_master_config(vec![SlaveAcl {
+        id: "dev-alice".into(),
+        public_keys: vec![format_hex_key(&ALICE)],
+        allowed_prefixes: vec!["/src".into()],
+    }]);
+    let mut master = Master::open(
+        LoadedMaster::load(&cfg_path).unwrap(),
+        store,
+        MemoryContent::new(),
+    )
+    .unwrap();
+    match master.handle(ALICE, subscribe()).unwrap() {
+        Reply::SendMany(msgs) => match &msgs[..] {
+            [
+                ProtocolMessage::RestoreEpochs { epochs },
+                ProtocolMessage::SubscribeAck { .. },
+            ] => {
+                assert_eq!(
+                    epochs,
+                    &vec![RestoreEpoch {
+                        prefix: p("/src"),
+                        generation: 4,
+                    }]
+                );
+            }
+            other => panic!("expected RestoreEpochs then SubscribeAck, got {other:?}"),
+        },
+        other => panic!("expected SendMany, got {other:?}"),
+    }
+}
+
+#[test]
+fn subscribe_without_an_epoch_returns_only_subscribe_ack() {
+    let sandbox = SyncSandbox::new();
+    let mut master = alice_master(&sandbox);
+    match master.handle(ALICE, subscribe()).unwrap() {
+        Reply::Send(ProtocolMessage::SubscribeAck { .. }) => {}
+        other => panic!("expected only SubscribeAck, got {other:?}"),
+    }
+}
+
+#[test]
+fn root_report_under_the_checkout_is_acked_and_a_sibling_is_rejected() {
+    let sandbox = SyncSandbox::new();
+    let mut master = alice_master(&sandbox);
+    send(master.handle(ALICE, subscribe()).unwrap());
+
+    match send(
+        master
+            .handle(
+                ALICE,
+                ProtocolMessage::RootReport {
+                    checkout_id: "src".into(),
+                    path: p("/src/nested"),
+                    root: empty_dir_node().into(),
+                },
+            )
+            .unwrap(),
+    ) {
+        ProtocolMessage::RootAck {
+            checkout_id,
+            path,
+            matched,
+            ..
+        } => {
+            assert_eq!(checkout_id, "src");
+            assert_eq!(path, p("/src/nested"));
+            assert!(matched);
+        }
+        other => panic!("expected RootAck, got {other:?}"),
+    }
+
+    match send(
+        master
+            .handle(
+                ALICE,
+                ProtocolMessage::RootReport {
+                    checkout_id: "src".into(),
+                    path: p("/other"),
+                    root: empty_dir_node().into(),
+                },
+            )
+            .unwrap(),
+    ) {
+        ProtocolMessage::Error { code, .. } => assert_eq!(code, "outside_central"),
+        other => panic!("expected outside_central, got {other:?}"),
     }
 }
 

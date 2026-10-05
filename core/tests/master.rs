@@ -1,7 +1,7 @@
 use arborsync_core::LoadedMaster;
+use arborsync_core::LocalEvent;
 use arborsync_core::RedbStorage;
 use arborsync_core::Storage;
-use arborsync_core::LocalEvent;
 use arborsync_core::config::{ReloadError, SlaveAcl};
 use arborsync_core::hash::{ContentHash, FileNode};
 use arborsync_core::keys::format_hex_key;
@@ -16,6 +16,7 @@ use arborsync_core::merkle::{self, DirChild, file_node};
 use arborsync_core::meta::{EntryKind, FileMetadata, hash_bytes};
 use arborsync_core::path::RESERVED_CONFLICTS;
 use arborsync_core::protocol::{BulkEncoding, BulkHeader, CheckoutRef, ProtocolMessage};
+use arborsync_core::storage::RestoreMark;
 use arborsync_core::test_support::{MemoryStorage, SyncSandbox, name, p};
 
 const ALICE: [u8; 32] = [0xA1; 32];
@@ -1019,7 +1020,11 @@ fn a_remove_event_for_a_recreated_central_file_fans_out_the_new_bytes() {
     }
     assert_eq!(std::fs::read(&host).unwrap(), b"new");
     assert_eq!(
-        master.meta(&p("/src/edit.txt")).unwrap().unwrap().content_hash,
+        master
+            .meta(&p("/src/edit.txt"))
+            .unwrap()
+            .unwrap()
+            .content_hash,
         hash_bytes(b"new")
     );
 }
@@ -1362,7 +1367,9 @@ fn a_later_bulk_finish_loses_cas_against_the_live_node() {
     };
 
     match finish(&mut master, BACKUP, "bak", backup_body).unwrap() {
-        Reply::Send(ProtocolMessage::CasAccept { file_node: node, .. }) => {
+        Reply::Send(ProtocolMessage::CasAccept {
+            file_node: node, ..
+        }) => {
             assert_eq!(node, Some(file_node(&backup_new)));
         }
         other => panic!("expected CasAccept, got {other:?}"),
@@ -1392,7 +1399,12 @@ fn a_reserved_name_on_the_wire_is_rejected_and_not_indexed() {
         .unwrap();
 
     let announced = [
-        (BACKUP, "bak", "/.arborsync-tmp/scratch", ".arborsync-tmp/scratch"),
+        (
+            BACKUP,
+            "bak",
+            "/.arborsync-tmp/scratch",
+            ".arborsync-tmp/scratch",
+        ),
         (
             ALICE,
             "src",
@@ -1538,6 +1550,55 @@ fn open_drops_an_indexed_file_that_is_gone_from_disk() {
     assert!(
         master.meta(&p("/src/hello.txt")).unwrap().is_none(),
         "a restart must forget a file the disk no longer has"
+    );
+}
+
+#[test]
+fn open_refuses_to_survey_while_a_prefix_is_replacing() {
+    let sandbox = SyncSandbox::new();
+    let cfg_path = sandbox.write_master_config(vec![slave_acl("dev-alice", ALICE, &["/src"])]);
+    let cfg = LoadedMaster::load(&cfg_path).unwrap();
+    let mut master = Master::open(
+        cfg,
+        RedbStorage::open(&sandbox.master_db()).unwrap(),
+        MemoryContent::new(),
+    )
+    .unwrap();
+    sandbox
+        .tree(&sandbox.central_root())
+        .file("src/hello.txt", b"hello");
+    master.rescan().unwrap();
+    assert!(master.meta(&p("/src/hello.txt")).unwrap().is_some());
+    drop(master);
+    std::fs::remove_file(sandbox.central_root().join("src/hello.txt")).unwrap();
+
+    {
+        let store = RedbStorage::open(&sandbox.master_db()).unwrap();
+        store
+            .put_restore_mark(&p("/src"), RestoreMark::Replacing { generation: 1 })
+            .unwrap();
+    }
+
+    let cfg = LoadedMaster::load(&cfg_path).unwrap();
+    let err = match Master::open(
+        cfg,
+        RedbStorage::open(&sandbox.master_db()).unwrap(),
+        MemoryContent::new(),
+    ) {
+        Err(err) => err,
+        Ok(_) => panic!("open should refuse to survey while a prefix is replacing"),
+    };
+    let text = err.to_string();
+    assert!(text.contains("Still replacing"), "{text}");
+    assert!(text.contains("/src"), "{text}");
+
+    let store = RedbStorage::open(&sandbox.master_db()).unwrap();
+    assert!(
+        store
+            .get_meta(&arborsync_core::CheckoutId::master(), &p("/src/hello.txt"))
+            .unwrap()
+            .is_some(),
+        "open must not drop the indexed file while the prefix is replacing"
     );
 }
 
