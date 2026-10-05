@@ -192,12 +192,20 @@ struct Heard {
     at: Instant,
 }
 
+#[derive(Clone, Default)]
+struct SampleMark {
+    flow: Flow,
+    error: Option<LastError>,
+}
+
 #[derive(Default)]
 pub struct StatusLedger {
     aggregate: Flow,
     last_error: Option<LastError>,
     by_slave: HashMap<String, PeerAcc>,
     gauges: HashMap<String, Heard>,
+    log_mark: SampleMark,
+    report_mark: SampleMark,
 }
 
 impl StatusLedger {
@@ -320,6 +328,8 @@ impl StatusLedger {
         let stale_after = gauge_window(status_interval_seconds);
         let flow = std::mem::take(&mut self.aggregate);
         let last_error = self.last_error.take();
+        self.log_mark = SampleMark::default();
+        self.report_mark = SampleMark::default();
         let mut accs = std::mem::take(&mut self.by_slave);
         let mut slaves = Vec::new();
         let mut queues = Queues::default();
@@ -381,9 +391,12 @@ impl StatusLedger {
     }
 
     pub fn take_slave(&mut self, connected: bool, queues: Queues, waits: &[Wait]) -> SlaveStatus {
-        let flow = std::mem::take(&mut self.aggregate);
-        let last_error = self.last_error.take();
-        self.by_slave.clear();
+        let flow = flow_since(&self.aggregate, &self.log_mark.flow);
+        let last_error = error_since(&self.last_error, &self.log_mark.error);
+        self.log_mark = SampleMark {
+            flow: self.aggregate.clone(),
+            error: self.last_error.clone(),
+        };
         let error_count = last_error.as_ref().map(|e| e.count).unwrap_or(0);
         SlaveStatus {
             health: classify(&flow, &queues, error_count),
@@ -393,6 +406,17 @@ impl StatusLedger {
             queues,
             last_error,
         }
+    }
+
+    pub fn report_delta(&mut self) -> (Flow, u64) {
+        let flow = flow_since(&self.aggregate, &self.report_mark.flow);
+        let last_error = error_since(&self.last_error, &self.report_mark.error);
+        let error_count = last_error.as_ref().map(|e| e.count).unwrap_or(0);
+        self.report_mark = SampleMark {
+            flow: self.aggregate.clone(),
+            error: self.last_error.clone(),
+        };
+        (flow, error_count)
     }
 
     fn heard(&self, slave: &str, now: Instant, stale_after: Duration) -> (Hint, Option<Wait>) {
@@ -487,6 +511,42 @@ impl fmt::Display for MasterStatus {
 impl fmt::Display for SlaveStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.line(0))
+    }
+}
+
+fn flow_since(current: &Flow, mark: &Flow) -> Flow {
+    Flow {
+        in_msgs: current.in_msgs.saturating_sub(mark.in_msgs),
+        out_msgs: current.out_msgs.saturating_sub(mark.out_msgs),
+        cas_accept: current.cas_accept.saturating_sub(mark.cas_accept),
+        cas_reject: current.cas_reject.saturating_sub(mark.cas_reject),
+        apply_ok: current.apply_ok.saturating_sub(mark.apply_ok),
+        apply_fail: current.apply_fail.saturating_sub(mark.apply_fail),
+        bulk_in: current.bulk_in.saturating_sub(mark.bulk_in),
+        bulk_out: current.bulk_out.saturating_sub(mark.bulk_out),
+        bytes_in: current.bytes_in.saturating_sub(mark.bytes_in),
+        bytes_out: current.bytes_out.saturating_sub(mark.bytes_out),
+        root: current.root.saturating_sub(mark.root),
+        dir_list: current.dir_list.saturating_sub(mark.dir_list),
+        local: current.local.saturating_sub(mark.local),
+        rescan: current.rescan.saturating_sub(mark.rescan),
+        flushed: current.flushed.saturating_sub(mark.flushed),
+        fanout_dropped: current.fanout_dropped.saturating_sub(mark.fanout_dropped),
+    }
+}
+
+fn error_since(current: &Option<LastError>, mark: &Option<LastError>) -> Option<LastError> {
+    match (current, mark) {
+        (None, _) => None,
+        (Some(cur), None) => Some(cur.clone()),
+        (Some(cur), Some(prev)) if cur.reason == prev.reason => {
+            let count = cur.count.saturating_sub(prev.count);
+            (count > 0).then(|| LastError {
+                reason: cur.reason.clone(),
+                count,
+            })
+        }
+        (Some(cur), Some(_)) => Some(cur.clone()),
     }
 }
 

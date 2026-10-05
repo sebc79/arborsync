@@ -7,7 +7,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use tokio::sync::Notify;
 
 use crate::apply;
 use crate::bottleneck::{Gauge, Stage, Waiting};
@@ -20,11 +23,12 @@ use crate::keys::format_hex_key;
 use crate::merkle::file_node;
 use crate::meta::{self, EntryKind, FileMetadata, Inspected};
 use crate::path::{
-    canonical_to_host, confine_host, is_reserved_root_entry, join_central, strip_central,
-    CanonicalPath, EntryName, PathError,
+    CanonicalPath, EntryName, PathError, canonical_to_host, confine_host, is_reserved_root_entry,
+    join_central, strip_central,
 };
+use crate::peers::{self, Pace, PeerName, PeerView, QueueDepth};
 use crate::protocol::{
-    page_dir_list, BulkEncoding, BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage,
+    BulkEncoding, BulkHeader, CheckoutAck, CheckoutRef, ProtocolMessage, page_dir_list,
 };
 use crate::status::{MasterStatus, PeerLive, Queues, StatusLedger};
 use crate::storage::{CheckoutId, Storage};
@@ -33,7 +37,8 @@ use crate::tune::Tune;
 use crate::watch::LocalEvent;
 
 pub use crate::apply::{
-    ApplyError, BulkStage, ContentBytes, ContentHook, MemoryContent, VerifiedContent, WholeFileLater,
+    ApplyError, BulkStage, ContentBytes, ContentHook, MemoryContent, VerifiedContent,
+    WholeFileLater,
 };
 
 /// Checkout id on the wire. Distinct from [`CheckoutId`], the index namespace.
@@ -92,7 +97,10 @@ pub enum Reply {
     Send(ProtocolMessage),
     /// Inbound control that needs no response (for example a peer `Error`).
     Quiet,
-    Hangup { reason: String, rate_limit: bool },
+    Hangup {
+        reason: String,
+        rate_limit: bool,
+    },
     Bulk(BulkTransfer),
 }
 
@@ -295,6 +303,15 @@ struct LiveSlave {
     outbox: Waiting<u64, ProtocolMessage>,
     next_seq: u64,
     writable: bool,
+    generation: u64,
+    directory: Option<PeerView>,
+    published: Option<PeerView>,
+    directory_notify: Arc<Notify>,
+}
+
+struct Installed {
+    displaced_peer: Option<[u8; 32]>,
+    dropped_slave: Option<SlaveId>,
 }
 
 #[derive(Default)]
@@ -302,6 +319,7 @@ struct Roster {
     by_slave: HashMap<SlaveId, LiveSlave>,
     by_peer: HashMap<[u8; 32], SlaveId>,
     by_central: HashMap<CanonicalPath, HashSet<InterestKey>>,
+    generations: HashMap<SlaveId, u64>,
 }
 
 impl Roster {
@@ -310,11 +328,31 @@ impl Roster {
         peer: [u8; 32],
         slave: SlaveId,
         checkouts: HashMap<CheckoutName, CanonicalPath>,
-    ) -> Option<[u8; 32]> {
+        notify: Option<Arc<Notify>>,
+    ) -> Installed {
+        let dropped_slave = self.by_peer.get(&peer).cloned().filter(|id| id != &slave);
+        let mut generation = self
+            .generations
+            .get(&slave)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        if generation == 0 {
+            generation = 1;
+        }
+        self.generations.insert(slave.clone(), generation);
+        let reused = self
+            .by_slave
+            .get(&slave)
+            .map(|live| Arc::clone(&live.directory_notify));
+        let displaced_peer = self
+            .by_slave
+            .get(&slave)
+            .map(|live| live.peer)
+            .filter(|old| old != &peer);
         if let Some(previous) = self.by_peer.get(&peer).cloned() {
             self.forget(&previous);
         }
-        let displaced = self.by_slave.get(&slave).map(|live| live.peer);
         self.forget(&slave);
         for (checkout, central) in &checkouts {
             self.by_central
@@ -325,6 +363,7 @@ impl Roster {
                     checkout: checkout.clone(),
                 });
         }
+        let directory_notify = notify.or(reused).unwrap_or_else(|| Arc::new(Notify::new()));
         self.by_peer.insert(peer, slave.clone());
         self.by_slave.insert(
             slave,
@@ -334,9 +373,16 @@ impl Roster {
                 outbox: Waiting::new(Stage::Fanout),
                 next_seq: 0,
                 writable: true,
+                generation,
+                directory: None,
+                published: None,
+                directory_notify,
             },
         );
-        displaced.filter(|old| old != &peer)
+        Installed {
+            displaced_peer,
+            dropped_slave,
+        }
     }
 
     fn forget(&mut self, slave: &SlaveId) {
@@ -460,6 +506,16 @@ impl Roster {
         let dropped = live.outbox.len() as u64;
         live.outbox.clear();
         dropped
+    }
+
+    fn generation(&self, peer: &[u8; 32]) -> Option<u64> {
+        let slave = self.by_peer.get(peer)?;
+        Some(self.by_slave.get(slave)?.generation)
+    }
+
+    fn take_directory(&mut self, peer: &[u8; 32]) -> Option<PeerView> {
+        let slave = self.by_peer.get(peer).cloned()?;
+        self.by_slave.get_mut(&slave)?.directory.take()
     }
 }
 
@@ -599,6 +655,8 @@ pub struct Master<S: Storage, C: ContentHook> {
     dirs: index::DirChildren,
     status: StatusLedger,
     wipes: WipeSet,
+    board: peers::PeerBoard,
+    pending_notifies: HashMap<[u8; 32], Arc<Notify>>,
 }
 
 impl<S: Storage, C: ContentHook> Master<S, C> {
@@ -621,7 +679,10 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             dirs: index::DirChildren::default(),
             status: StatusLedger::default(),
             wipes: WipeSet { paths: Vec::new() },
+            board: peers::PeerBoard::default(),
+            pending_notifies: HashMap::new(),
         };
+        master.sync_board();
         // A clean directory hash still names files the disk has lost. Surveying
         // on open drops those rows so the next reconcile can copy them back.
         master.rescan()?;
@@ -1008,12 +1069,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     }
 
     fn repair_dir_nodes(&mut self) -> Result<(), MasterError> {
-        let changed = index::repair_dir_nodes(
-            &self.store,
-            &CheckoutId::master(),
-            &CanonicalPath::root(),
-        )
-        .map_err(MasterError::index)?;
+        let changed =
+            index::repair_dir_nodes(&self.store, &CheckoutId::master(), &CanonicalPath::root())
+                .map_err(MasterError::index)?;
         if changed {
             self.dirs = index::DirChildren::default();
         }
@@ -1139,9 +1197,13 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
     pub fn disconnect(&mut self, peer: [u8; 32]) {
         if let Some(slave) = self.live_slave_id(&peer) {
             self.status.forget_gauge(&slave);
+            if let Some(name) = PeerName::parse(&slave) {
+                self.board.note_disconnect(&name);
+            }
         }
         self.roster.disconnect_peer(&peer);
         self.drop_pending(peer);
+        self.publish_peers(Instant::now());
     }
 
     /// Drop in-flight applies for `peer` without touching the roster.
@@ -1346,6 +1408,9 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         let mut drop_peers = Vec::new();
         for (slave, peer, checkouts) in live {
             if self.authorize_peer(&peer).is_none() {
+                if let Some(name) = PeerName::parse(slave.as_str()) {
+                    self.board.note_disconnect(&name);
+                }
                 drop_peers.push(peer);
                 plan.drop_slave_ids.push(slave.as_str().to_string());
                 self.roster.forget(&slave);
@@ -1364,7 +1429,79 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         plan.drop_peers = drop_peers;
         plan.drop_slave_ids.sort();
         plan.drop_slave_ids.dedup();
+        self.sync_board();
+        self.publish_peers(Instant::now());
         Ok(plan)
+    }
+
+    pub fn arm_directory_notify(&mut self, peer: [u8; 32], notify: Arc<Notify>) {
+        self.pending_notifies.insert(peer, notify);
+    }
+
+    pub fn session_generation(&self, peer: &[u8; 32]) -> Option<u64> {
+        self.roster.generation(peer)
+    }
+
+    pub fn observe_peer_report(
+        &mut self,
+        peer: [u8; 32],
+        generation: u64,
+        seq: u64,
+        pace: Pace,
+        depth: u32,
+    ) {
+        let Some(id) = self.live_slave_id(&peer) else {
+            return;
+        };
+        let Some(name) = PeerName::parse(&id) else {
+            return;
+        };
+        let changed = self.board.observe_report(
+            &name,
+            generation,
+            peers::SelfReport {
+                seq,
+                pace,
+                depth: QueueDepth::from_units(depth as usize),
+            },
+            Instant::now(),
+        );
+        if changed {
+            self.publish_peers(Instant::now());
+        }
+    }
+
+    pub fn publish_peers(&mut self, now: Instant) {
+        self.sync_board();
+        let views = self.board.views(now);
+        for (id, live) in &mut self.roster.by_slave {
+            let Some(name) = PeerName::parse(id.as_str()) else {
+                continue;
+            };
+            let Some(view) = views.get(&name) else {
+                continue;
+            };
+            if live.published.as_ref() == Some(view) {
+                continue;
+            }
+            live.published = Some(view.clone());
+            live.directory = Some(view.clone());
+            live.directory_notify.notify_one();
+        }
+    }
+
+    pub fn poll_peer_directory(&mut self, peer: [u8; 32]) -> Option<PeerView> {
+        self.roster.take_directory(&peer)
+    }
+
+    fn sync_board(&mut self) {
+        let ids: Vec<PeerName> = self
+            .cfg
+            .slaves()
+            .iter()
+            .filter_map(|acl| PeerName::parse(acl.id()))
+            .collect();
+        self.board.sync_acl(&ids);
     }
 
     pub fn max_connections(&self) -> u32 {
@@ -1419,13 +1556,26 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
         }
 
         let slave = SlaveId::new(slave_id);
-        if let Some(displaced) = self.roster.install(peer, slave.clone(), live) {
+        let notify = self.pending_notifies.remove(&peer);
+        let installed = self.roster.install(peer, slave.clone(), live, notify);
+        if let Some(displaced) = installed.displaced_peer {
             log::info!(
                 "slave {} replaced its session; {} is no longer live",
                 slave.as_str(),
                 format_hex_key(&displaced)
             );
         }
+        if let Some(dropped) = installed.dropped_slave {
+            if let Some(name) = PeerName::parse(dropped.as_str()) {
+                self.board.note_disconnect(&name);
+            }
+        }
+        if let Some(name) = PeerName::parse(slave.as_str()) {
+            if let Some(generation) = self.roster.generation(&peer) {
+                self.board.note_session(&name, generation, Instant::now());
+            }
+        }
+        self.publish_peers(Instant::now());
         let mut acks = Vec::with_capacity(checkouts.len());
         for checkout in checkouts {
             acks.push(CheckoutAck {
@@ -2064,8 +2214,7 @@ impl<S: Storage, C: ContentHook> Master<S, C> {
             self.inflight.disarm(path);
             return Err(err);
         }
-        if let Err(err) =
-            apply::install_verified(&self.central_root, path, new, previous, verified)
+        if let Err(err) = apply::install_verified(&self.central_root, path, new, previous, verified)
         {
             self.inflight.disarm(path);
             return Err(err.into());

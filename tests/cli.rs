@@ -458,6 +458,7 @@ impl ConnectedPair {
             watcher_debounce_ms: 200,
             rescan_interval_seconds: 3600,
             status_interval_seconds: 0,
+            peer_socket: None,
             checkouts: vec![CheckoutConfig {
                 id: "src".into(),
                 central: "/src".into(),

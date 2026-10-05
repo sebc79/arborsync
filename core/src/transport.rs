@@ -11,6 +11,7 @@ use quinn_hyphae::helper::{hyphae_client_endpoint, hyphae_server_endpoint};
 use quinn_hyphae::{HandshakeBuilder, HyphaePeerIdentity, RustCryptoBackend};
 use tokio::sync::mpsc;
 
+use crate::peers::{self, Inbound, Outbound, Pace, PeerView, QueueDepth, SelfReport};
 use crate::protocol::{
     self, BulkHeader, FrameError, MAX_CONTROL_FRAME, PROTOCOL_PREAMBLE, ProtocolMessage,
 };
@@ -57,6 +58,53 @@ pub enum TransportError {
     Stream(String),
     #[error("session closed")]
     Closed,
+}
+
+#[derive(Clone, Debug)]
+pub enum SessionFrame {
+    File(ProtocolMessage),
+    Directory(PeerView),
+    Report {
+        seq: u64,
+        pace: Pace,
+        depth: QueueDepth,
+    },
+}
+
+fn encode_session(frame: &SessionFrame) -> Result<Vec<u8>, FrameError> {
+    let outbound = match frame {
+        SessionFrame::File(msg) => return protocol::encode_control(msg),
+        SessionFrame::Directory(view) => Outbound::Directory(view.clone()),
+        SessionFrame::Report { seq, pace, depth } => Outbound::Report(SelfReport {
+            seq: *seq,
+            pace: *pace,
+            depth: *depth,
+        }),
+    };
+    peers::encode_outbound(&outbound)
+}
+
+fn decode_session(buf: &[u8]) -> Result<SessionFrame, FrameError> {
+    Ok(match peers::decode_inbound(buf)? {
+        Inbound::File(msg) => SessionFrame::File(msg),
+        Inbound::Directory(view) => SessionFrame::Directory(view),
+        Inbound::Report(report) => SessionFrame::Report {
+            seq: report.seq,
+            pace: report.pace,
+            depth: report.depth,
+        },
+    })
+}
+
+fn send_frame(send: &MemoryControlSend, frame: &[u8]) -> Result<(), TransportError> {
+    send.out.send(frame.to_vec())
+}
+
+async fn recv_frame(recv: &mut MemoryControlRecv) -> Result<Vec<u8>, TransportError> {
+    if recv.closed.load(Ordering::Acquire) {
+        return Err(TransportError::Closed);
+    }
+    recv.rx.recv().await.ok_or(TransportError::Closed)
 }
 
 pub struct AttemptLimiter {
@@ -157,6 +205,13 @@ pub trait Transport: Send + Sync + 'static {
     fn read_control(
         recv: &mut Self::ControlRecv,
     ) -> impl Future<Output = Result<ProtocolMessage, Self::Error>> + Send;
+    fn write_frame(
+        send: &mut Self::ControlSend,
+        frame: &SessionFrame,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn read_frame(
+        recv: &mut Self::ControlRecv,
+    ) -> impl Future<Output = Result<SessionFrame, Self::Error>> + Send;
     fn write_bulk(
         &self,
         xfer: &BulkTransfer,
@@ -203,11 +258,11 @@ impl<T> Closable<T> {
 }
 
 pub struct MemoryControlSend {
-    out: Arc<Closable<ProtocolMessage>>,
+    out: Arc<Closable<Vec<u8>>>,
 }
 
 pub struct MemoryControlRecv {
-    rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
     closed: Arc<AtomicBool>,
 }
 
@@ -219,7 +274,7 @@ pub struct MemoryTransport {
     opener: bool,
     closed: Arc<AtomicBool>,
     control: Mutex<Option<(MemoryControlSend, MemoryControlRecv)>>,
-    control_out: Arc<Closable<ProtocolMessage>>,
+    control_out: Arc<Closable<Vec<u8>>>,
     bulk_out: Arc<Closable<BulkTransfer>>,
     bulk_in: tokio::sync::Mutex<mpsc::UnboundedReceiver<BulkTransfer>>,
     datagram_out: Option<Arc<Closable<Vec<u8>>>>,
@@ -273,7 +328,7 @@ impl MemoryTransport {
         peer_key: [u8; 32],
         opener: bool,
         closed: Arc<AtomicBool>,
-        control_lane: Lane<ProtocolMessage>,
+        control_lane: Lane<Vec<u8>>,
         bulk_lane: Lane<BulkTransfer>,
         datagrams: Option<Lane<Vec<u8>>>,
     ) -> Self {
@@ -359,14 +414,26 @@ impl Transport for MemoryTransport {
         send: &mut Self::ControlSend,
         msg: &ProtocolMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        std::future::ready(send.out.send(msg.clone()))
+        let encoded = protocol::encode_control(msg).map_err(TransportError::Frame);
+        std::future::ready(encoded.and_then(|frame| send_frame(send, &frame)))
     }
 
     async fn read_control(recv: &mut Self::ControlRecv) -> Result<ProtocolMessage, Self::Error> {
-        if recv.closed.load(Ordering::Acquire) {
-            return Err(TransportError::Closed);
-        }
-        recv.rx.recv().await.ok_or(TransportError::Closed)
+        let frame = recv_frame(recv).await?;
+        Ok(protocol::decode_control(&frame)?.0)
+    }
+
+    fn write_frame(
+        send: &mut Self::ControlSend,
+        frame: &SessionFrame,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let encoded = encode_session(frame).map_err(TransportError::Frame);
+        std::future::ready(encoded.and_then(|bytes| send_frame(send, &bytes)))
+    }
+
+    async fn read_frame(recv: &mut Self::ControlRecv) -> Result<SessionFrame, Self::Error> {
+        let frame = recv_frame(recv).await?;
+        decode_session(&frame).map_err(TransportError::Frame)
     }
 
     fn write_bulk(
@@ -452,9 +519,7 @@ pub async fn copy_bulk_body(
             }));
         }
         chunk.resize(n, 0);
-        recv.read_exact(&mut chunk[..n])
-            .await
-            .map_err(stream_err)?;
+        recv.read_exact(&mut chunk[..n]).await.map_err(stream_err)?;
         dest.write_all(&chunk[..n])
             .map_err(|err| TransportError::Stream(err.to_string()))?;
         got = end;
@@ -506,6 +571,24 @@ impl ControlReader {
             stream,
             pending: Vec::new(),
         }
+    }
+
+    async fn read_prefixed(&mut self) -> Result<Vec<u8>, TransportError> {
+        self.fill(4).await?;
+        let header: [u8; 4] = self.pending[..4].try_into().expect("4 bytes");
+        let len = u32::from_be_bytes(header) as usize;
+        if len > MAX_CONTROL_FRAME {
+            log::warn!(
+                "incoming control length {len} exceeds 1 MiB (header {:02x} {:02x} {:02x} {:02x})",
+                header[0],
+                header[1],
+                header[2],
+                header[3]
+            );
+            return Err(TransportError::Frame(FrameError::TooLarge));
+        }
+        self.fill(4 + len).await?;
+        Ok(self.pending.drain(..4 + len).collect())
     }
 
     async fn fill(&mut self, need: usize) -> Result<(), TransportError> {
@@ -566,22 +649,21 @@ impl Transport for Connection {
     }
 
     async fn read_control(recv: &mut Self::ControlRecv) -> Result<ProtocolMessage, Self::Error> {
-        recv.fill(4).await?;
-        let header: [u8; 4] = recv.pending[..4].try_into().expect("4 bytes");
-        let len = u32::from_be_bytes(header) as usize;
-        if len > MAX_CONTROL_FRAME {
-            log::warn!(
-                "incoming control length {len} exceeds 1 MiB (header {:02x} {:02x} {:02x} {:02x})",
-                header[0],
-                header[1],
-                header[2],
-                header[3]
-            );
-            return Err(TransportError::Frame(FrameError::TooLarge));
-        }
-        recv.fill(4 + len).await?;
-        let frame: Vec<u8> = recv.pending.drain(..4 + len).collect();
+        let frame = recv.read_prefixed().await?;
         Ok(protocol::decode_control(&frame)?.0)
+    }
+
+    async fn write_frame(
+        send: &mut Self::ControlSend,
+        frame: &SessionFrame,
+    ) -> Result<(), Self::Error> {
+        let bytes = encode_session(frame).map_err(TransportError::Frame)?;
+        send.write_all(&bytes).await.map_err(stream_err)
+    }
+
+    async fn read_frame(recv: &mut Self::ControlRecv) -> Result<SessionFrame, Self::Error> {
+        let frame = recv.read_prefixed().await?;
+        decode_session(&frame).map_err(TransportError::Frame)
     }
 
     async fn write_bulk(&self, xfer: &BulkTransfer) -> Result<(), Self::Error> {
@@ -643,5 +725,35 @@ mod attempt_limiter_tests {
         assert!(!limiter.hits.contains_key(&idle));
         assert_eq!(limiter.hits.len(), 1);
         assert!(!limiter.limited(idle, later));
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::{FrameError, MemoryTransport, Transport, TransportError};
+
+    #[tokio::test]
+    async fn a_bad_asp1_frame_is_skippable_and_a_bad_file_frame_is_not() {
+        let (left, right) = MemoryTransport::pair([0x11; 32], [0x22; 32]);
+        let (send, _) = left.open_control().await.unwrap();
+        let (_, mut recv) = right.accept_control().await.unwrap();
+
+        let mut payload = b"asp1".to_vec();
+        payload.push(9);
+        let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+        frame.extend(payload);
+        send.out.send(frame).unwrap();
+        let err = MemoryTransport::read_frame(&mut recv).await.unwrap_err();
+        assert!(matches!(err, TransportError::Frame(FrameError::BadPeer)));
+
+        let junk = b"nope";
+        let mut file = (junk.len() as u32).to_be_bytes().to_vec();
+        file.extend_from_slice(junk);
+        send.out.send(file).unwrap();
+        let err = MemoryTransport::read_frame(&mut recv).await.unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::Frame(got) if got != FrameError::BadPeer
+        ));
     }
 }

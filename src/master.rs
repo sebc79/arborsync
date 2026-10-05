@@ -14,10 +14,12 @@ use arborsync_core::master::{
     reclaim_tree, survey_central,
 };
 use arborsync_core::path::host_to_canonical;
-use arborsync_core::protocol::ProtocolMessage;
+use arborsync_core::peers::report_period;
+use arborsync_core::protocol::{FrameError, ProtocolMessage};
 use arborsync_core::storage::Storage;
 use arborsync_core::transport::{
-    copy_bulk_body, listen, read_bulk_header, stream_err, AttemptLimiter, Transport,
+    AttemptLimiter, SessionFrame, Transport, TransportError, copy_bulk_body, listen,
+    read_bulk_header, stream_err,
 };
 use arborsync_core::watch::to_local_events;
 use arborsync_core::{LoadedMaster, RedbStorage};
@@ -120,6 +122,8 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
     let (cfg_tx, mut cfg_rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_config_watch(config_path.clone(), cfg_tx);
     let mut status_clock = crate::status::Clock::new();
+    let mut peer_clock = tokio::time::interval(report_period());
+    peer_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         let status_every = master.lock().expect("master").status_interval_seconds();
@@ -149,6 +153,9 @@ async fn run_async(config: Option<PathBuf>) -> anyhow::Result<()> {
             }
             _ = status_clock.wait(status_every) => {
                 emit_master_status(&master);
+            }
+            _ = peer_clock.tick() => {
+                master.lock().expect("master").publish_peers(Instant::now());
             }
         }
     }
@@ -262,21 +269,46 @@ async fn accept_session(
     let (mut send, mut recv) = conn.accept_control().await?;
     let (write_tx, mut write_rx) = unbounded_channel::<Vec<ProtocolMessage>>();
     let (write_err_tx, mut write_err_rx) = unbounded_channel();
+    let directory_notify = Arc::new(Notify::new());
+    master
+        .lock()
+        .expect("master")
+        .arm_directory_notify(peer, Arc::clone(&directory_notify));
     let writer_master = master.clone();
     tokio::spawn(async move {
-        while let Some(batch) = write_rx.recv().await {
-            let large = batch.len() > OUTBOX_BACKPRESSURE;
-            for msg in &batch {
-                if let Err(err) = Connection::write_control(&mut send, msg).await {
-                    let _ = write_err_tx.send(err);
-                    return;
+        loop {
+            tokio::select! {
+                biased;
+                _ = directory_notify.notified() => {
+                    if let Err(err) = write_directory(&mut send, &writer_master, peer).await {
+                        let _ = write_err_tx.send(err);
+                        return;
+                    }
                 }
-            }
-            if large {
-                writer_master
-                    .lock()
-                    .expect("master")
-                    .set_writable(peer, true);
+                batch = write_rx.recv() => {
+                    let Some(batch) = batch else {
+                        return;
+                    };
+                    if let Err(err) = write_directory(&mut send, &writer_master, peer).await {
+                        let _ = write_err_tx.send(err);
+                        return;
+                    }
+                    let large = batch.len() > OUTBOX_BACKPRESSURE;
+                    for msg in batch {
+                        if let Err(err) =
+                            Connection::write_frame(&mut send, &SessionFrame::File(msg)).await
+                        {
+                            let _ = write_err_tx.send(err);
+                            return;
+                        }
+                    }
+                    if large {
+                        writer_master
+                            .lock()
+                            .expect("master")
+                            .set_writable(peer, true);
+                    }
+                }
             }
         }
     });
@@ -294,6 +326,7 @@ async fn accept_session(
         wipe_ready: &wipe_ready,
     };
     let session = async {
+        let mut generation = 0u64;
         loop {
             if drain_parked(&drive, &mut parked).await? {
                 break;
@@ -304,12 +337,39 @@ async fn accept_session(
                         break;
                     }
                 }
-                msg = Connection::read_control(&mut recv) => {
-                    let msg = msg?;
-                    if control_waits(&master, &msg) {
-                        parked.push_back(msg);
-                    } else if drive_control(&drive, &mut parked, msg).await? {
-                        break;
+                frame = Connection::read_frame(&mut recv) => {
+                    match frame {
+                        Ok(SessionFrame::File(msg)) => {
+                            let subscribed = matches!(msg, ProtocolMessage::Subscribe { .. });
+                            if control_waits(&master, &msg) {
+                                parked.push_back(msg);
+                            } else if drive_control(&drive, &mut parked, msg).await? {
+                                break;
+                            }
+                            if subscribed {
+                                generation = master
+                                    .lock()
+                                    .expect("master")
+                                    .session_generation(&peer)
+                                    .unwrap_or(0);
+                            }
+                        }
+                        Ok(SessionFrame::Report { seq, pace, depth }) => {
+                            master.lock().expect("master").observe_peer_report(
+                                peer,
+                                generation,
+                                seq,
+                                pace,
+                                depth.get(),
+                            );
+                        }
+                        Ok(SessionFrame::Directory(_)) => {
+                            log::warn!("master ignored a peer directory");
+                        }
+                        Err(err) if bad_peer(&err) => {
+                            log::warn!("skipped peer frame: {err}");
+                        }
+                        Err(err) => return Err(err.into()),
                     }
                 }
                 incoming = conn.accept_uni() => {
@@ -369,13 +429,7 @@ async fn accept_session(
     }
     .await;
 
-    release_session(
-        &sessions,
-        &*master,
-        &slave_id,
-        peer,
-        *stop_rx.borrow(),
-    );
+    release_session(&sessions, &*master, &slave_id, peer, *stop_rx.borrow());
     session
 }
 
@@ -619,6 +673,22 @@ fn dispatch_master(
     }
 }
 
+fn bad_peer(err: &TransportError) -> bool {
+    matches!(err, TransportError::Frame(FrameError::BadPeer))
+}
+
+async fn write_directory(
+    send: &mut <quinn::Connection as Transport>::ControlSend,
+    master: &SharedMaster,
+    peer: [u8; 32],
+) -> Result<(), TransportError> {
+    let view = master.lock().expect("master").poll_peer_directory(peer);
+    if let Some(view) = view {
+        Connection::write_frame(send, &SessionFrame::Directory(view)).await?;
+    }
+    Ok(())
+}
+
 fn flush_outbox(
     master: &SharedMaster,
     peer: [u8; 32],
@@ -772,7 +842,7 @@ mod tests {
     use arborsync_core::config::SlaveAcl;
     use arborsync_core::keys::format_hex_key;
     use arborsync_core::master::{Master, MemoryContent, Reply};
-    use arborsync_core::meta::{hash_bytes, FileMetadata};
+    use arborsync_core::meta::{FileMetadata, hash_bytes};
     use arborsync_core::protocol::{BulkEncoding, BulkHeader, CheckoutRef, ProtocolMessage};
     use arborsync_core::test_support::{MemoryStorage, SyncSandbox, p};
     use tokio::sync::mpsc::unbounded_channel;
@@ -869,7 +939,12 @@ mod tests {
             )
             .unwrap();
         let body = b"pending-bytes";
-        let new = FileMetadata::file(body.len() as u64, 1_700_000_000_000, 0o100644, hash_bytes(body));
+        let new = FileMetadata::file(
+            body.len() as u64,
+            1_700_000_000_000,
+            0o100644,
+            hash_bytes(body),
+        );
         match master
             .handle(
                 ALICE,

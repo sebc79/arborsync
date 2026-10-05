@@ -15,6 +15,7 @@ pub mod master;
 pub mod merkle;
 pub mod meta;
 pub mod path;
+pub mod peers;
 pub mod protocol;
 pub mod reconcile;
 pub mod slave;

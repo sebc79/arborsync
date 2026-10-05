@@ -8,19 +8,20 @@ use std::time::{Duration, Instant};
 use crate::apply;
 use crate::bottleneck::{Stage, Wait, Waiting};
 use crate::config::{ConfigError, LoadedSlave, ReloadError, SlaveReload};
-use crate::crawl::{Crawl, DirListPage, RescanWalk, WalkError, Walked, STEP_BUDGET};
+use crate::crawl::{Crawl, DirListPage, RescanWalk, STEP_BUDGET, WalkError, Walked};
 use crate::hash::{ContentHash, FileNode};
 use crate::hashing::{HashDone, HashKey, HashNeed, HashOutcome, HashPlan};
 use crate::index;
 use crate::inflight::Inflight;
-use crate::merkle::{file_node, DirChild};
+use crate::merkle::{DirChild, file_node};
 use crate::meta::{self, EntryKind, FileMetadata, Inspected};
 use crate::path::{
-    canonical_to_host, confine_host, conflict_sidecar_path, join_central, local_paths_overlap,
-    strip_central, CanonicalPath, EntryName, PathError,
+    CanonicalPath, EntryName, PathError, canonical_to_host, confine_host, conflict_sidecar_path,
+    join_central, local_paths_overlap, strip_central,
 };
+use crate::peers::{self, PeerView, QueueDepth};
 use crate::protocol::{BulkEncoding, BulkHeader, CheckoutRef, ProtocolMessage};
-use crate::reconcile::{decide_child, WalkAction};
+use crate::reconcile::{WalkAction, decide_child};
 use crate::status::{Queues, SlaveStatus, StatusLedger};
 use crate::storage::{CheckoutId, Storage, WriteBatch};
 use crate::transfer::{self, BulkTransfer};
@@ -28,6 +29,13 @@ use crate::tune::Tune;
 use crate::watch::LocalEvent;
 
 pub use crate::apply::{ApplyError, ContentBytes, ContentHook, MemoryContent, WholeFileLater};
+
+pub fn serve_peers(
+    socket: PathBuf,
+    rx: tokio::sync::watch::Receiver<PeerView>,
+) -> io::Result<tokio::task::JoinHandle<()>> {
+    peers::serve_peers(socket, rx)
+}
 pub use crate::crawl::{RescanStat, RescanStated};
 
 struct StagedAnnounce {
@@ -300,6 +308,8 @@ pub struct Slave<S: Storage, C: ContentHook> {
     status: StatusLedger,
     cas_since_dir_list: HashMap<String, u64>,
     dir_list_sent: HashMap<(String, CanonicalPath, Option<EntryName>), u64>,
+    served: PeerView,
+    served_tx: Option<tokio::sync::watch::Sender<PeerView>>,
 }
 
 impl<S: Storage, C: ContentHook> Slave<S, C> {
@@ -338,6 +348,8 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             status: StatusLedger::default(),
             cas_since_dir_list: HashMap::new(),
             dir_list_sent: HashMap::new(),
+            served: PeerView::Waiting,
+            served_tx: None,
         };
         let mut ids: Vec<String> = slave.checkouts.keys().cloned().collect();
         ids.sort();
@@ -418,6 +430,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
     }
 
     pub fn take_status(&mut self, link: LinkState) -> SlaveStatus {
+        let queues = self.queue_snapshot(&link);
         let mut waits: Vec<Wait> = [
             self.pending.oldest(),
             self.pending_pulls.oldest(),
@@ -428,13 +441,17 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         .flatten()
         .collect();
         waits.extend(link.waits);
+        self.status.take_slave(link.connected, queues, &waits)
+    }
+
+    fn queue_snapshot(&self, link: &LinkState) -> Queues {
         let depth = |stage| {
-            waits
+            link.waits
                 .iter()
                 .find(|wait| wait.stage == stage)
                 .map_or(0, |wait| wait.depth)
         };
-        let queues = Queues {
+        Queues {
             pending: self.pending.len(),
             pending_pulls: self.pending_pulls.len(),
             pending_renames: self.pending_renames.len(),
@@ -442,8 +459,34 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             sending: depth(Stage::FulfillRead),
             work: link.work_depth,
             ..Queues::default()
-        };
-        self.status.take_slave(link.connected, queues, &waits)
+        }
+    }
+
+    pub fn sample_report(&mut self, link: LinkState, seq: u64) -> (peers::Pace, QueueDepth) {
+        let queues = self.queue_snapshot(&link);
+        let (flow, errors) = self.status.report_delta();
+        let report = peers::self_report(seq, &flow, &queues, errors);
+        (report.pace, report.depth)
+    }
+
+    pub fn set_served_peers(&mut self, view: PeerView) {
+        self.served = view.clone();
+        if let Some(tx) = &self.served_tx {
+            let _ = tx.send(view);
+        }
+    }
+
+    pub fn served_peers(&self) -> PeerView {
+        self.served.clone()
+    }
+
+    pub fn bind_served_peers(&mut self, tx: tokio::sync::watch::Sender<PeerView>) {
+        let _ = tx.send(self.served.clone());
+        self.served_tx = Some(tx);
+    }
+
+    pub fn peer_socket(&self) -> &std::path::Path {
+        self.cfg.peer_socket()
     }
 
     pub fn crawl_pending(&self) -> bool {
@@ -872,12 +915,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                     });
                 }
                 let pending = self.pending.remove(&key).expect("pending");
-                self.finish_verified(
-                    &pending.checkout_id,
-                    pending.path,
-                    pending.new,
-                    verified,
-                )
+                self.finish_verified(&pending.checkout_id, pending.path, pending.new, verified)
             }
             ApplyBulkOutcome::Failed { key, path } => {
                 let Some(pending) = self.pending.get_mut(&key) else {
@@ -1490,9 +1528,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
             _ => None,
         };
         let link_target = match new.kind {
-            EntryKind::Symlink => {
-                Some(fs::read_link(&host).map_err(SlaveError::io(&host))?)
-            }
+            EntryKind::Symlink => Some(fs::read_link(&host).map_err(SlaveError::io(&host))?),
             _ => None,
         };
         self.checkout_mut(checkout_id)?
@@ -1675,8 +1711,10 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
         after: Option<EntryName>,
     ) -> ProtocolMessage {
         let epoch = self.cas_epoch(checkout_id);
-        self.dir_list_sent
-            .insert((checkout_id.to_string(), path.clone(), after.clone()), epoch);
+        self.dir_list_sent.insert(
+            (checkout_id.to_string(), path.clone(), after.clone()),
+            epoch,
+        );
         ProtocolMessage::DirListRequest {
             checkout_id: checkout_id.into(),
             path,
@@ -2002,8 +2040,7 @@ impl<S: Storage, C: ContentHook> Slave<S, C> {
                 }
             }
             WalkAction::AnnounceDelete => {
-                if self.cas_epoch(checkout_id) > list_epoch || self.crawl.rescanning(checkout_id)
-                {
+                if self.cas_epoch(checkout_id) > list_epoch || self.crawl.rescanning(checkout_id) {
                     return Ok(plan);
                 }
                 plan.send
